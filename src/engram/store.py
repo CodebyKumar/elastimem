@@ -13,9 +13,11 @@ import sqlite3
 import threading
 from typing import Callable
 
-from . import procedural, semantic
-from .config import EngramConfig
+from . import assembly, procedural, semantic
+from .assembly import ContextPlan
+from .config import EngramConfig, MemoryProfile
 from .db import open_store, connect
+from .governor import Governor
 
 log = logging.getLogger("engram")
 
@@ -41,16 +43,25 @@ class Engram:
         complete_fn: CompleteFn | None = None,
         embed_fn: EmbedFn | None = None,
         config: EngramConfig | None = None,
+        tokenizer_fn: Callable[[str], int] | None = None,
+        probe_fn: Callable[[], tuple[int, int]] | None = None,
+        on_tier_change: Callable | None = None,
     ) -> None:
         self.path = os.path.expanduser(path) if path != ":memory:" else path
         self.config = config or EngramConfig()
         self.complete_fn = complete_fn
         self.embed_fn = embed_fn
+        self.tokenizer_fn = tokenizer_fn
         self._write_lock = threading.RLock()
         self._local = threading.local()
 
         conn, self.fts_enabled = open_store(self.path)
         self._local.conn = conn
+
+        governor_kwargs = {"on_tier_change": on_tier_change}
+        if probe_fn is not None:
+            governor_kwargs["probe_fn"] = probe_fn
+        self.governor = Governor(self.config, **governor_kwargs)
 
     # ------------------------------------------------------------------ #
     # connections
@@ -63,6 +74,87 @@ class Engram:
             conn = connect(self.path)
             self._local.conn = conn
         return conn
+
+    # ------------------------------------------------------------------ #
+    # governor / context
+    # ------------------------------------------------------------------ #
+    @property
+    def profile(self) -> MemoryProfile:
+        """The governor's current capability/budget snapshot."""
+        return self.governor.profile
+
+    def tick(self) -> MemoryProfile:
+        """Call once per turn: cheap hardware re-check, may change the tier."""
+        return self.governor.tick()
+
+    def report_pressure(self) -> MemoryProfile:
+        """Host signal that an OOM/decode failure happened; downgrades a tier."""
+        return self.governor.report_pressure()
+
+    def build_context(self, user_input: str = "") -> ContextPlan:
+        """Assemble this turn's budgeted memory sections.
+
+        ``user_input`` (when given) makes retrieval query-aware; retrieval
+        never raises — on any failure a section is simply empty.
+        """
+        profile = self.governor.profile
+        conn = self._conn
+
+        relevance: dict[int, float] = {}
+        episodic_text = ""
+        if user_input and len(user_input.split()) >= self.config.min_query_words:
+            try:
+                from . import retrieval
+
+                relevance = retrieval.fact_relevance(
+                    conn, user_input, fts=self.fts_enabled
+                )
+                if profile.budgets.episodic > 0:
+                    episodic_text = retrieval.episodic_section(
+                        self, user_input, profile, tokenizer_fn=self.tokenizer_fn
+                    )
+            except Exception:
+                log.exception("engram: retrieval failed; sections degraded to empty")
+
+        facts_text, fact_ids = assembly.build_facts_section(
+            conn, self.config, profile, relevance, self.tokenizer_fn
+        )
+        if fact_ids:
+            with self._write_lock:
+                semantic.touch(conn, fact_ids)
+
+        sections = {
+            assembly.SECTION_FACTS: facts_text,
+            assembly.SECTION_EPISODIC: episodic_text,
+            assembly.SECTION_SESSIONS: self._sessions_section(profile),
+            assembly.SECTION_LESSONS: assembly.build_lessons_section(
+                conn, self.config, profile, self.tokenizer_fn
+            ),
+        }
+        return ContextPlan(
+            sections=sections,
+            rolling_summary=self._rolling_summary(),
+            keep_last_n_turns=assembly.estimate_window_turns(
+                profile.budgets.working, min_turns=profile.window_min_turns
+            ),
+            profile=profile,
+            fact_ids=tuple(fact_ids),
+        )
+
+    def _sessions_section(self, profile: MemoryProfile) -> str:
+        """Recent session summaries (populated from phase 3 onward)."""
+        rows = self._conn.execute(
+            "SELECT summary FROM sessions WHERE summary IS NOT NULL AND summary != ''"
+            " ORDER BY id DESC LIMIT 5"
+        ).fetchall()
+        lines = [f"- {r['summary']}" for r in reversed(rows)]
+        return "\n".join(
+            assembly.fit_lines(lines, profile.budgets.sessions, self.tokenizer_fn)
+        )
+
+    def _rolling_summary(self) -> str | None:
+        """Current session's rolling summary (populated from phase 4 onward)."""
+        return None
 
     # ------------------------------------------------------------------ #
     # semantic memory (facts)
