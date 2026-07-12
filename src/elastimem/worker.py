@@ -2,12 +2,20 @@
 
 Design constraints, in order:
 
-1. **The foreground always wins.** Most local hosts have exactly one model
-   instance, and it is not thread-safe. The host brackets its own generation
-   with ``foreground()`` (or ``foreground_begin()/end()``); while the gate is
-   held, the worker will not *start* an LLM job. Jobs it does run are capped
-   tiny (``worker_max_tokens``) so a mistimed overlap costs well under a
-   second on a 2B model.
+1. **The foreground always wins — enforced by a real lock, not just a
+   flag.** Most local hosts have exactly one model instance, and it is not
+   thread-safe. The host brackets its own generation with ``foreground()``
+   (or ``foreground_begin()/end()``). Earlier versions of this worker only
+   checked an advisory ``Event`` before *dequeuing* an LLM job — but a job
+   already dequeued and mid-execution when the foreground opened its gate
+   would keep calling ``complete_fn`` concurrently with the foreground's own
+   generation, corrupting shared llama.cpp state (observed as garbled/
+   truncated replies, e.g. a bare stray token). ``llm_lock`` is the actual
+   mutual-exclusion primitive: the worker holds it for the duration of every
+   ``complete_fn`` call; ``foreground_begin()`` blocks until it can acquire
+   the same lock, so a foreground generation either finds the lock free or
+   waits out one small (``worker_max_tokens``-capped, sub-second) background
+   call before proceeding — it never runs concurrently with one.
 2. **Nothing is lost silently.** ``drain()`` finishes the queue (with a
    timeout) before the host unloads its model or exits.
 3. **Nothing ever raises.** A failed job is logged and dropped; the chat
@@ -51,6 +59,10 @@ class Worker:
         self._foreground_busy = threading.Event()
         self._idle = threading.Event()
         self._idle.set()
+        # The actual mutual-exclusion primitive protecting complete_fn calls;
+        # see the module docstring. Reentrant so a foreground() used nested
+        # or repeatedly by the same thread never self-deadlocks.
+        self.llm_lock = threading.RLock()
         self._held_llm_jobs: list[Job] = []      # waiting for the foreground gate
         self._batch: list[Job] = []              # BATCHED-cadence extractions
         self._turns_since_batch = 0
@@ -63,10 +75,19 @@ class Worker:
     # host-facing controls
     # ------------------------------------------------------------------ #
     def foreground_begin(self) -> None:
-        """The host is about to use the LLM; hold new LLM jobs."""
+        """The host is about to use the LLM.
+
+        Sets the advisory flag (so the worker stops *starting* new LLM jobs)
+        and then blocks until it can acquire ``llm_lock`` — if a background
+        job is already mid-``complete_fn`` call, this waits for it to finish
+        rather than letting the two race. The wait is bounded by
+        ``worker_max_tokens``, so in practice this is sub-second.
+        """
         self._foreground_busy.set()
+        self.llm_lock.acquire()
 
     def foreground_end(self) -> None:
+        self.llm_lock.release()
         self._foreground_busy.clear()
 
     def submit(self, job: Job) -> None:
@@ -159,4 +180,12 @@ class Worker:
             self._queue.put(Job("consolidate", needs_llm=True, payload={}))
 
     def _execute(self, job: Job) -> None:
-        self._store._execute_job(job)
+        if job.needs_llm:
+            # Real mutual exclusion, not just the advisory _foreground_busy
+            # flag: if the foreground grabbed llm_lock between this job being
+            # dequeued and now, block here until it releases it rather than
+            # calling complete_fn concurrently with a live generation.
+            with self.llm_lock:
+                self._store._execute_job(job)
+        else:
+            self._store._execute_job(job)

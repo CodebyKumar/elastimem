@@ -66,6 +66,45 @@ def test_foreground_gate_blocks_llm_jobs(tmp_path):
     s.close()
 
 
+def test_foreground_waits_for_inflight_background_job(tmp_path):
+    """Closes the TOCTOU race: a background LLM job that's already dequeued
+    and mid-execution (i.e. slipped past the advisory gate check) must not
+    run concurrently with a foreground generation that starts right after.
+    Regression test for a real bug: two threads calling into the same
+    non-thread-safe llama.cpp instance concurrently produced garbled
+    replies (a bare stray token) whenever a fact was saved right before the
+    next turn started generating."""
+    llm = FakeLLM(fact_json={"hobby": "chess"})
+    s = full_store(tmp_path / "race.db", llm)
+
+    # Foreground gate is OPEN (no one holds it yet) — enqueue an LLM job and
+    # let the worker actually dequeue + start executing it, simulating the
+    # real sequence: previous turn's record_turn() enqueues, gate is closed
+    # by then (previous foreground() already exited), worker grabs it.
+    s.record_turn("i play chess every single evening", "Nice!")
+    # FakeLLM sleeps 20ms per call; give the worker time to dequeue and be
+    # inside the call (but not yet finished) before we open the gate.
+    deadline = time.monotonic() + 1.0
+    while not llm.calls and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert llm.calls, "worker never started the background job in time"
+
+    # Now the next turn begins: foreground_begin() must block until the
+    # in-flight background call releases llm_lock, not race it.
+    t0 = time.monotonic()
+    with s.foreground():
+        elapsed = time.monotonic() - t0
+        # It should have waited out (part of) the background call's 20ms,
+        # not returned instantly while the job was still running.
+        assert llm.active == 0, "foreground entered while background call was still active"
+        # Simulate the foreground's own generation call.
+        llm(  # noqa: this direct call simulates the host's chat completion
+            "simulated foreground generation", max_tokens=8, temperature=0.3
+        )
+    assert llm.max_concurrent == 1, "background and foreground calls overlapped"
+    s.close()
+
+
 def test_record_turn_returns_fast_despite_slow_llm(tmp_path):
     class SlowLLM(FakeLLM):
         def __call__(self, prompt, *, max_tokens, temperature):

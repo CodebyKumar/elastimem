@@ -88,11 +88,15 @@ One daemon thread, one queue. Job kinds: `extract`, `rolling_summary`,
 
 The critical invariant is **foreground-wins**: most local hosts have exactly
 one model instance and it is not thread-safe. The host brackets its own
-generation with `with mem.foreground():`; while held, the worker will not
-start LLM jobs (it holds them and polls). Background LLM calls are capped at
-`worker_max_tokens` (default 96) so even a mistimed overlap costs
-sub-seconds on a 2B model. `drain()` finishes the queue before the host
-unloads its model; `close()` drains and stops.
+generation with `with mem.foreground():`. This is enforced by a real
+mutual-exclusion lock (`Worker.llm_lock`), not just an advisory flag —
+`foreground_begin()` blocks until it acquires the lock, and the worker holds
+the same lock for the full duration of every `complete_fn` call. A job that
+was already dequeued and mid-call when the foreground gate opened is waited
+out rather than raced with; background LLM calls are capped at
+`worker_max_tokens` (default 96) so that wait is sub-second on a 2B model.
+`drain()` finishes the queue before the host unloads its model; `close()`
+drains and stops.
 
 ## Consolidation
 
