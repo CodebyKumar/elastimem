@@ -11,19 +11,34 @@ from __future__ import annotations
 import re
 
 # (compiled pattern, fact key or None to use group('key'))
+#
+# Name/location values are tried as capitalized words first ("Priya and I
+# live…" stops at "Priya", not "Priya and" — capitalization bounds the
+# match against a trailing clause), falling back to a single all-lowercase
+# word for casual typing ("my name is kumar"). The lowercase fallback has no
+# capital letter to bound it, so it only captures one word and
+# _LEADING_STOPWORD rejects it when that word is a stopword rather than part
+# of a name/place ("my name is not important" must not yield "not").
 _RULES: list[tuple[re.Pattern, str]] = [
-    # Name/location values must be capitalized words — the patterns stay
-    # case-sensitive on the captured group ("Priya and I live…" must yield
-    # "Priya", not "Priya and") while tolerating lowercased prefixes.
     (re.compile(r"\b[Mm]y name is ([A-Z][\w'-]+(?: [A-Z][\w'-]+)?)"), "name"),
-    (re.compile(r"\b[Cc]all me ([A-Z][\w'-]+)\b"), "name"),
+    (re.compile(r"\b[Mm]y name is ([a-z][\w'-]+)\b"), "name"),
+    (re.compile(r"\b[Cc]all me ([A-Za-z][\w'-]+)\b"), "name"),
     (re.compile(r"\b[Ii] live in ([A-Z][\w'-]+(?:[ ,][A-Z][\w'-]+){0,2})"), "location"),
+    (re.compile(r"\b[Ii] live in ([a-z][\w'-]+)\b"), "location"),
     (re.compile(r"\b[Ii](?:'m| am) from ([A-Z][\w'-]+(?:[ ,][A-Z][\w'-]+){0,2})"), "location"),
+    (re.compile(r"\b[Ii](?:'m| am) from ([a-z][\w'-]+)\b"), "location"),
     (re.compile(r"\bi work (?:as an? |at )([\w &'-]{2,40})", re.I), "occupation"),
     (re.compile(r"\bi(?:'m| am) an? ([\w-]{2,25}) by (?:profession|trade)\b", re.I), "occupation"),
     (re.compile(r"\bi(?:'m| am) allergic to ([\w ,'-]{2,40})", re.I), "allergies"),
     (re.compile(r"\bi(?:'m| am) (vegetarian|vegan|pescatarian)\b", re.I), "diet"),
 ]
+
+# Rejects a lowercase-led capture whose first word is a stopword rather than
+# part of a name/place ("my name is not important", "i live in the moment").
+_LEADING_STOPWORD = frozenset({
+    "not", "no", "very", "so", "too", "really", "just", "kind", "sort",
+    "a", "an", "the", "still", "also", "actually", "basically", "literally",
+})
 
 _PREFERENCE = re.compile(
     r"\bmy (?:favorite|favourite|preferred) ([\w ]{2,20}) is ([\w ,'-]{2,40})", re.I
@@ -53,7 +68,7 @@ def capture(user_text: str) -> list[tuple[str, str]]:
         m = pattern.search(user_text)
         if m:
             value = _clean_value(m.group(1))
-            if value:
+            if value and value.split()[0].lower() not in _LEADING_STOPWORD:
                 found.append((key, value))
     for m in _PREFERENCE.finditer(user_text):
         subject = m.group(1).strip().lower().replace(" ", "_")

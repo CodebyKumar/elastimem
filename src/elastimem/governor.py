@@ -190,7 +190,7 @@ class Governor:
                 self._set_tier(Tier(self._tier - 1))
         return self._profile
 
-    def reconfigure(self) -> MemoryProfile:
+    def reconfigure(self, *, reprobe: bool = False) -> MemoryProfile:
         """Rebuild the current tier's budgets from ``self.config`` right now.
 
         Budgets are only recomputed on a tier change (see ``_set_tier``), so
@@ -200,8 +200,25 @@ class Governor:
         happen. Call this immediately after changing any config field that
         feeds budget math (``context_tokens``, ``static_prompt_tokens``,
         ``output_reserve``, ``tool_reserve``).
+
+        ``reprobe=True`` also re-measures hardware and re-classifies the
+        tier before rebuilding budgets, same as ``tick()``. The tier is
+        RAM-based and blind to which model is active, so on its own it can't
+        tell a 4K-context model from a 128K one apart - but startup order
+        matters: if the host constructs its Elastimem store BEFORE loading
+        its own (possibly large) model - as most hosts do, since the model
+        card isn't known until the model is chosen - the constructor's
+        one-time probe measures RAM the model hasn't claimed yet, and
+        without reprobing the tier stays keyed to that pre-load reading
+        until the next tick() (normally the first turn). Pass this when
+        calling reconfigure() right after a model finishes loading, so the
+        tier the host's first turn actually runs under reflects real
+        post-load memory pressure instead of a stale pre-load guess.
         """
         with self._lock:
+            if reprobe and self.config.tier_override is None:
+                total, available = self._probe()
+                self._set_tier(_classify(total, available))
             self._profile = self._build_profile(self._tier)
         return self._profile
 

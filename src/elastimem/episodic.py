@@ -15,7 +15,7 @@ from __future__ import annotations
 import re
 import sqlite3
 
-from .assembly import estimate_tokens
+from .assembly import TokenizerFn, estimate_tokens
 from .config import ElastimemConfig
 from .db import utcnow
 
@@ -72,22 +72,29 @@ def record_turn(
     turn: int,
     user_text: str,
     assistant_text: str,
+    tokenizer_fn: TokenizerFn | None = None,
 ) -> list[int]:
     """Persist one exchange. Returns the ids of the chunks created (for the
-    embedding queue)."""
+    embedding queue).
+
+    ``tokenizer_fn``, when given, is used for the ``token_estimate`` values
+    written here - the same values ``session_tail`` later budgets resumed
+    history against. Without it, both silently agree on the chars/4 proxy;
+    passing it here and nowhere else would make them diverge instead."""
     now = utcnow()
     with conn:
         cur = conn.execute(
             "INSERT INTO messages(session_id, turn, role, content, created_at,"
             " token_estimate) VALUES (?,?,?,?,?,?)",
-            (session_id, turn, "user", user_text, now, estimate_tokens(user_text)),
+            (session_id, turn, "user", user_text, now,
+             estimate_tokens(user_text, tokenizer_fn)),
         )
         first_id = cur.lastrowid
         cur = conn.execute(
             "INSERT INTO messages(session_id, turn, role, content, created_at,"
             " token_estimate) VALUES (?,?,?,?,?,?)",
             (session_id, turn, "assistant", assistant_text, now,
-             estimate_tokens(assistant_text)),
+             estimate_tokens(assistant_text, tokenizer_fn)),
         )
         last_id = cur.lastrowid
         conn.execute(
@@ -97,7 +104,7 @@ def record_turn(
 
         chunk_ids = []
         for text in _chunk_exchange(user_text, assistant_text,
-                                    config.chunk_target_tokens):
+                                    config.chunk_target_tokens, tokenizer_fn):
             cur = conn.execute(
                 "INSERT INTO chunks(session_id, first_msg_id, last_msg_id, text,"
                 " created_at) VALUES (?,?,?,?,?)",
@@ -107,12 +114,38 @@ def record_turn(
     return chunk_ids
 
 
-def _chunk_exchange(user_text: str, assistant_text: str,
-                    target_tokens: int) -> list[str]:
+# A chunk whose exchange yielded a durable fact (via rules.capture or the
+# background LLM extraction pass) is more likely to matter on future recall
+# than idle chat - bump it above the neutral 0.5 default new chunks get.
+# Matches semantic.SOURCE_IMPORTANCE's "import" tier: clearly more salient
+# than an unremarkable exchange, but not claiming the certainty of an
+# explicit user "remember this" (1.0).
+FACT_BEARING_IMPORTANCE = 0.8
+
+
+def bump_importance(conn: sqlite3.Connection, chunk_ids: list[int],
+                     importance: float = FACT_BEARING_IMPORTANCE) -> None:
+    """Raises chunks(id).importance to at least ``importance`` for the given
+    ids. Only ever raises, never lowers - a chunk already marked important by
+    an earlier pass (e.g. rule capture) keeps that weight even if a later
+    pass (e.g. LLM extraction on the same turn) would rate it lower."""
+    if not chunk_ids:
+        return
+    placeholders = ",".join("?" * len(chunk_ids))
+    with conn:
+        conn.execute(
+            f"UPDATE chunks SET importance = MAX(importance, ?) "
+            f"WHERE id IN ({placeholders})",
+            (importance, *chunk_ids),
+        )
+
+
+def _chunk_exchange(user_text: str, assistant_text: str, target_tokens: int,
+                    tokenizer_fn: TokenizerFn | None = None) -> list[str]:
     """One retrieval chunk per exchange; oversized exchanges split at
     sentence boundaries so no chunk grossly exceeds the target."""
     combined = f"User: {user_text}\nAssistant: {assistant_text}"
-    if estimate_tokens(combined) <= target_tokens:
+    if estimate_tokens(combined, tokenizer_fn) <= target_tokens:
         return [combined]
 
     sentences = re.split(r"(?<=[.!?])\s+", combined)
@@ -120,7 +153,7 @@ def _chunk_exchange(user_text: str, assistant_text: str,
     buf = ""
     for sentence in sentences:
         candidate = f"{buf} {sentence}".strip()
-        if buf and estimate_tokens(candidate) > target_tokens:
+        if buf and estimate_tokens(candidate, tokenizer_fn) > target_tokens:
             chunks.append(buf)
             buf = sentence
         else:

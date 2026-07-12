@@ -5,7 +5,11 @@ Ranking model, used everywhere: ``relevance × importance × recency``.
 * relevance — FTS5 BM25 rank and/or vector cosine, fused with Reciprocal
   Rank Fusion (RRF, ``1/(60+rank)``). Facts that match nothing keep a 0.3
   floor so important off-topic facts still surface.
-* importance — source-derived weight (explicit 1.0 … auto 0.5).
+* importance — for facts, source-derived weight (explicit 1.0 … auto 0.5,
+  see semantic.SOURCE_IMPORTANCE). For chunks, a neutral 0.5 baseline
+  bumped to 0.8 if the exchange yielded a stored fact (see
+  episodic.bump_importance) — the only per-chunk signal currently derived;
+  everything else scores as an average exchange.
 * recency — ``exp(-age_days / half_life)``.
 
 Degradation: no embeddings → FTS5 only; no FTS5 → ``LIKE`` term matching.

@@ -138,7 +138,7 @@ class Elastimem:
         """Host signal that an OOM/decode failure happened; downgrades a tier."""
         return self.governor.report_pressure()
 
-    def reconfigure(self, **config_overrides) -> MemoryProfile:
+    def reconfigure(self, *, reprobe: bool = False, **config_overrides) -> MemoryProfile:
         """Update config fields (e.g. after a model switch) and immediately
         rebuild token budgets from them.
 
@@ -150,12 +150,19 @@ class Elastimem:
             mem.reconfigure(context_tokens=new_model_ctx,
                             static_prompt_tokens=measured_prompt_tokens)
 
+        ``reprobe=True`` also re-measures hardware and re-classifies the
+        tier before rebuilding budgets (see ``Governor.reconfigure``) -
+        pass this when calling reconfigure() right after a (possibly large)
+        model finishes loading, since the store is normally constructed
+        before any model is chosen and its startup tier reading predates
+        that model claiming its share of RAM.
+
         Returns the refreshed :class:`MemoryProfile`.
         """
         if config_overrides:
             self.config = _resolve_config(self.config, config_overrides)
             self.governor.config = self.config
-        return self.governor.reconfigure()
+        return self.governor.reconfigure(reprobe=reprobe)
 
     def build_context(self, user_input: str = "") -> ContextPlan:
         """Assemble this turn's budgeted memory sections.
@@ -247,10 +254,14 @@ class Elastimem:
                 self._turn += 1
                 chunk_ids = episodic.record_turn(
                     self._conn, self.config, self.session_id, self._turn,
-                    user_text, assistant_text,
+                    user_text, assistant_text, tokenizer_fn=self.tokenizer_fn,
                 )
-            for key, value in rules.capture(user_text):
+            captured = rules.capture(user_text)
+            for key, value in captured:
                 self.remember(key, value, source="rule")
+            if captured:
+                with self._write_lock:
+                    episodic.bump_importance(self._conn, chunk_ids)
             self._after_record_turn(user_text, assistant_text, chunk_ids)
         except Exception:
             log.exception("elastimem: record_turn failed (chat unaffected)")
@@ -265,7 +276,8 @@ class Elastimem:
                 and len(user_text.split()) >= self.config.min_query_words):
             self._worker.submit(Job(
                 "extract", needs_llm=True,
-                payload={"user": user_text, "assistant": assistant_text},
+                payload={"user": user_text, "assistant": assistant_text,
+                         "chunk_ids": chunk_ids},
             ))
         if (self.embed_fn is not None and profile.embeddings_enabled and chunk_ids):
             self._worker.submit(Job("embed", needs_llm=False,
@@ -317,11 +329,14 @@ class Elastimem:
     def _execute_job(self, job: Job) -> None:
         conn = self._conn  # worker thread gets its own connection
         if job.kind == "extract" and self.complete_fn is not None:
-            extraction.extract_facts(
+            stored = extraction.extract_facts(
                 conn, self.config, self.complete_fn,
                 job.payload["user"], job.payload["assistant"],
                 store_fn=lambda k, v, s: self.remember(k, v, source=s),
             )
+            if stored and job.payload.get("chunk_ids"):
+                with self._write_lock:
+                    episodic.bump_importance(conn, job.payload["chunk_ids"])
         elif job.kind == "rolling_summary" and self.complete_fn is not None:
             summary = extraction.rolling_summary(
                 self.complete_fn, self.config, self._rolling, job.payload["turns"]
@@ -396,18 +411,41 @@ class Elastimem:
                     " role='user' ORDER BY id", (self.session_id,)
                 )
             ]
-            summary = extraction.session_summary(
-                self.complete_fn, self.config, user_turns
-            ) or None
+            # drain() only finishes what was already queued - the worker
+            # thread stays alive and could still pick up a job submitted by
+            # another thread between drain() returning and this call
+            # running. This call itself never went through the worker, so
+            # without llm_lock it could race a background complete_fn call
+            # against this one on the same (typically single-instance,
+            # non-thread-safe) model. Mirrors Worker._execute's own guard.
+            with self._worker.llm_lock:
+                summary = extraction.session_summary(
+                    self.complete_fn, self.config, user_turns
+                ) or None
 
-        with self._write_lock:
+        level = self.governor.profile.consolidation_level
+        llm_merge = level is ConsolidationLevel.FULL and self.complete_fn is not None
+        # consolidate() interleaves complete_fn calls with the writes below
+        # (contradiction-merge reviews a row, calls the model, writes the
+        # merged value, repeats) - can't cleanly separate "the LLM part"
+        # from "the DB part" into two locks without changing consolidate()
+        # itself. Acquire llm_lock BEFORE _write_lock, matching the order
+        # Worker._execute already uses everywhere else (llm_lock, then
+        # _write_lock inside _execute_job) - reversing that order here would
+        # be a lock-order inversion: this thread holding _write_lock while
+        # waiting on llm_lock, with the worker thread holding llm_lock while
+        # waiting on _write_lock inside its own consolidate job, deadlocks.
+        # Only taken when llm_merge is actually possible, so the common
+        # (DB-only consolidation) path pays no extra lock cost.
+        with contextlib.ExitStack() as stack:
+            if llm_merge:
+                stack.enter_context(self._worker.llm_lock)
+            stack.enter_context(self._write_lock)
             episodic.end_session(self._conn, self.session_id, summary)
-            level = self.governor.profile.consolidation_level
             if level is not ConsolidationLevel.OFF:
                 extraction.consolidate(
                     self._conn, self.config, self.complete_fn,
-                    llm_merge=(level is ConsolidationLevel.FULL
-                               and self.complete_fn is not None),
+                    llm_merge=llm_merge,
                 )
             self.session_id = None
             self._turn = 0

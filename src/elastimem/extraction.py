@@ -153,8 +153,9 @@ def consolidate(
             "SELECT old.key, old.value AS old_value, new.value AS new_value,"
             " new.id AS new_id FROM facts old JOIN facts new"
             " ON new.id = old.invalidated_by"
-            " WHERE old.invalidated_at >= datetime('now', '-7 days')"
-            " AND new.invalidated_at IS NULL LIMIT 5"
+            " WHERE old.invalidated_at >= datetime('now', ?)"
+            " AND new.invalidated_at IS NULL LIMIT 5",
+            (f"-{config.fact_merge_review_window_days} days",),
         ).fetchall()
         for row in recent_changes:
             merged = _call(

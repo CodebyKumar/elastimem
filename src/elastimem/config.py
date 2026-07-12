@@ -104,6 +104,15 @@ class ElastimemConfig:
     profile_keys: frozenset[str] = DEFAULT_PROFILE_KEYS
     reserved_keys: frozenset[str] = frozenset()   # host-owned keys Elastimem must reject
     quarantine_cap: int = 200
+    # How far back consolidate() looks for a key whose value changed, to
+    # offer the LLM a chance to merge OLD/NEW into one value instead of a
+    # blunt overwrite ("moving to Austin in May" + "lives in Austin"). A
+    # change older than this is assumed settled and reviewed only if it
+    # changes again. FULL tier only consolidates on session end / idle
+    # ticks, not continuously, so this should stay well above the gap
+    # between two such ticks in normal use, or genuinely-recent changes can
+    # age out of the window before consolidation ever sees them.
+    fact_merge_review_window_days: float = 7.0
 
     # --- procedural memory -------------------------------------------------
     max_lessons: int = 15            # older lessons archived beyond this
