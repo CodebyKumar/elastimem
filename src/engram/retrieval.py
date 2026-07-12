@@ -32,11 +32,29 @@ log = logging.getLogger("engram")
 
 _RRF_K = 60
 
+# Stopwords are stripped from queries (not from the index): in an OR query,
+# BM25's length normalization can let a short document win on "about"/"what"
+# alone, burying the document that matched the actual content words.
+_STOPWORDS = frozenset(
+    "a an and are as at be but by did do does for from had has have he her him "
+    "his how i if in is it its me my of on or our she so that the their them "
+    "they this to unclear us was we were what when where which who will with "
+    "you your about again also can could should would tell remind know talk "
+    "talked discuss discussed say said".split()
+)
+
+
+def _query_terms(text: str) -> list[str]:
+    terms = re.findall(r"[a-zA-Z0-9]{2,}", text.lower())
+    kept = [t for t in dict.fromkeys(terms) if t not in _STOPWORDS]
+    # An all-stopword query ("what did we do") falls back to the raw terms —
+    # a weak query beats no query.
+    return kept or list(dict.fromkeys(terms))
+
 
 def _fts_query(text: str) -> str:
-    """Turn free text into a safe FTS5 OR-query of quoted terms."""
-    terms = re.findall(r"[a-zA-Z0-9]{2,}", text.lower())
-    return " OR ".join(f'"{t}"' for t in dict.fromkeys(terms))  # deduped, ordered
+    """Turn free text into a safe FTS5 OR-query of quoted content terms."""
+    return " OR ".join(f'"{t}"' for t in _query_terms(text))
 
 
 def _rrf(rank: int) -> float:
@@ -160,6 +178,29 @@ def search_chunks(
     return hits[:k]
 
 
+def search_all(store: "Engram", query: str, k: int = 5) -> list[Hit]:
+    """Chunks + facts combined — backs ``Engram.recall()`` and search tools."""
+    hits = search_chunks(store, query, k=k)
+    conn = store._conn
+    for fact_id, rel in fact_relevance(conn, query, fts=store.fts_enabled).items():
+        row = conn.execute(
+            "SELECT key, value, importance, valid_from FROM facts WHERE id=?",
+            (fact_id,),
+        ).fetchone()
+        if row is None:
+            continue
+        recency = math.exp(
+            -_days_since(row["valid_from"]) / store.config.fact_recency_half_life_days
+        )
+        hits.append(
+            Hit(kind="fact", text=f"{row['key']}: {row['value']}",
+                date=row["valid_from"][:10],
+                score=rel * row["importance"] * recency)
+        )
+    hits.sort(key=lambda h: h.score, reverse=True)
+    return hits[:k]
+
+
 def episodic_section(
     store: "Engram",
     query: str,
@@ -188,7 +229,7 @@ def _like_match(
     where: str = "1=1",
 ) -> list[sqlite3.Row]:
     """Degradation floor when FTS5 is unavailable: rank by LIKE term count."""
-    terms = re.findall(r"[a-zA-Z0-9]{2,}", query.lower())[:8]
+    terms = _query_terms(query)[:8]
     if not terms:
         return []
     score_expr = " + ".join(

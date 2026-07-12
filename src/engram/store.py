@@ -13,7 +13,7 @@ import sqlite3
 import threading
 from typing import Callable
 
-from . import assembly, procedural, semantic
+from . import assembly, episodic, procedural, rules, semantic
 from .assembly import ContextPlan
 from .config import EngramConfig, MemoryProfile
 from .db import open_store, connect
@@ -62,6 +62,12 @@ class Engram:
         if probe_fn is not None:
             governor_kwargs["probe_fn"] = probe_fn
         self.governor = Governor(self.config, **governor_kwargs)
+
+        # Session state (lazy: first record_turn opens one).
+        self.session_id: int | None = None
+        self._turn = 0
+        with self._write_lock:
+            episodic.close_orphan_sessions(conn)
 
     # ------------------------------------------------------------------ #
     # connections
@@ -155,6 +161,83 @@ class Engram:
     def _rolling_summary(self) -> str | None:
         """Current session's rolling summary (populated from phase 4 onward)."""
         return None
+
+    # ------------------------------------------------------------------ #
+    # episodic memory (turns, sessions, recall)
+    # ------------------------------------------------------------------ #
+    def begin_session(self, host_tag: str | None = None) -> int:
+        """Start a new session explicitly (record_turn does this lazily)."""
+        with self._write_lock:
+            if self.session_id is not None:
+                episodic.end_session(self._conn, self.session_id)
+            self.session_id = episodic.begin_session(self._conn, host_tag)
+            self._turn = 0
+        return self.session_id
+
+    def record_turn(self, user_text: str, assistant_text: str) -> None:
+        """Persist one exchange and run inline rule capture.
+
+        Never raises: memory writes must not break the host's chat loop.
+        """
+        try:
+            with self._write_lock:
+                if self.session_id is None:
+                    self.session_id = episodic.begin_session(self._conn)
+                self._turn += 1
+                chunk_ids = episodic.record_turn(
+                    self._conn, self.config, self.session_id, self._turn,
+                    user_text, assistant_text,
+                )
+            for key, value in rules.capture(user_text):
+                self.remember(key, value, source="rule")
+            self._after_record_turn(user_text, assistant_text, chunk_ids)
+        except Exception:
+            log.exception("engram: record_turn failed (chat unaffected)")
+
+    def _after_record_turn(
+        self, user_text: str, assistant_text: str, chunk_ids: list[int]
+    ) -> None:
+        """Hook for deferred work (LLM extraction, embedding) — phase 4/5."""
+
+    def recall(self, query: str, k: int = 5) -> list:
+        """Search past conversations and facts. Works in every tier; returns
+        a list of :class:`engram.retrieval.Hit`, best first. Never raises."""
+        try:
+            from . import retrieval
+
+            return retrieval.search_all(self, query, k=k)
+        except Exception:
+            log.exception("engram: recall failed")
+            return []
+
+    def sessions(self, n: int = 20) -> list[dict]:
+        """Recent sessions, newest first."""
+        return episodic.list_sessions(self._conn, n)
+
+    def resume_session(self, session_id: int | None = None) -> tuple[str | None, list[dict]]:
+        """Return ``(rolling_summary, tail_messages)`` of a past session so the
+        host can reload them into its message list. Defaults to the most
+        recently ended session. Starts a fresh session for new turns."""
+        conn = self._conn
+        if session_id is None:
+            row = conn.execute(
+                "SELECT id FROM sessions WHERE ended_at IS NOT NULL"
+                " AND message_count > 0 ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if row is None:
+                return None, []
+            session_id = row["id"]
+        return episodic.session_tail(
+            conn, session_id, self.governor.profile.budgets.working
+        )
+
+    def end_session(self) -> None:
+        """Close the current session (summary generation arrives in phase 4)."""
+        with self._write_lock:
+            if self.session_id is not None:
+                episodic.end_session(self._conn, self.session_id)
+                self.session_id = None
+                self._turn = 0
 
     # ------------------------------------------------------------------ #
     # semantic memory (facts)
