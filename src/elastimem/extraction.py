@@ -16,10 +16,10 @@ import sqlite3
 from typing import Callable
 
 from . import semantic
-from .config import EngramConfig
+from .config import ElastimemConfig
 from .db import utcnow
 
-log = logging.getLogger("engram")
+log = logging.getLogger("elastimem")
 
 CompleteFn = Callable[..., str]
 
@@ -60,13 +60,13 @@ def _call(complete_fn: CompleteFn, system: str, user: str, max_tokens: int) -> s
         )
         return (out or "").strip()
     except Exception:
-        log.exception("engram: background completion failed")
+        log.exception("elastimem: background completion failed")
         return ""
 
 
 def extract_facts(
     conn: sqlite3.Connection,
-    config: EngramConfig,
+    config: ElastimemConfig,
     complete_fn: CompleteFn,
     user_text: str,
     assistant_text: str,
@@ -102,7 +102,7 @@ def extract_facts(
 
 def rolling_summary(
     complete_fn: CompleteFn,
-    config: EngramConfig,
+    config: ElastimemConfig,
     previous_summary: str | None,
     evicted_turns: list[tuple[str, str]],
 ) -> str:
@@ -119,7 +119,7 @@ def rolling_summary(
 
 
 def session_summary(
-    complete_fn: CompleteFn, config: EngramConfig, user_turns: list[str]
+    complete_fn: CompleteFn, config: ElastimemConfig, user_turns: list[str]
 ) -> str:
     """1-2 sentence episodic summary; '' when the session was trivial."""
     if len(user_turns) < 2:
@@ -134,7 +134,7 @@ def session_summary(
 # --------------------------------------------------------------------------- #
 def consolidate(
     conn: sqlite3.Connection,
-    config: EngramConfig,
+    config: ElastimemConfig,
     complete_fn: CompleteFn | None,
     *,
     llm_merge: bool,

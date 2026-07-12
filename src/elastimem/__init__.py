@@ -1,10 +1,10 @@
-"""Engram — elastic, resource-adaptive memory for local-first AI agents.
+"""Elastimem — elastic, resource-adaptive memory for local-first AI agents.
 
 Quickstart::
 
-    from engram import Engram
+    from elastimem import Elastimem
 
-    mem = Engram("~/.myagent/memory.db")
+    mem = Elastimem("~/.myagent/memory.db")
     mem.remember("favorite_color", "blue")
     mem.facts()   # {'favorite_color': 'blue'}
 """
@@ -13,18 +13,18 @@ from .config import (
     Budgets,
     Cadence,
     ConsolidationLevel,
-    EngramConfig,
+    ElastimemConfig,
     MemoryProfile,
     Tier,
 )
 from .semantic import Fact
-from .store import Engram
+from .store import Elastimem
 
 __version__ = "0.1.0"
 
 __all__ = [
-    "Engram",
-    "EngramConfig",
+    "Elastimem",
+    "ElastimemConfig",
     "MemoryProfile",
     "Budgets",
     "Tier",

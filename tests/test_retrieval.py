@@ -3,8 +3,8 @@
 import hashlib
 import math
 
-from engram import Engram, EngramConfig
-from engram.governor import GIB
+from elastimem import Elastimem, ElastimemConfig
+from elastimem.governor import GIB
 
 
 def toy_embed(texts):
@@ -25,7 +25,7 @@ def toy_embed(texts):
 
 
 def make_store(path, embed=toy_embed, **cfg):
-    return Engram(str(path), embed_fn=embed, config=EngramConfig(**cfg),
+    return Elastimem(str(path), embed_fn=embed, config=ElastimemConfig(**cfg),
                   probe_fn=lambda: (32 * GIB, 20 * GIB))
 
 
@@ -80,7 +80,7 @@ def test_embed_failure_degrades_to_fts_only(tmp_path):
 
 
 def test_embed_backfill(tmp_path):
-    from engram import embeddings
+    from elastimem import embeddings
 
     path = tmp_path / "bf.db"
     s = make_store(path, embed=None)   # no embedder: chunks stay unembedded

@@ -1,11 +1,11 @@
 """Episodic memory: persistence, sessions, chunking, recall across sessions."""
 
-from engram import Engram, EngramConfig
-from engram.governor import GIB
+from elastimem import Elastimem, ElastimemConfig
+from elastimem.governor import GIB
 
 
 def make_store(path, **cfg_kwargs):
-    return Engram(str(path), config=EngramConfig(**cfg_kwargs),
+    return Elastimem(str(path), config=ElastimemConfig(**cfg_kwargs),
                   probe_fn=lambda: (32 * GIB, 20 * GIB))
 
 

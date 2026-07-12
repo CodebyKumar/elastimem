@@ -7,12 +7,12 @@ from __future__ import annotations
 
 import sqlite3
 
-from .config import EngramConfig
+from .config import ElastimemConfig
 from .db import utcnow
 
 
 def add_lesson(
-    conn: sqlite3.Connection, config: EngramConfig, text: str, tag: str | None = None
+    conn: sqlite3.Connection, config: ElastimemConfig, text: str, tag: str | None = None
 ) -> bool:
     text = text.strip()
     if not text:

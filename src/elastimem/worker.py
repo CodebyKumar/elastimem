@@ -29,9 +29,9 @@ from typing import TYPE_CHECKING, Any, Callable
 from .config import Cadence
 
 if TYPE_CHECKING:
-    from .store import Engram
+    from .store import Elastimem
 
-log = logging.getLogger("engram")
+log = logging.getLogger("elastimem")
 
 _SENTINEL = object()
 
@@ -45,7 +45,7 @@ class Job:
 
 
 class Worker:
-    def __init__(self, store: "Engram") -> None:
+    def __init__(self, store: "Elastimem") -> None:
         self._store = store
         self._queue: "queue.Queue[Job | object]" = queue.Queue()
         self._foreground_busy = threading.Event()
@@ -55,7 +55,7 @@ class Worker:
         self._batch: list[Job] = []              # BATCHED-cadence extractions
         self._turns_since_batch = 0
         self._thread = threading.Thread(
-            target=self._run, name="engram-worker", daemon=True
+            target=self._run, name="elastimem-worker", daemon=True
         )
         self._thread.start()
 
@@ -121,7 +121,7 @@ class Worker:
             try:
                 self._execute(job)
             except Exception:
-                log.exception("engram worker: %s job failed", job.kind)
+                log.exception("elastimem worker: %s job failed", job.kind)
             finally:
                 if (self._queue.empty() and not self._held_llm_jobs):
                     self._idle.set()

@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from . import guards
-from .config import EngramConfig
+from .config import ElastimemConfig
 from .db import utcnow
 
 SOURCE_IMPORTANCE = {"explicit": 1.0, "rule": 0.7, "auto": 0.5, "import": 0.8}
@@ -50,7 +50,7 @@ def _row_to_fact(row: sqlite3.Row) -> Fact:
 
 def store_fact(
     conn: sqlite3.Connection,
-    config: EngramConfig,
+    config: ElastimemConfig,
     key: str,
     value: str,
     source: str = "explicit",
@@ -162,14 +162,14 @@ def touch(conn: sqlite3.Connection, fact_ids: list[int]) -> None:
         )
 
 
-def effective_importance(fact_row: sqlite3.Row, config: EngramConfig) -> float:
+def effective_importance(fact_row: sqlite3.Row, config: ElastimemConfig) -> float:
     """Decayed importance: ``importance * exp(-days_since_access/half_life)``."""
     anchor = fact_row["last_accessed_at"] or fact_row["valid_from"]
     days = _days_since(anchor)
     return fact_row["importance"] * math.exp(-days / config.fact_decay_half_life_days)
 
 
-def apply_decay(conn: sqlite3.Connection, config: EngramConfig) -> int:
+def apply_decay(conn: sqlite3.Connection, config: ElastimemConfig) -> int:
     """Archive decayed auto-facts. Explicit/rule/import facts are never
     auto-archived. Returns the number archived."""
     archived = 0

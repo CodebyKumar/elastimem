@@ -1,6 +1,6 @@
-# Engram Architecture
+# Elastimem Architecture
 
-Engram is a memory *library* for AI agents, not an agent runtime. It owns one
+Elastimem is a memory *library* for AI agents, not an agent runtime. It owns one
 SQLite file and answers two questions for its host, every turn:
 
 1. **What should the model see right now?** → `build_context(user_input)`
@@ -12,7 +12,7 @@ capacity.
 
 ## Design principles
 
-- **Host-agnostic.** Engram never loads a model, imports an inference
+- **Host-agnostic.** Elastimem never loads a model, imports an inference
   library, or calls an API. The host injects `complete_fn` (text completion)
   and `embed_fn` (embeddings) as plain callables. Both are optional.
 - **Elastic.** The [Memory Governor](governor.md) probes RAM and the model's
@@ -41,7 +41,7 @@ capacity.
 ```
 
 ### Working memory (`working` plan inside `ContextPlan`)
-Engram does not own the host's message list. `build_context()` returns
+Elastimem does not own the host's message list. `build_context()` returns
 `keep_last_n_turns` (how many verbatim turns the working budget affords) and
 `rolling_summary` (an LLM-condensed digest of turns the host evicted and
 reported via `report_evictions()`). Without an LLM, the rolling summary

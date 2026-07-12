@@ -1,13 +1,13 @@
 """Context assembly: sections, budgets, ordering, rendering."""
 
-from engram import Engram, EngramConfig, Tier
-from engram.governor import GIB
-from engram import assembly
+from elastimem import Elastimem, ElastimemConfig, Tier
+from elastimem.governor import GIB
+from elastimem import assembly
 
 
 def make_store(tmp_path, avail_gib=20.0, **cfg_kwargs):
-    cfg = EngramConfig(**cfg_kwargs)
-    return Engram(str(tmp_path / "a.db"), config=cfg,
+    cfg = ElastimemConfig(**cfg_kwargs)
+    return Elastimem(str(tmp_path / "a.db"), config=cfg,
                   probe_fn=lambda: (32 * GIB, int(avail_gib * GIB)))
 
 
@@ -74,7 +74,7 @@ def test_custom_tokenizer_is_used(tmp_path):
         calls.append(text)
         return len(text)  # brutal: 1 token per char → tiny effective budgets
 
-    s = Engram(str(tmp_path / "t.db"), tokenizer_fn=tok,
+    s = Elastimem(str(tmp_path / "t.db"), tokenizer_fn=tok,
                probe_fn=lambda: (32 * GIB, 20 * GIB))
     s.remember("name", "Alexandra von Longname")
     s.build_context()

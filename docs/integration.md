@@ -1,6 +1,6 @@
 # Integration guide
 
-Engram needs, at most, two callables from you:
+Elastimem needs, at most, two callables from you:
 
 ```python
 complete_fn(prompt: str, *, max_tokens: int, temperature: float) -> str
@@ -12,9 +12,9 @@ Both optional. Everything below is progressive enhancement.
 ## Level 0 — no LLM at all
 
 ```python
-from engram import Engram
+from elastimem import Elastimem
 
-mem = Engram("~/.myapp/memory.db")
+mem = Elastimem("~/.myapp/memory.db")
 mem.record_turn(user_text, reply_text)   # transcripts + regex fact capture
 ctx = mem.build_context(user_text)       # facts/lessons/episodic via FTS5
 hits = mem.recall("that thing about the car")
@@ -26,12 +26,12 @@ episodic recall, budgeted context sections. See `examples/minimal_bot.py`.
 ## Level 1 — llama.cpp host (single model instance)
 
 The one hard rule: **your model instance is not thread-safe, so bracket your
-own generation with the foreground gate.** Engram's background jobs then
+own generation with the foreground gate.** Elastimem's background jobs then
 interleave between turns.
 
 ```python
 from llama_cpp import Llama
-from engram import Engram, EngramConfig
+from elastimem import Elastimem, ElastimemConfig
 
 llm = Llama(model_path="model.gguf", n_ctx=4096, ...)
 
@@ -41,9 +41,9 @@ def complete_fn(prompt, *, max_tokens, temperature):
         max_tokens=max_tokens, temperature=temperature)
     return out["choices"][0]["message"]["content"]
 
-mem = Engram("~/.myagent/memory.db",
+mem = Elastimem("~/.myagent/memory.db",
              complete_fn=complete_fn,
-             config=EngramConfig(context_tokens=4096,
+             config=ElastimemConfig(context_tokens=4096,
                                  static_prompt_tokens=measured_prompt_tokens,
                                  reserved_keys=frozenset({"model", "agent_name"})))
 
@@ -55,7 +55,7 @@ with mem.foreground():                       # hold background LLM jobs
     reply = generate(system_prompt, history[-plan.keep_last_n_turns*2:], user_input)
 mem.record_turn(user_input, reply)
 
-# if you trim your history list, tell Engram:
+# if you trim your history list, tell Elastimem:
 mem.report_evictions(evicted_pairs)          # -> rolling summary
 # feed plan.rolling_summary back as a system-side note next turn
 
@@ -80,7 +80,7 @@ See `examples/llama_cpp_bot.py` for a complete program.
 API models don't contend for local RAM, so the foreground gate matters less
 (still harmless). Wire `complete_fn` to your chat endpoint and `embed_fn` to
 an embeddings endpoint; set `context_tokens` to the model's window. You may
-pin `ENGRAM_TIER=full` since the machine isn't running the model.
+pin `ELASTIMEM_TIER=full` since the machine isn't running the model.
 
 ## Exposing memory to your agent as tools
 

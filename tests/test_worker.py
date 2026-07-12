@@ -5,8 +5,8 @@ import json
 import threading
 import time
 
-from engram import Engram, EngramConfig, Tier
-from engram.governor import GIB
+from elastimem import Elastimem, ElastimemConfig, Tier
+from elastimem.governor import GIB
 
 
 class FakeLLM:
@@ -37,7 +37,7 @@ class FakeLLM:
 
 
 def full_store(path, llm, **cfg):
-    return Engram(str(path), complete_fn=llm, config=EngramConfig(**cfg),
+    return Elastimem(str(path), complete_fn=llm, config=ElastimemConfig(**cfg),
                   probe_fn=lambda: (32 * GIB, 20 * GIB))
 
 
@@ -49,7 +49,7 @@ def test_background_extraction_stores_facts(tmp_path):
     assert s.drain(timeout=5)
     assert s.facts().get("favorite_sport") == "badminton"
     # extraction happened on the worker thread, not the caller's
-    assert any(c["thread"] == "engram-worker" for c in llm.calls)
+    assert any(c["thread"] == "elastimem-worker" for c in llm.calls)
     s.close()
 
 
@@ -83,7 +83,7 @@ def test_record_turn_returns_fast_despite_slow_llm(tmp_path):
 
 def test_lite_tier_never_calls_llm(tmp_path):
     llm = FakeLLM(fact_json={"anything": "value"})
-    s = Engram(str(tmp_path / "l.db"), complete_fn=llm,
+    s = Elastimem(str(tmp_path / "l.db"), complete_fn=llm,
                probe_fn=lambda: (4 * GIB, 2 * GIB))
     assert s.profile.tier is Tier.LITE
     s.record_turn("i adore mountain hiking every summer", "Wonderful!")
@@ -95,8 +95,8 @@ def test_lite_tier_never_calls_llm(tmp_path):
 def test_batched_cadence_coalesces(tmp_path):
     llm = FakeLLM(fact_json={"k": "v"})
     # STANDARD tier -> BATCHED every 3 turns
-    s = Engram(str(tmp_path / "b.db"), complete_fn=llm,
-               config=EngramConfig(batched_every_n_turns=3),
+    s = Elastimem(str(tmp_path / "b.db"), complete_fn=llm,
+               config=ElastimemConfig(batched_every_n_turns=3),
                probe_fn=lambda: (8 * GIB, 4 * GIB))
     s.record_turn("first message with plenty of words", "ok")
     s.record_turn("second message with plenty of words", "ok")
@@ -120,7 +120,7 @@ def test_rolling_summary_from_evictions(tmp_path):
 
 
 def test_rolling_summary_placeholder_without_llm(tmp_path):
-    s = Engram(str(tmp_path / "p.db"), probe_fn=lambda: (32 * GIB, 20 * GIB))
+    s = Elastimem(str(tmp_path / "p.db"), probe_fn=lambda: (32 * GIB, 20 * GIB))
     s.record_turn("hello there friend of mine", "hi!")
     s.report_evictions([("hello there friend of mine", "hi!")])
     plan = s.build_context()

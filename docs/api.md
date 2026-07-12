@@ -1,8 +1,8 @@
 # Public API reference
 
-Everything importable from `engram` is public; everything else is internal.
+Everything importable from `elastimem` is public; everything else is internal.
 
-## `Engram(path, *, complete_fn=None, embed_fn=None, config=None, tokenizer_fn=None, probe_fn=None, on_tier_change=None)`
+## `Elastimem(path, *, complete_fn=None, embed_fn=None, config=None, tokenizer_fn=None, probe_fn=None, on_tier_change=None)`
 
 One persistent store backed by one SQLite file (`":memory:"` supported).
 
@@ -59,11 +59,11 @@ One persistent store backed by one SQLite file (`":memory:"` supported).
   lessons`, tokens), `embeddings_enabled`, `llm_extraction_enabled`,
   `extraction_cadence`, `rolling_summary_enabled`, `consolidation_level`,
   `episodic_top_k`.
-- **`Hit`** (from `engram.retrieval`) — `kind` (`chunk|fact`), `text`,
+- **`Hit`** (from `elastimem.retrieval`) — `kind` (`chunk|fact`), `text`,
   `date`, `score`, `session_id`.
 - **`Fact`** — `key`, `value`, `category`, `source`, `importance`,
   `valid_from`, `invalidated_at`, `archived`.
-- **`EngramConfig`** — see docstrings in `engram/config.py`; notable fields:
+- **`ElastimemConfig`** — see docstrings in `elastimem/config.py`; notable fields:
   `context_tokens`, `static_prompt_tokens`, `reserved_keys`, `profile_keys`,
   `chunk_target_tokens`, `worker_max_tokens`, `tier_override`.
-- **`Tier`** — `LITE < STANDARD < FULL`; env override `ENGRAM_TIER`.
+- **`Tier`** — `LITE < STANDARD < FULL`; env override `ELASTIMEM_TIER`.

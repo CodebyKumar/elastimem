@@ -1,6 +1,6 @@
 # The Memory Governor — normative spec
 
-The governor makes Engram *elastic*: it measures what the machine can afford
+The governor makes Elastimem *elastic*: it measures what the machine can afford
 and sizes every memory capability accordingly, continuously. This document is
 the specification; `governor.py` implements it and `tests/test_governor.py` +
 `tests/test_degradation.py` enforce it.
@@ -10,9 +10,9 @@ the specification; `governor.py` implements it and `tests/test_governor.py` +
 | Input | Source | When |
 |---|---|---|
 | RAM total / available | `psutil` if installed, else `/proc/meminfo` (Linux) or `sysctl` + `vm_stat` (macOS); unknown platforms assume 8/4 GiB | startup + every `tick()` |
-| `context_tokens` | `EngramConfig` (host passes its model's `n_ctx`) | construction |
-| `static_prompt_tokens` | `EngramConfig` (host measures its fixed prompt) | construction |
-| Tier override | `ENGRAM_TIER=lite\|standard\|full` or `EngramConfig.tier_override` | construction (pins the tier) |
+| `context_tokens` | `ElastimemConfig` (host passes its model's `n_ctx`) | construction |
+| `static_prompt_tokens` | `ElastimemConfig` (host measures its fixed prompt) | construction |
+| Tier override | `ELASTIMEM_TIER=lite\|standard\|full` or `ElastimemConfig.tier_override` | construction (pins the tier) |
 | Pressure signal | host calls `report_pressure()` on OOM / decode failure | runtime |
 
 ## Tier classification

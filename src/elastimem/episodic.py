@@ -16,7 +16,7 @@ import re
 import sqlite3
 
 from .assembly import estimate_tokens
-from .config import EngramConfig
+from .config import ElastimemConfig
 from .db import utcnow
 
 
@@ -67,7 +67,7 @@ def end_session(
 
 def record_turn(
     conn: sqlite3.Connection,
-    config: EngramConfig,
+    config: ElastimemConfig,
     session_id: int,
     turn: int,
     user_text: str,

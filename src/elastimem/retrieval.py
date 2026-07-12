@@ -26,9 +26,9 @@ from .config import MemoryProfile
 from .semantic import _days_since
 
 if TYPE_CHECKING:
-    from .store import Engram
+    from .store import Elastimem
 
-log = logging.getLogger("engram")
+log = logging.getLogger("elastimem")
 
 _RRF_K = 60
 
@@ -92,7 +92,7 @@ def fact_relevance(
         top = max(raw.values())
         return {fid: score / top for fid, score in raw.items()}
     except sqlite3.Error:
-        log.exception("engram: fact relevance query failed")
+        log.exception("elastimem: fact relevance query failed")
         return {}
 
 
@@ -111,7 +111,7 @@ class Hit:
 
 
 def search_chunks(
-    store: "Engram",
+    store: "Elastimem",
     query: str,
     k: int = 8,
     exclude_session: int | None = None,
@@ -134,7 +134,7 @@ def search_chunks(
             for i, row in enumerate(rows):
                 fused[row["id"]] = fused.get(row["id"], 0.0) + _rrf(i)
         except sqlite3.Error:
-            log.exception("engram: chunk FTS query failed")
+            log.exception("elastimem: chunk FTS query failed")
 
     # Vector leg (phase 5): only when the store has an embedder wired and the
     # governor allows it.
@@ -178,8 +178,8 @@ def search_chunks(
     return hits[:k]
 
 
-def search_all(store: "Engram", query: str, k: int = 5) -> list[Hit]:
-    """Chunks + facts combined — backs ``Engram.recall()`` and search tools."""
+def search_all(store: "Elastimem", query: str, k: int = 5) -> list[Hit]:
+    """Chunks + facts combined — backs ``Elastimem.recall()`` and search tools."""
     hits = search_chunks(store, query, k=k)
     conn = store._conn
     for fact_id, rel in fact_relevance(conn, query, fts=store.fts_enabled).items():
@@ -202,7 +202,7 @@ def search_all(store: "Engram", query: str, k: int = 5) -> list[Hit]:
 
 
 def episodic_section(
-    store: "Engram",
+    store: "Elastimem",
     query: str,
     profile: MemoryProfile,
     tokenizer_fn=None,

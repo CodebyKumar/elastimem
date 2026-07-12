@@ -1,8 +1,8 @@
-"""Configuration and shared value types for Engram.
+"""Configuration and shared value types for Elastimem.
 
 Three objects travel through the whole framework:
 
-* :class:`EngramConfig` — host-supplied knobs, all optional.
+* :class:`ElastimemConfig` — host-supplied knobs, all optional.
 * :class:`Tier` — the governor's coarse resource class (LITE/STANDARD/FULL).
 * :class:`MemoryProfile` — the governor's *output*: a frozen snapshot of every
   capability decision and token budget, consumed by retrieval assembly and the
@@ -25,8 +25,8 @@ class Tier(enum.IntEnum):
 
     @classmethod
     def from_env(cls) -> "Tier | None":
-        """Read the ENGRAM_TIER override (``lite|standard|full``), if set."""
-        raw = os.environ.get("ENGRAM_TIER", "").strip().lower()
+        """Read the ELASTIMEM_TIER override (``lite|standard|full``), if set."""
+        raw = os.environ.get("ELASTIMEM_TIER", "").strip().lower()
         return {"lite": cls.LITE, "standard": cls.STANDARD, "full": cls.FULL}.get(raw)
 
 
@@ -85,7 +85,7 @@ DEFAULT_PROFILE_KEYS = frozenset(
 
 
 @dataclass
-class EngramConfig:
+class ElastimemConfig:
     """Host-tunable configuration. Every field has a sensible default.
 
     ``context_tokens`` should be the context window of the host's chat model
@@ -102,7 +102,7 @@ class EngramConfig:
 
     # --- fact hygiene ------------------------------------------------------
     profile_keys: frozenset[str] = DEFAULT_PROFILE_KEYS
-    reserved_keys: frozenset[str] = frozenset()   # host-owned keys Engram must reject
+    reserved_keys: frozenset[str] = frozenset()   # host-owned keys Elastimem must reject
     quarantine_cap: int = 200
 
     # --- procedural memory -------------------------------------------------

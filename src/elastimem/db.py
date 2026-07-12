@@ -1,10 +1,10 @@
 """SQLite layer: schema, migrations, connections, corruption recovery.
 
-One Engram store is one SQLite file in WAL mode. Concurrency model:
+One Elastimem store is one SQLite file in WAL mode. Concurrency model:
 
 * WAL allows one writer and many readers at once.
 * Each thread gets its own connection (:func:`connect` is cheap; callers cache
-  per-thread). All writes are serialized through ``Engram._write_lock`` at the
+  per-thread). All writes are serialized through ``Elastimem._write_lock`` at the
   store level, so ``check_same_thread=False`` is never needed.
 * FTS5 is feature-detected once per store; when absent, retrieval falls back
   to ``LIKE`` matching (see the degradation matrix in docs/governor.md).
@@ -17,7 +17,7 @@ import os
 import sqlite3
 import time
 
-log = logging.getLogger("engram")
+log = logging.getLogger("elastimem")
 
 SCHEMA_VERSION = 1
 
@@ -172,7 +172,7 @@ def open_store(path: str) -> tuple[sqlite3.Connection, bool]:
         conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
     except sqlite3.DatabaseError:
         quarantined = f"{path}.corrupt-{int(time.time())}"
-        log.warning("engram: store at %s is corrupt; moving to %s and recreating",
+        log.warning("elastimem: store at %s is corrupt; moving to %s and recreating",
                     path, quarantined)
         os.replace(path, quarantined)
         conn = connect(path)
@@ -198,8 +198,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
     current = int(row["value"])
     if current > SCHEMA_VERSION:
         raise RuntimeError(
-            f"store schema v{current} is newer than this engram (v{SCHEMA_VERSION}); "
-            "upgrade the engram package"
+            f"store schema v{current} is newer than this elastimem (v{SCHEMA_VERSION}); "
+            "upgrade the elastimem package"
         )
     # future: stepwise `if current < 2: ...` blocks, then bump the meta row.
 

@@ -4,7 +4,7 @@
 greedily filled to the governor's token budget for that section. The host
 renders sections into its own prompt format (or calls :meth:`ContextPlan.render`
 for a sensible plain-text default) and applies the working-window guidance to
-its own message list. Engram plans; the host applies.
+its own message list. Elastimem plans; the host applies.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from . import semantic
-from .config import EngramConfig, MemoryProfile
+from .config import ElastimemConfig, MemoryProfile
 from .semantic import _days_since
 
 TokenizerFn = Callable[[str], int]
@@ -77,7 +77,7 @@ def fit_lines(lines: list[str], budget_tokens: int,
 
 def build_facts_section(
     conn: sqlite3.Connection,
-    config: EngramConfig,
+    config: ElastimemConfig,
     profile: MemoryProfile,
     relevance: dict[int, float] | None = None,
     tokenizer_fn: TokenizerFn | None = None,
@@ -113,7 +113,7 @@ def build_facts_section(
 
 def build_lessons_section(
     conn: sqlite3.Connection,
-    config: EngramConfig,
+    config: ElastimemConfig,
     profile: MemoryProfile,
     tokenizer_fn: TokenizerFn | None = None,
 ) -> str:

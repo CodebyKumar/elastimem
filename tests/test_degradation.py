@@ -3,8 +3,8 @@ floor when its dependency is missing — never an exception to the host."""
 
 import time
 
-from engram import Engram, EngramConfig, Tier
-from engram.governor import GIB
+from elastimem import Elastimem, ElastimemConfig, Tier
+from elastimem.governor import GIB
 
 
 def test_lite_tier_never_calls_embed_fn(tmp_path):
@@ -14,7 +14,7 @@ def test_lite_tier_never_calls_embed_fn(tmp_path):
         calls.append(texts)
         return [[0.0] * 8 for _ in texts]
 
-    s = Engram(str(tmp_path / "l.db"), embed_fn=spy_embed,
+    s = Elastimem(str(tmp_path / "l.db"), embed_fn=spy_embed,
                probe_fn=lambda: (4 * GIB, 2 * GIB))
     assert s.profile.tier is Tier.LITE
     s.record_turn("my car needs brake pads replaced soon", "Noted!")
@@ -27,14 +27,14 @@ def test_lite_tier_never_calls_embed_fn(tmp_path):
 def test_no_llm_no_embedder_still_fully_functional(tmp_path):
     """The zero-capability floor: rules + FTS5 + explicit memory."""
     path = tmp_path / "bare.db"
-    s = Engram(str(path), probe_fn=lambda: (32 * GIB, 20 * GIB))
+    s = Elastimem(str(path), probe_fn=lambda: (32 * GIB, 20 * GIB))
     s.record_turn("my name is Kavya and I live in Pune",
                   "Nice to meet you, Kavya!")
     s.remember("dietary_restriction", "vegetarian")
     s.end_session()
     s.close()
 
-    s2 = Engram(str(path), probe_fn=lambda: (32 * GIB, 20 * GIB))
+    s2 = Elastimem(str(path), probe_fn=lambda: (32 * GIB, 20 * GIB))
     assert s2.facts()["name"] == "Kavya"                      # rule capture
     assert s2.facts()["dietary_restriction"] == "vegetarian"  # explicit
     assert s2.recall("where does the user live")              # FTS recall
@@ -55,7 +55,7 @@ def test_tier_downgrade_mid_session_stops_llm_and_embeddings(tmp_path):
         embed_calls.append(texts)
         return [[0.0] * 8 for _ in texts]
 
-    s = Engram(str(tmp_path / "d.db"), complete_fn=llm, embed_fn=embed,
+    s = Elastimem(str(tmp_path / "d.db"), complete_fn=llm, embed_fn=embed,
                probe_fn=lambda: (32 * GIB, int(ram["avail"] * GIB)))
     s.record_turn("i enjoy long evening walks by the river", "Lovely!")
     s.drain(timeout=5)
@@ -76,7 +76,7 @@ def test_consolidation_llm_merge(tmp_path):
             return "Austin (moving in May)"
         return "NONE"
 
-    s = Engram(str(tmp_path / "m.db"), complete_fn=merging_llm,
+    s = Elastimem(str(tmp_path / "m.db"), complete_fn=merging_llm,
                probe_fn=lambda: (32 * GIB, 20 * GIB))
     s.remember("location", "Seattle")
     s.remember("location", "moving to Austin in May")
@@ -89,7 +89,7 @@ def test_consolidation_llm_merge(tmp_path):
 
 
 def test_pressure_report_is_immediate_and_survives_recovery_rules(tmp_path):
-    s = Engram(str(tmp_path / "p.db"), probe_fn=lambda: (32 * GIB, 20 * GIB))
+    s = Elastimem(str(tmp_path / "p.db"), probe_fn=lambda: (32 * GIB, 20 * GIB))
     assert s.profile.tier is Tier.FULL
     s.report_pressure()
     assert s.profile.tier is Tier.STANDARD
@@ -101,7 +101,7 @@ def test_pressure_report_is_immediate_and_survives_recovery_rules(tmp_path):
 
 
 def test_build_context_never_raises(tmp_path):
-    s = Engram(str(tmp_path / "n.db"), probe_fn=lambda: (32 * GIB, 20 * GIB))
+    s = Elastimem(str(tmp_path / "n.db"), probe_fn=lambda: (32 * GIB, 20 * GIB))
     for weird in ["", "hi", '"; DROP TABLE chunks; --', "🦆" * 500, "a " * 3000]:
         plan = s.build_context(weird)
         assert plan.profile is not None

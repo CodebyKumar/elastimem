@@ -1,4 +1,4 @@
-"""Full-capability example: Engram wired to llama-cpp-python.
+"""Full-capability example: Elastimem wired to llama-cpp-python.
 
 Requires:  pip install llama-cpp-python
 Models:    a chat GGUF (CHAT_MODEL) and optionally a small embedding GGUF
@@ -14,7 +14,7 @@ import sys
 
 sys.path.insert(0, "src")
 
-from engram import Engram, EngramConfig  # noqa: E402
+from elastimem import Elastimem, ElastimemConfig  # noqa: E402
 
 CHAT_MODEL = os.environ.get("CHAT_MODEL", "models/chat.gguf")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "")   # optional
@@ -51,11 +51,11 @@ def main() -> None:
     chat, complete_fn, embed_fn = load_models()
     base_prompt = "You are a helpful local assistant. Be concise."
 
-    mem = Engram(
+    mem = Elastimem(
         "./llama_bot_memory.db",
         complete_fn=complete_fn,
         embed_fn=embed_fn,
-        config=EngramConfig(
+        config=ElastimemConfig(
             context_tokens=N_CTX,
             static_prompt_tokens=len(base_prompt) // 4,
             reserved_keys=frozenset({"model", "agent_name"}),
@@ -78,7 +78,7 @@ def main() -> None:
         if plan.rolling_summary:
             system += f"\n\nEARLIER IN THIS CONVERSATION: {plan.rolling_summary}"
 
-        # trim the live window to the plan, reporting evictions to Engram
+        # trim the live window to the plan, reporting evictions to Elastimem
         max_msgs = plan.keep_last_n_turns * 2
         if len(history) > max_msgs:
             evicted = history[:-max_msgs]

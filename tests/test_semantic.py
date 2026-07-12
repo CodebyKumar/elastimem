@@ -2,7 +2,7 @@
 
 import sqlite3
 
-from engram import Engram, EngramConfig
+from elastimem import Elastimem, ElastimemConfig
 
 
 def test_store_and_read(store):
@@ -96,9 +96,9 @@ def test_profile_categorization(store):
 
 
 def test_decay_archives_only_unaccessed_auto_facts(tmp_path):
-    from engram import semantic
-    cfg = EngramConfig(fact_decay_half_life_days=60.0, fact_archive_threshold=0.15)
-    s = Engram(str(tmp_path / "d.db"), config=cfg)
+    from elastimem import semantic
+    cfg = ElastimemConfig(fact_decay_half_life_days=60.0, fact_archive_threshold=0.15)
+    s = Elastimem(str(tmp_path / "d.db"), config=cfg)
     s.remember("old_auto", "something", source="auto")
     s.remember("old_explicit", "keep me")
     # backdate both far beyond the decay horizon

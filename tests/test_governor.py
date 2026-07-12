@@ -2,12 +2,12 @@
 
 import pytest
 
-from engram import Engram, EngramConfig, Tier, Cadence
-from engram.governor import Governor, GIB, probe_ram
+from elastimem import Elastimem, ElastimemConfig, Tier, Cadence
+from elastimem.governor import Governor, GIB, probe_ram
 
 
 def gov(total_gib, avail_gib, **cfg_kwargs):
-    cfg = EngramConfig(**cfg_kwargs)
+    cfg = ElastimemConfig(**cfg_kwargs)
     return Governor(cfg, probe_fn=lambda: (int(total_gib * GIB), int(avail_gib * GIB)))
 
 
@@ -21,8 +21,8 @@ def test_tier_classification():
 
 
 def test_env_override(monkeypatch):
-    monkeypatch.setenv("ENGRAM_TIER", "lite")
-    g = Governor(EngramConfig(), probe_fn=lambda: (32 * GIB, 20 * GIB))
+    monkeypatch.setenv("ELASTIMEM_TIER", "lite")
+    g = Governor(ElastimemConfig(), probe_fn=lambda: (32 * GIB, 20 * GIB))
     assert g.tier is Tier.LITE
     assert g.tick().tier is Tier.LITE  # override pins the tier
 
@@ -47,7 +47,7 @@ def test_lite_zeroes_episodic_and_boosts_working():
 
 def test_immediate_downgrade_and_cautious_upgrade():
     ram = {"avail": 20.0}
-    cfg = EngramConfig(upgrade_healthy_ticks=3)
+    cfg = ElastimemConfig(upgrade_healthy_ticks=3)
     g = Governor(cfg, probe_fn=lambda: (32 * GIB, int(ram["avail"] * GIB)))
     assert g.tier is Tier.FULL
 
@@ -72,7 +72,7 @@ def test_tier_change_callback():
     calls = []
     ram = {"avail": 20.0}
     g = Governor(
-        EngramConfig(),
+        ElastimemConfig(),
         probe_fn=lambda: (32 * GIB, int(ram["avail"] * GIB)),
         on_tier_change=lambda old, new: calls.append((old.name, new.name)),
     )
@@ -88,7 +88,7 @@ def test_probe_ram_returns_sane_values():
 
 
 def test_store_exposes_governor(tmp_path):
-    s = Engram(str(tmp_path / "g.db"), probe_fn=lambda: (32 * GIB, 20 * GIB))
+    s = Elastimem(str(tmp_path / "g.db"), probe_fn=lambda: (32 * GIB, 20 * GIB))
     assert s.profile.tier is Tier.FULL
     assert s.tick().tier is Tier.FULL
     s.close()

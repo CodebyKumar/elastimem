@@ -1,9 +1,9 @@
-"""The Memory Governor: Engram's defining component.
+"""The Memory Governor: Elastimem's defining component.
 
 The governor answers one question, continuously: *what can this machine
 afford right now?* It probes hardware at startup, re-checks cheaply on every
 ``tick()`` (call it once per turn), and emits a frozen
-:class:`~engram.config.MemoryProfile` that every other component consumes —
+:class:`~elastimem.config.MemoryProfile` that every other component consumes —
 token budgets per prompt section, whether embeddings run, how often
 background LLM extraction fires, how aggressive consolidation is.
 
@@ -32,12 +32,12 @@ from .config import (
     Budgets,
     Cadence,
     ConsolidationLevel,
-    EngramConfig,
+    ElastimemConfig,
     MemoryProfile,
     Tier,
 )
 
-log = logging.getLogger("engram")
+log = logging.getLogger("elastimem")
 
 GIB = 1024**3
 
@@ -131,7 +131,7 @@ class Governor:
 
     def __init__(
         self,
-        config: EngramConfig,
+        config: ElastimemConfig,
         *,
         probe_fn: Callable[[], tuple[int, int]] = probe_ram,
         on_tier_change: Callable[[Tier, Tier], None] | None = None,
@@ -151,7 +151,7 @@ class Governor:
         )
         self._tier = self._startup_tier
         self._profile = self._build_profile(self._tier)
-        log.info("engram governor: startup tier %s (ram %.1f/%.1f GiB available)",
+        log.info("elastimem governor: startup tier %s (ram %.1f/%.1f GiB available)",
                  self._tier.name, available / GIB, total / GIB)
 
     # -- public --------------------------------------------------------- #
@@ -197,12 +197,12 @@ class Governor:
         old, self._tier = self._tier, tier
         self._healthy_streak = 0
         self._profile = self._build_profile(tier)
-        log.info("engram governor: tier %s -> %s", old.name, tier.name)
+        log.info("elastimem governor: tier %s -> %s", old.name, tier.name)
         if self._on_tier_change is not None:
             try:
                 self._on_tier_change(old, tier)
             except Exception:
-                log.exception("engram: on_tier_change callback failed")
+                log.exception("elastimem: on_tier_change callback failed")
 
     def _build_profile(self, tier: Tier) -> MemoryProfile:
         cfg = self.config

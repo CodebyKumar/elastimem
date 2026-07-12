@@ -14,8 +14,8 @@ import time
 
 sys.path.insert(0, "src")
 
-from engram import Engram, EngramConfig  # noqa: E402
-from engram.governor import GIB  # noqa: E402
+from elastimem import Elastimem, ElastimemConfig  # noqa: E402
+from elastimem.governor import GIB  # noqa: E402
 
 sys.path.insert(0, "tests")
 from test_retrieval import toy_embed  # noqa: E402
@@ -30,14 +30,14 @@ TOPICS = [
 
 
 def main(n_chunks: int = 10_000) -> None:
-    store = Engram(":memory:", embed_fn=toy_embed,
+    store = Elastimem(":memory:", embed_fn=toy_embed,
                    probe_fn=lambda: (32 * GIB, 20 * GIB))
     rng = random.Random(42)
 
     t0 = time.monotonic()
     conn = store._conn
-    from engram.db import utcnow
-    from engram.embeddings import encode
+    from elastimem.db import utcnow
+    from elastimem.embeddings import encode
 
     with conn:
         conn.execute("INSERT INTO sessions(started_at) VALUES (?)", (utcnow(),))

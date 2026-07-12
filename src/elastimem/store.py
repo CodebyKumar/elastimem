@@ -1,4 +1,4 @@
-"""The Engram store: the one class hosts interact with.
+"""The Elastimem store: the one class hosts interact with.
 
 Thread model: public methods may be called from the host's main thread; the
 background worker (phase 4) owns deferred writes. All writes acquire the
@@ -17,22 +17,22 @@ import contextlib
 
 from . import assembly, episodic, extraction, procedural, rules, semantic
 from .assembly import ContextPlan
-from .config import ConsolidationLevel, EngramConfig, MemoryProfile
+from .config import ConsolidationLevel, ElastimemConfig, MemoryProfile
 from .db import open_store, connect
 from .governor import Governor
 from .worker import Job, Worker
 
-log = logging.getLogger("engram")
+log = logging.getLogger("elastimem")
 
 CompleteFn = Callable[..., str]
 EmbedFn = Callable[[list[str]], list[list[float]]]
 
 
-class Engram:
+class Elastimem:
     """One persistent memory store backed by a single SQLite file.
 
     ``complete_fn`` and ``embed_fn`` are optional host-injected capabilities;
-    Engram degrades gracefully around whatever is missing (see
+    Elastimem degrades gracefully around whatever is missing (see
     docs/governor.md for the full degradation matrix).
 
     ``complete_fn(prompt: str, *, max_tokens: int, temperature: float) -> str``
@@ -45,13 +45,13 @@ class Engram:
         *,
         complete_fn: CompleteFn | None = None,
         embed_fn: EmbedFn | None = None,
-        config: EngramConfig | None = None,
+        config: ElastimemConfig | None = None,
         tokenizer_fn: Callable[[str], int] | None = None,
         probe_fn: Callable[[], tuple[int, int]] | None = None,
         on_tier_change: Callable | None = None,
     ) -> None:
         self.path = os.path.expanduser(path) if path != ":memory:" else path
-        self.config = config or EngramConfig()
+        self.config = config or ElastimemConfig()
         self.complete_fn = complete_fn
         self.embed_fn = embed_fn
         self.tokenizer_fn = tokenizer_fn
@@ -126,7 +126,7 @@ class Engram:
                         self, user_input, profile, tokenizer_fn=self.tokenizer_fn
                     )
             except Exception:
-                log.exception("engram: retrieval failed; sections degraded to empty")
+                log.exception("elastimem: retrieval failed; sections degraded to empty")
 
         facts_text, fact_ids = assembly.build_facts_section(
             conn, self.config, profile, relevance, self.tokenizer_fn
@@ -199,7 +199,7 @@ class Engram:
                 self.remember(key, value, source="rule")
             self._after_record_turn(user_text, assistant_text, chunk_ids)
         except Exception:
-            log.exception("engram: record_turn failed (chat unaffected)")
+            log.exception("elastimem: record_turn failed (chat unaffected)")
 
     def _after_record_turn(
         self, user_text: str, assistant_text: str, chunk_ids: list[int]
@@ -297,13 +297,13 @@ class Engram:
 
     def recall(self, query: str, k: int = 5) -> list:
         """Search past conversations and facts. Works in every tier; returns
-        a list of :class:`engram.retrieval.Hit`, best first. Never raises."""
+        a list of :class:`elastimem.retrieval.Hit`, best first. Never raises."""
         try:
             from . import retrieval
 
             return retrieval.search_all(self, query, k=k)
         except Exception:
-            log.exception("engram: recall failed")
+            log.exception("elastimem: recall failed")
             return []
 
     def sessions(self, n: int = 20) -> list[dict]:

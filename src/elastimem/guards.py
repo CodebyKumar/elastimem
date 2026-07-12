@@ -7,7 +7,7 @@ user's profile. This module rejects those before they ever reach the facts
 table, and quarantines automatic rejections so misbehavior stays inspectable
 instead of silently vanishing.
 
-Hosts extend the defaults via ``EngramConfig.reserved_keys`` (keys the host
+Hosts extend the defaults via ``ElastimemConfig.reserved_keys`` (keys the host
 owns — e.g. an agent's identity fields) and may pass extra self-referential
 value markers when constructing the store.
 """

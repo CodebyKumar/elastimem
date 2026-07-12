@@ -7,7 +7,7 @@ milliseconds; ``benchmarks/bench_recall.py`` keeps that claim honest. When
 ``sqlite-vec`` is installed the same BLOBs can be indexed for larger stores,
 but it is never required.
 
-Engram never embeds on its own: the host's ``embed_fn`` does the work, the
+Elastimem never embeds on its own: the host's ``embed_fn`` does the work, the
 governor decides whether it may be called at all, and a failing ``embed_fn``
 disables the vector leg for the rest of the session (degradation floor:
 FTS5-only retrieval).
@@ -21,9 +21,9 @@ from array import array
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .store import Engram
+    from .store import Elastimem
 
-log = logging.getLogger("engram")
+log = logging.getLogger("elastimem")
 
 
 def encode(vector: list[float]) -> bytes:
@@ -47,7 +47,7 @@ def cosine(a, b) -> float:
     return dot / math.sqrt(num_a * num_b)
 
 
-def embed_chunks(store: "Engram", chunk_ids: list[int]) -> int:
+def embed_chunks(store: "Elastimem", chunk_ids: list[int]) -> int:
     """Embed and persist vectors for the given chunks. Returns count done.
     A failing ``embed_fn`` disables embeddings for the session (logged once)."""
     if store.embed_fn is None or getattr(store, "_embed_failed", False):
@@ -66,7 +66,7 @@ def embed_chunks(store: "Engram", chunk_ids: list[int]) -> int:
     except Exception:
         store._embed_failed = True
         log.exception(
-            "engram: embed_fn failed; vector search disabled for this session"
+            "elastimem: embed_fn failed; vector search disabled for this session"
         )
         return 0
     with store._write_lock:
@@ -81,7 +81,7 @@ def embed_chunks(store: "Engram", chunk_ids: list[int]) -> int:
     return len(rows)
 
 
-def embed_pending(store: "Engram", limit: int = 200) -> int:
+def embed_pending(store: "Elastimem", limit: int = 200) -> int:
     """Backfill: embed chunks that predate the embedder (or were missed)."""
     rows = store._conn.execute(
         "SELECT id FROM chunks WHERE embedding IS NULL LIMIT ?", (limit,)
@@ -89,7 +89,7 @@ def embed_pending(store: "Engram", limit: int = 200) -> int:
     return embed_chunks(store, [r["id"] for r in rows]) if rows else 0
 
 
-def similar_chunks(store: "Engram", query: str, limit: int = 20) -> list[int]:
+def similar_chunks(store: "Elastimem", query: str, limit: int = 20) -> list[int]:
     """Chunk ids most cosine-similar to the query, best first.
 
     Raises when embeddings are unavailable — the caller (retrieval fusion)
@@ -104,7 +104,7 @@ def similar_chunks(store: "Engram", query: str, limit: int = 20) -> list[int]:
         query_vec = store.embed_fn([query])[0]
     except Exception:
         store._embed_failed = True
-        log.exception("engram: query embedding failed; disabling vector leg")
+        log.exception("elastimem: query embedding failed; disabling vector leg")
         raise
 
     scored: list[tuple[float, int]] = []

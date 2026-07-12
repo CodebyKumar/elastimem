@@ -12,12 +12,12 @@ import sys
 
 sys.path.insert(0, "src")
 
-from engram import Engram  # noqa: E402
+from elastimem import Elastimem  # noqa: E402
 
 
 def main() -> None:
-    mem = Engram("./minimal_bot_memory.db")
-    print(f"[engram tier: {mem.profile.tier.name}, "
+    mem = Elastimem("./minimal_bot_memory.db")
+    print(f"[elastimem tier: {mem.profile.tier.name}, "
           f"facts known: {len(mem.facts())}]")
 
     while True:

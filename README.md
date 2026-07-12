@@ -1,31 +1,31 @@
-# Engram
+# Elastimem
 
 **Elastic, resource-adaptive memory for local-first AI agents.**
 
-Engram gives your agent long-term memory — facts, past conversations, learned
+Elastimem gives your agent long-term memory — facts, past conversations, learned
 lessons — in a single SQLite file, with **zero required dependencies**. Its
-defining feature is the **Memory Governor**: Engram probes the machine it's
+defining feature is the **Memory Governor**: Elastimem probes the machine it's
 running on and elastically sizes every memory capability to fit, so the same
 code serves a 4 GB Jetson and a 128 GB workstation. Every capability has a
 documented degradation floor; nothing ever hard-fails because the host is
 small.
 
 ```
-pip install engramdb            # zero dependencies
-pip install engramdb[system]    # + psutil for richer hardware probing
-pip install engramdb[vec]       # + sqlite-vec for accelerated vector search
+pip install elastimem            # zero dependencies
+pip install elastimem[system]    # + psutil for richer hardware probing
+pip install elastimem[vec]       # + sqlite-vec for accelerated vector search
 ```
 
 ## Why another memory framework?
 
 Mem0, Letta/MemGPT, and Zep all assume a big cloud model and unbounded
 resources. Local agents live in a different world: a 2B model with a 4096-token
-context on a machine that's also running the model itself. Engram is designed
+context on a machine that's also running the model itself. Elastimem is designed
 for that world:
 
-- **Host-agnostic.** Engram is a library, not a runtime. It never loads a
+- **Host-agnostic.** Elastimem is a library, not a runtime. It never loads a
   model or calls an API. You inject `complete_fn` / `embed_fn` callables;
-  Engram degrades gracefully around whatever you don't provide.
+  Elastimem degrades gracefully around whatever you don't provide.
 - **Elastic.** Token budgets, retrieval depth, window size, extraction
   cadence — all derived from your model's context size and the machine's RAM,
   re-evaluated at runtime under memory pressure.
@@ -40,9 +40,9 @@ for that world:
 ## Quickstart
 
 ```python
-from engram import Engram
+from elastimem import Elastimem
 
-mem = Engram("~/.myagent/memory.db",
+mem = Elastimem("~/.myagent/memory.db",
              complete_fn=my_llm,      # optional: (prompt, *, max_tokens, temperature) -> str
              embed_fn=my_embedder)    # optional: (list[str]) -> list[list[float]]
 
@@ -66,14 +66,14 @@ works; it's just progressively less clever.
 
 | Layer | What it holds | Where |
 |---|---|---|
-| **Working** | current conversation window + rolling summary of evicted turns | host's message list, planned by Engram |
+| **Working** | current conversation window + rolling summary of evicted turns | host's message list, planned by Elastimem |
 | **Episodic** | full past transcripts, chunked and indexed for recall | `messages` / `chunks` (+FTS5, +vectors) |
 | **Semantic** | facts about the user, temporally versioned, importance-decayed | `facts` |
 | **Procedural** | lessons the agent learned about its own behavior | `lessons` |
 
 ## The Memory Governor
 
-At startup (and on every `tick()`), Engram classifies the machine into a tier
+At startup (and on every `tick()`), Elastimem classifies the machine into a tier
 and derives token budgets from your model's context size:
 
 | Capability | FULL (≥16 GB) | STANDARD (≥8 GB) | LITE |
@@ -93,7 +93,7 @@ OpenAI-compatible, no-LLM): [docs/integration.md](docs/integration.md).
 
 Alpha (0.1.0). API may move before 1.0. Built as the memory engine for
 [Tuffy](https://github.com/CodebyKumar), an on-device agent for 8 GB Apple
-Silicon and Jetson Orin — Engram's constraints are real-device constraints.
+Silicon and Jetson Orin — Elastimem's constraints are real-device constraints.
 
 ## License
 

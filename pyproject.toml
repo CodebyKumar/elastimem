@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "engramdb"
+name = "elastimem"
 version = "0.1.0"
 description = "Elastic, resource-adaptive memory framework for local-first AI agents"
 readme = "README.md"
@@ -31,13 +31,13 @@ system = ["psutil>=5.9"]      # richer hardware probing for the Memory Governor
 vec = ["sqlite-vec>=0.1"]     # accelerated vector search (brute-force cosine otherwise)
 
 [project.urls]
-Homepage = "https://github.com/CodebyKumar/engram"
+Homepage = "https://github.com/CodebyKumar/elastimem"
 
 [dependency-groups]
 dev = ["pytest>=8.0"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/engram"]
+packages = ["src/elastimem"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
