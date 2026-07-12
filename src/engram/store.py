@@ -13,11 +13,14 @@ import sqlite3
 import threading
 from typing import Callable
 
-from . import assembly, episodic, procedural, rules, semantic
+import contextlib
+
+from . import assembly, episodic, extraction, procedural, rules, semantic
 from .assembly import ContextPlan
-from .config import EngramConfig, MemoryProfile
+from .config import ConsolidationLevel, EngramConfig, MemoryProfile
 from .db import open_store, connect
 from .governor import Governor
+from .worker import Job, Worker
 
 log = logging.getLogger("engram")
 
@@ -66,8 +69,11 @@ class Engram:
         # Session state (lazy: first record_turn opens one).
         self.session_id: int | None = None
         self._turn = 0
+        self._rolling: str | None = None
         with self._write_lock:
             episodic.close_orphan_sessions(conn)
+
+        self._worker = Worker(self)
 
     # ------------------------------------------------------------------ #
     # connections
@@ -159,8 +165,8 @@ class Engram:
         )
 
     def _rolling_summary(self) -> str | None:
-        """Current session's rolling summary (populated from phase 4 onward)."""
-        return None
+        """Current session's rolling summary (maintained by the worker)."""
+        return self._rolling
 
     # ------------------------------------------------------------------ #
     # episodic memory (turns, sessions, recall)
@@ -172,6 +178,7 @@ class Engram:
                 episodic.end_session(self._conn, self.session_id)
             self.session_id = episodic.begin_session(self._conn, host_tag)
             self._turn = 0
+            self._rolling = None
         return self.session_id
 
     def record_turn(self, user_text: str, assistant_text: str) -> None:
@@ -197,7 +204,96 @@ class Engram:
     def _after_record_turn(
         self, user_text: str, assistant_text: str, chunk_ids: list[int]
     ) -> None:
-        """Hook for deferred work (LLM extraction, embedding) — phase 4/5."""
+        """Enqueue deferred work: LLM extraction, chunk embedding."""
+        profile = self.governor.profile
+        if (self.complete_fn is not None
+                and profile.llm_extraction_enabled
+                and len(user_text.split()) >= self.config.min_query_words):
+            self._worker.submit(Job(
+                "extract", needs_llm=True,
+                payload={"user": user_text, "assistant": assistant_text},
+            ))
+        if (self.embed_fn is not None and profile.embeddings_enabled and chunk_ids):
+            self._worker.submit(Job("embed", needs_llm=False,
+                                    payload={"chunk_ids": chunk_ids}))
+
+    @contextlib.contextmanager
+    def foreground(self):
+        """Bracket the host's own LLM generation: while held, the worker
+        will not start background LLM jobs (single-model-instance safety)."""
+        self._worker.foreground_begin()
+        try:
+            yield
+        finally:
+            self._worker.foreground_end()
+
+    def foreground_begin(self) -> None:
+        self._worker.foreground_begin()
+
+    def foreground_end(self) -> None:
+        self._worker.foreground_end()
+
+    def report_evictions(self, turns: list[tuple[str, str]]) -> None:
+        """Host reports (user, assistant) pairs it evicted from its window;
+        they fold into the rolling summary (already persisted verbatim)."""
+        if not turns:
+            return
+        profile = self.governor.profile
+        if profile.rolling_summary_enabled and self.complete_fn is not None:
+            self._worker.submit(Job(
+                "rolling_summary", needs_llm=True, payload={"turns": turns},
+            ))
+        else:
+            # Degradation floor: a marker line, so the model knows history
+            # exists and recall() can retrieve it.
+            self._rolling = (
+                f"[{len(turns)} earlier turn(s) omitted — memory search can"
+                " recall them]"
+                if self._rolling is None
+                else self._rolling + f" [+{len(turns)} more turn(s) omitted]"
+            )
+
+    def drain(self, timeout: float = 5.0) -> bool:
+        """Finish queued background work (call before unloading the model)."""
+        return self._worker.drain(timeout)
+
+    # ------------------------------------------------------------------ #
+    # background job execution (called from the worker thread)
+    # ------------------------------------------------------------------ #
+    def _execute_job(self, job: Job) -> None:
+        conn = self._conn  # worker thread gets its own connection
+        if job.kind == "extract" and self.complete_fn is not None:
+            extraction.extract_facts(
+                conn, self.config, self.complete_fn,
+                job.payload["user"], job.payload["assistant"],
+                store_fn=lambda k, v, s: self.remember(k, v, source=s),
+            )
+        elif job.kind == "rolling_summary" and self.complete_fn is not None:
+            summary = extraction.rolling_summary(
+                self.complete_fn, self.config, self._rolling, job.payload["turns"]
+            )
+            if summary:
+                self._rolling = summary
+                if self.session_id is not None:
+                    with self._write_lock:
+                        conn.execute(
+                            "UPDATE sessions SET rolling_summary=? WHERE id=?",
+                            (summary, self.session_id),
+                        )
+                        conn.commit()
+        elif job.kind == "embed":
+            from . import embeddings
+
+            embeddings.embed_chunks(self, job.payload["chunk_ids"])
+        elif job.kind == "consolidate":
+            level = self.governor.profile.consolidation_level
+            if level is not ConsolidationLevel.OFF:
+                with self._write_lock:
+                    extraction.consolidate(
+                        conn, self.config, self.complete_fn,
+                        llm_merge=(level is ConsolidationLevel.FULL
+                                   and self.complete_fn is not None),
+                    )
 
     def recall(self, query: str, k: int = 5) -> list:
         """Search past conversations and facts. Works in every tier; returns
@@ -232,12 +328,36 @@ class Engram:
         )
 
     def end_session(self) -> None:
-        """Close the current session (summary generation arrives in phase 4)."""
+        """Close the current session: flush deferred work, summarize (when a
+        completion callable exists), run exit consolidation."""
+        if self.session_id is None:
+            return
+        self._worker.drain()
+
+        summary = None
+        if self.complete_fn is not None:
+            user_turns = [
+                r["content"] for r in self._conn.execute(
+                    "SELECT content FROM messages WHERE session_id=? AND"
+                    " role='user' ORDER BY id", (self.session_id,)
+                )
+            ]
+            summary = extraction.session_summary(
+                self.complete_fn, self.config, user_turns
+            ) or None
+
         with self._write_lock:
-            if self.session_id is not None:
-                episodic.end_session(self._conn, self.session_id)
-                self.session_id = None
-                self._turn = 0
+            episodic.end_session(self._conn, self.session_id, summary)
+            level = self.governor.profile.consolidation_level
+            if level is not ConsolidationLevel.OFF:
+                extraction.consolidate(
+                    self._conn, self.config, self.complete_fn,
+                    llm_merge=(level is ConsolidationLevel.FULL
+                               and self.complete_fn is not None),
+                )
+            self.session_id = None
+            self._turn = 0
+            self._rolling = None
 
     # ------------------------------------------------------------------ #
     # semantic memory (facts)
@@ -291,6 +411,8 @@ class Engram:
                 **counts}
 
     def close(self) -> None:
+        """Stop the worker (draining pending jobs) and close connections."""
+        self._worker.stop()
         conn = getattr(self._local, "conn", None)
         if conn is not None:
             conn.close()
