@@ -31,6 +31,7 @@ One persistent store backed by one SQLite file (`":memory:"` supported).
 | `record_turn(user_text, assistant_text)` | persist exchange, rule capture, enqueue extraction/embedding; never raises |
 | `report_evictions(turns: list[tuple[str, str]])` | fold host-evicted (user, assistant) pairs into the rolling summary |
 | `report_pressure() -> MemoryProfile` | OOM/decode-failure signal; downgrades one tier |
+| `reconfigure(**config_overrides) -> MemoryProfile` | update config (e.g. `context_tokens` after a model switch) and rebuild budgets immediately — see warning below |
 
 ### Memory operations
 | method | purpose |

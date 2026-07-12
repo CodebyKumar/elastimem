@@ -138,6 +138,25 @@ class Elastimem:
         """Host signal that an OOM/decode failure happened; downgrades a tier."""
         return self.governor.report_pressure()
 
+    def reconfigure(self, **config_overrides) -> MemoryProfile:
+        """Update config fields (e.g. after a model switch) and immediately
+        rebuild token budgets from them.
+
+        Budgets are normally only recomputed on a tier change; call this
+        whenever you change something that feeds budget math after
+        construction — most commonly ``context_tokens`` and
+        ``static_prompt_tokens`` when the host switches models::
+
+            mem.reconfigure(context_tokens=new_model_ctx,
+                            static_prompt_tokens=measured_prompt_tokens)
+
+        Returns the refreshed :class:`MemoryProfile`.
+        """
+        if config_overrides:
+            self.config = _resolve_config(self.config, config_overrides)
+            self.governor.config = self.config
+        return self.governor.reconfigure()
+
     def build_context(self, user_input: str = "") -> ContextPlan:
         """Assemble this turn's budgeted memory sections.
 

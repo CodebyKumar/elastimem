@@ -190,6 +190,21 @@ class Governor:
                 self._set_tier(Tier(self._tier - 1))
         return self._profile
 
+    def reconfigure(self) -> MemoryProfile:
+        """Rebuild the current tier's budgets from ``self.config`` right now.
+
+        Budgets are only recomputed on a tier change (see ``_set_tier``), so
+        a host that mutates ``config.context_tokens`` (e.g. after switching
+        to a model with a different context window) would otherwise see
+        stale budgets until the tier happens to flip — which may never
+        happen. Call this immediately after changing any config field that
+        feeds budget math (``context_tokens``, ``static_prompt_tokens``,
+        ``output_reserve``, ``tool_reserve``).
+        """
+        with self._lock:
+            self._profile = self._build_profile(self._tier)
+        return self._profile
+
     # -- internals ------------------------------------------------------ #
     def _set_tier(self, tier: Tier) -> None:
         if tier == self._tier:

@@ -61,10 +61,26 @@ mem.record_turn(user_input, reply)
 mem.report_evictions(evicted_pairs)          # -> rolling summary
 # feed plan.rolling_summary back as a system-side note next turn
 
-# on exit / model switch:
+# on exit:
 mem.end_session()      # drains worker, writes session summary, consolidates
 mem.close()
 ```
+
+**If your host can switch models mid-session** (a different `n_ctx`, e.g.
+swapping a local model for a larger-context API model), budgets do **not**
+update on their own — they're only recomputed on a tier change, which may
+never happen. Call `reconfigure()` right after the switch:
+
+```python
+mem.drain()                      # finish queued work on the old model
+mem.reconfigure(context_tokens=new_model_ctx,
+               static_prompt_tokens=measured_prompt_tokens)
+```
+
+Forgetting this is not dangerous (nothing crashes), but a host that jumps
+from a 4k-context local model to a 128k-context API model will silently keep
+using the old, much smaller memory budgets until something else happens to
+flip the tier.
 
 Embeddings: load a *separate tiny* embedding model (e.g. a MiniLM-class GGUF,
 `Llama(model_path=..., embedding=True, n_ctx=512, n_gpu_layers=0)`) so

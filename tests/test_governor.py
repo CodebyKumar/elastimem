@@ -92,3 +92,38 @@ def test_store_exposes_governor(tmp_path):
     assert s.profile.tier is Tier.FULL
     assert s.tick().tier is Tier.FULL
     s.close()
+
+
+def test_budgets_are_stale_without_reconfigure(tmp_path):
+    """Documents the gap reconfigure() closes: mutating config directly does
+    NOT change budgets until the tier happens to flip."""
+    s = Elastimem(str(tmp_path / "stale.db"), context_tokens=4096,
+                  probe_fn=lambda: (32 * GIB, 20 * GIB))
+    before = s.profile.budgets.working
+    s.config.context_tokens = 131_072   # e.g. switched to a big API model
+    assert s.profile.budgets.working == before   # still stale — no tick happened
+    s.close()
+
+
+def test_reconfigure_rebuilds_budgets_immediately(tmp_path):
+    s = Elastimem(str(tmp_path / "r.db"), context_tokens=4096,
+                  probe_fn=lambda: (32 * GIB, 20 * GIB))
+    small_budget = s.profile.budgets.working
+
+    profile = s.reconfigure(context_tokens=131_072, static_prompt_tokens=2000)
+    assert s.config.context_tokens == 131_072
+    assert s.config.static_prompt_tokens == 2000
+    assert profile.budgets.working > small_budget
+    assert s.profile.budgets.working == profile.budgets.working  # not stale
+    s.close()
+
+
+def test_reconfigure_with_no_args_still_rebuilds(tmp_path):
+    """Calling with zero kwargs rebuilds from whatever config already holds
+    (covers a host that mutated the config object directly)."""
+    s = Elastimem(str(tmp_path / "nr.db"), context_tokens=4096,
+                  probe_fn=lambda: (32 * GIB, 20 * GIB))
+    s.config.context_tokens = 131_072
+    profile = s.reconfigure()
+    assert profile.budgets.working > s.profile.budgets.working - 1  # rebuilt
+    s.close()
