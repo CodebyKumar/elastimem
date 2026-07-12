@@ -2,12 +2,22 @@
 
 Everything importable from `elastimem` is public; everything else is internal.
 
-## `Elastimem(path, *, complete_fn=None, embed_fn=None, config=None, tokenizer_fn=None, probe_fn=None, on_tier_change=None)`
+## `elastimem.open(path, **kwargs) -> Elastimem`
+
+The friendly front door — identical to constructing `Elastimem(path, **kwargs)`.
+
+## `Elastimem(path, *, llm=None, embedder=None, config=None, tokenizer_fn=None, probe_fn=None, on_tier_change=None, **config_overrides)`
 
 One persistent store backed by one SQLite file (`":memory:"` supported).
 
-- `complete_fn(prompt, *, max_tokens, temperature) -> str` — optional LLM.
-- `embed_fn(texts: list[str]) -> list[list[float]]` — optional embedder.
+- `llm(prompt, *, max_tokens, temperature) -> str` — optional LLM.
+  (`complete_fn=` still accepted as a legacy alias.)
+- `embedder(texts: list[str]) -> list[list[float]]` — optional embedder.
+  (`embed_fn=` still accepted as a legacy alias.)
+- `**config_overrides` — any `ElastimemConfig` field passed inline, e.g.
+  `context_tokens=4096, reserved_keys={"model"}`. May be combined with
+  `config=`; inline values override the config object. Unknown names raise
+  `TypeError` listing the valid options.
 - `tokenizer_fn(text) -> int` — optional exact token counter (default chars/4).
 - `probe_fn() -> (total_bytes, available_bytes)` — override hardware probe.
 - `on_tier_change(old: Tier, new: Tier)` — governor callback.

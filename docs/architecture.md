@@ -13,8 +13,8 @@ capacity.
 ## Design principles
 
 - **Host-agnostic.** Elastimem never loads a model, imports an inference
-  library, or calls an API. The host injects `complete_fn` (text completion)
-  and `embed_fn` (embeddings) as plain callables. Both are optional.
+  library, or calls an API. The host injects `llm` (text completion)
+  and `embedder` (embeddings) as plain callables. Both are optional.
 - **Elastic.** The [Memory Governor](governor.md) probes RAM and the model's
   context size, then budgets every capability. Same code on a 4 GB Jetson
   and a 128 GB workstation.

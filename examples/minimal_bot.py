@@ -12,11 +12,11 @@ import sys
 
 sys.path.insert(0, "src")
 
-from elastimem import Elastimem  # noqa: E402
+import elastimem  # noqa: E402
 
 
 def main() -> None:
-    mem = Elastimem("./minimal_bot_memory.db")
+    mem = elastimem.open("./minimal_bot_memory.db")
     print(f"[elastimem tier: {mem.profile.tier.name}, "
           f"facts known: {len(mem.facts())}]")
 

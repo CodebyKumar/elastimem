@@ -3,8 +3,8 @@
 Elastimem needs, at most, two callables from you:
 
 ```python
-complete_fn(prompt: str, *, max_tokens: int, temperature: float) -> str
-embed_fn(texts: list[str]) -> list[list[float]]
+llm(prompt: str, *, max_tokens: int, temperature: float) -> str
+embedder(texts: list[str]) -> list[list[float]]
 ```
 
 Both optional. Everything below is progressive enhancement.
@@ -12,9 +12,9 @@ Both optional. Everything below is progressive enhancement.
 ## Level 0 — no LLM at all
 
 ```python
-from elastimem import Elastimem
+import elastimem
 
-mem = Elastimem("~/.myapp/memory.db")
+mem = elastimem.open("~/.myapp/memory.db")
 mem.record_turn(user_text, reply_text)   # transcripts + regex fact capture
 ctx = mem.build_context(user_text)       # facts/lessons/episodic via FTS5
 hits = mem.recall("that thing about the car")
@@ -31,21 +31,23 @@ interleave between turns.
 
 ```python
 from llama_cpp import Llama
-from elastimem import Elastimem, ElastimemConfig
+import elastimem
 
-llm = Llama(model_path="model.gguf", n_ctx=4096, ...)
+chat = Llama(model_path="model.gguf", n_ctx=4096, ...)
 
-def complete_fn(prompt, *, max_tokens, temperature):
-    out = llm.create_chat_completion(
+def llm(prompt, *, max_tokens, temperature):
+    out = chat.create_chat_completion(
         messages=[{"role": "user", "content": prompt}],
         max_tokens=max_tokens, temperature=temperature)
     return out["choices"][0]["message"]["content"]
 
-mem = Elastimem("~/.myagent/memory.db",
-             complete_fn=complete_fn,
-             config=ElastimemConfig(context_tokens=4096,
-                                 static_prompt_tokens=measured_prompt_tokens,
-                                 reserved_keys=frozenset({"model", "agent_name"})))
+mem = elastimem.open(
+    "~/.myagent/memory.db",
+    llm=llm,
+    context_tokens=4096,
+    static_prompt_tokens=measured_prompt_tokens,
+    reserved_keys={"model", "agent_name"},
+)
 
 # per turn:
 mem.tick()
@@ -67,8 +69,8 @@ mem.close()
 Embeddings: load a *separate tiny* embedding model (e.g. a MiniLM-class GGUF,
 `Llama(model_path=..., embedding=True, n_ctx=512, n_gpu_layers=0)`) so
 embedding never contends with chat generation, and pass its
-`create_embedding` through `embed_fn`. If loading it fails or RAM is tight,
-just don't pass `embed_fn` — retrieval stays FTS5.
+`create_embedding` through `embedder=`. If loading it fails or RAM is tight,
+just don't pass `embedder` — retrieval stays FTS5.
 
 On decode/OOM errors from your model, call `mem.report_pressure()` — the
 governor sheds memory work first.
@@ -78,7 +80,7 @@ See `examples/llama_cpp_bot.py` for a complete program.
 ## Level 2 — OpenAI-compatible / API host
 
 API models don't contend for local RAM, so the foreground gate matters less
-(still harmless). Wire `complete_fn` to your chat endpoint and `embed_fn` to
+(still harmless). Wire `llm` to your chat endpoint and `embedder` to
 an embeddings endpoint; set `context_tokens` to the model's window. You may
 pin `ELASTIMEM_TIER=full` since the machine isn't running the model.
 

@@ -14,7 +14,7 @@ import sys
 
 sys.path.insert(0, "src")
 
-from elastimem import Elastimem, ElastimemConfig  # noqa: E402
+import elastimem  # noqa: E402
 
 CHAT_MODEL = os.environ.get("CHAT_MODEL", "models/chat.gguf")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "")   # optional
@@ -27,39 +27,37 @@ def load_models():
     chat = Llama(model_path=CHAT_MODEL, n_ctx=N_CTX, n_gpu_layers=-1,
                  verbose=False)
 
-    def complete_fn(prompt, *, max_tokens, temperature):
+    def llm(prompt, *, max_tokens, temperature):
         out = chat.create_chat_completion(
             messages=[{"role": "user", "content": prompt}],
             max_tokens=max_tokens, temperature=temperature)
         return out["choices"][0]["message"]["content"]
 
-    embed_fn = None
+    embedder = None
     if EMBED_MODEL and os.path.exists(EMBED_MODEL):
         # Separate tiny instance on CPU: embedding must never contend with
         # chat generation for the GPU or the chat model's lock.
-        embedder = Llama(model_path=EMBED_MODEL, embedding=True, n_ctx=512,
-                         n_gpu_layers=0, verbose=False)
+        embed_model = Llama(model_path=EMBED_MODEL, embedding=True, n_ctx=512,
+                            n_gpu_layers=0, verbose=False)
 
-        def embed_fn(texts):
-            return [embedder.create_embedding(t)["data"][0]["embedding"]
+        def embedder(texts):
+            return [embed_model.create_embedding(t)["data"][0]["embedding"]
                     for t in texts]
 
-    return chat, complete_fn, embed_fn
+    return chat, llm, embedder
 
 
 def main() -> None:
-    chat, complete_fn, embed_fn = load_models()
+    chat, llm, embedder = load_models()
     base_prompt = "You are a helpful local assistant. Be concise."
 
-    mem = Elastimem(
+    mem = elastimem.open(
         "./llama_bot_memory.db",
-        complete_fn=complete_fn,
-        embed_fn=embed_fn,
-        config=ElastimemConfig(
-            context_tokens=N_CTX,
-            static_prompt_tokens=len(base_prompt) // 4,
-            reserved_keys=frozenset({"model", "agent_name"}),
-        ),
+        llm=llm,
+        embedder=embedder,
+        context_tokens=N_CTX,
+        static_prompt_tokens=len(base_prompt) // 4,
+        reserved_keys={"model", "agent_name"},
     )
     print(f"[tier: {mem.profile.tier.name}, budgets: {mem.profile.budgets}]")
 

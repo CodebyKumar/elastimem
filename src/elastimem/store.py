@@ -28,32 +28,67 @@ CompleteFn = Callable[..., str]
 EmbedFn = Callable[[list[str]], list[list[float]]]
 
 
+def _resolve_config(
+    config: ElastimemConfig | None, overrides: dict
+) -> ElastimemConfig:
+    """Merge an optional external config with inline keyword overrides."""
+    import dataclasses
+
+    valid = {f.name for f in dataclasses.fields(ElastimemConfig)}
+    unknown = set(overrides) - valid
+    if unknown:
+        raise TypeError(
+            f"unknown config option(s): {', '.join(sorted(unknown))} "
+            f"(valid: {', '.join(sorted(valid))})"
+        )
+    if config is None:
+        return ElastimemConfig(**overrides)
+    if overrides:
+        return dataclasses.replace(config, **overrides)
+    return config
+
+
 class Elastimem:
     """One persistent memory store backed by a single SQLite file.
 
-    ``complete_fn`` and ``embed_fn`` are optional host-injected capabilities;
-    Elastimem degrades gracefully around whatever is missing (see
-    docs/governor.md for the full degradation matrix).
+    Simplest form — everything is optional except the path::
 
-    ``complete_fn(prompt: str, *, max_tokens: int, temperature: float) -> str``
-    ``embed_fn(texts: list[str]) -> list[list[float]]``
+        mem = Elastimem("~/.myagent/memory.db")
+
+    Full form — inject an LLM and an embedder, tune config inline::
+
+        mem = Elastimem(
+            "~/.myagent/memory.db",
+            llm=my_complete_fn,        # (prompt, *, max_tokens, temperature) -> str
+            embedder=my_embed_fn,      # (list[str]) -> list[list[float]]
+            context_tokens=4096,       # any ElastimemConfig field works here
+            reserved_keys={"model"},
+        )
+
+    Config fields may be passed directly as keyword arguments (as above), or
+    bundled in an external :class:`ElastimemConfig` via ``config=``; inline
+    keywords override the bundle. Elastimem degrades gracefully around any
+    capability you don't provide (see docs/governor.md).
     """
 
     def __init__(
         self,
         path: str,
         *,
-        complete_fn: CompleteFn | None = None,
-        embed_fn: EmbedFn | None = None,
+        llm: CompleteFn | None = None,
+        embedder: EmbedFn | None = None,
         config: ElastimemConfig | None = None,
         tokenizer_fn: Callable[[str], int] | None = None,
         probe_fn: Callable[[], tuple[int, int]] | None = None,
         on_tier_change: Callable | None = None,
+        complete_fn: CompleteFn | None = None,   # legacy alias of llm
+        embed_fn: EmbedFn | None = None,         # legacy alias of embedder
+        **config_overrides,
     ) -> None:
         self.path = os.path.expanduser(path) if path != ":memory:" else path
-        self.config = config or ElastimemConfig()
-        self.complete_fn = complete_fn
-        self.embed_fn = embed_fn
+        self.config = _resolve_config(config, config_overrides)
+        self.complete_fn = complete_fn if complete_fn is not None else llm
+        self.embed_fn = embed_fn if embed_fn is not None else embedder
         self.tokenizer_fn = tokenizer_fn
         self._write_lock = threading.RLock()
         self._local = threading.local()

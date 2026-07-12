@@ -57,7 +57,7 @@ Token estimation uses chars/4 unless the host passes `tokenizer_fn`.
 
 | Capability | FULL | STANDARD | LITE |
 |---|---|---|---|
-| `embed_fn` called | yes | yes | **never** |
+| `embedder` called | yes | yes | **never** |
 | Episodic injection (`build_context`) | top 4 | top 3 | none (`recall()` only) |
 | LLM fact extraction | background, per turn | batched every 3 turns | off |
 | Rolling summary | LLM | LLM | marker line |
@@ -74,8 +74,8 @@ host.**
 | Capability | Fallback 1 | Floor |
 |---|---|---|
 | Vector search | FTS5 BM25 only | `LIKE` term matching (no FTS5 in sqlite build) |
-| `embed_fn` raises | vector leg disabled for the session (logged once), FTS5-only | — |
-| `complete_fn` absent or raises | regex rule capture | explicit `remember` only |
+| `embedder` raises | vector leg disabled for the session (logged once), FTS5-only | — |
+| `llm` absent or raises | regex rule capture | explicit `remember` only |
 | Rolling summary | `[k earlier turn(s) omitted — memory search can recall them]` | plain eviction |
 | Session summary | — | title = first user message (80 chars) |
 | Corrupt DB file | renamed `<path>.corrupt-<ts>`, fresh store created, warning logged | — |

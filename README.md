@@ -24,7 +24,7 @@ context on a machine that's also running the model itself. Elastimem is designed
 for that world:
 
 - **Host-agnostic.** Elastimem is a library, not a runtime. It never loads a
-  model or calls an API. You inject `complete_fn` / `embed_fn` callables;
+  model or calls an API. You inject `llm` / `embedder` callables;
   Elastimem degrades gracefully around whatever you don't provide.
 - **Elastic.** Token budgets, retrieval depth, window size, extraction
   cadence — all derived from your model's context size and the machine's RAM,
@@ -40,16 +40,14 @@ for that world:
 ## Quickstart
 
 ```python
-from elastimem import Elastimem
+import elastimem
 
-mem = Elastimem("~/.myagent/memory.db",
-             complete_fn=my_llm,      # optional: (prompt, *, max_tokens, temperature) -> str
-             embed_fn=my_embedder)    # optional: (list[str]) -> list[list[float]]
+mem = elastimem.open("~/.myagent/memory.db")        # that's it — memory works
 
 # each turn:
 ctx = mem.build_context(user_input)        # budgeted prompt sections + window plan
 reply = run_my_agent(ctx, user_input)
-mem.record_turn(user_input, reply)         # persist + background extraction
+mem.record_turn(user_input, reply)         # persist + rule capture
 
 # anytime:
 mem.remember("dietary_restriction", "vegetarian")   # explicit, durable
@@ -57,8 +55,26 @@ hits = mem.recall("what did we discuss about my car")
 mem.end_session()                          # summarize, consolidate, close
 ```
 
-No `complete_fn` → no LLM extraction/summaries (regex rules + explicit memory
-still work). No `embed_fn` → keyword (FTS5 BM25) retrieval. No psutil → stdlib
+Give it an LLM and an embedder when you have them — every capability is
+optional and unlocks more:
+
+```python
+mem = elastimem.open(
+    "~/.myagent/memory.db",
+    llm=my_llm,               # (prompt, *, max_tokens, temperature) -> str
+    embedder=my_embedder,     # (list[str]) -> list[list[float]]
+    context_tokens=4096,      # any config field can be passed inline...
+    reserved_keys={"model"},
+)
+
+# ...or bundle settings in a reusable config object:
+from elastimem import ElastimemConfig
+cfg = ElastimemConfig(context_tokens=4096, reserved_keys=frozenset({"model"}))
+mem = elastimem.open("~/.myagent/memory.db", llm=my_llm, config=cfg)
+```
+
+No `llm` → no LLM extraction/summaries (regex rules + explicit memory still
+work). No `embedder` → keyword (FTS5 BM25) retrieval. No psutil → stdlib
 hardware probe. No FTS5 in your sqlite build → `LIKE` retrieval. It always
 works; it's just progressively less clever.
 
