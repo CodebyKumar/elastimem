@@ -4,8 +4,10 @@ Get from install to first recall in under a minute.
 
 ## 1. Install
 
+Not on PyPI — install directly from GitHub:
+
 ```bash
-pip install elastimem
+pip install git+https://github.com/CodebyKumar/elastimem.git
 ```
 
 No required dependencies — this works standalone.

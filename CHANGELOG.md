@@ -12,16 +12,15 @@ version.
 
 Nothing yet.
 
-## [0.1.0a1] — first public pre-release
+## [0.1.0a1]
 
 Elastimem is in **alpha**. The core API (`open`/`remember`/`recall`/
 `record_turn`/`build_context` — see
 [docs/api_stability.md](docs/api_stability.md) for the exact Stable
 surface) is expected to remain stable across alpha iterations, but internal
 implementation details and advanced features may still evolve based on
-feedback from early adopters. Expect `0.1.0a2`, `a3`, etc. before a `b1`
-beta or a `0.1.0` final, informed by real usage rather than a fixed
-timeline.
+feedback from early adopters. Not published to PyPI — install directly
+from this repository, see [docs/installation.md](docs/installation.md).
 
 ### Added
 - Core memory store (`Elastimem` / `elastimem.open()`) over a single SQLite
@@ -76,4 +75,4 @@ timeline.
   example into their own project.
 
 [Unreleased]: https://github.com/CodebyKumar/elastimem/compare/v0.1.0a1...HEAD
-[0.1.0a1]: https://github.com/CodebyKumar/elastimem/releases/tag/v0.1.0a1
+[0.1.0a1]: https://github.com/CodebyKumar/elastimem/tree/v0.1.0a1

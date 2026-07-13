@@ -10,10 +10,20 @@ code serves a 4 GB Jetson and a 128 GB workstation. Every capability has a
 documented degradation floor; nothing ever hard-fails because the host is
 small.
 
+Not on PyPI — install directly from this repository:
+
 ```
-pip install elastimem            # zero dependencies
-pip install elastimem[system]    # + psutil for richer hardware probing
-pip install elastimem[embed]     # + fastembed, activates the built-in embedder
+pip install git+https://github.com/CodebyKumar/elastimem.git                          # zero dependencies
+pip install "elastimem[system] @ git+https://github.com/CodebyKumar/elastimem.git"    # + psutil for richer hardware probing
+pip install "elastimem[embed] @ git+https://github.com/CodebyKumar/elastimem.git"     # + fastembed, activates the built-in embedder
+```
+
+Or clone and install locally (editable, for hacking on the source):
+
+```
+git clone https://github.com/CodebyKumar/elastimem.git
+cd elastimem
+pip install -e .
 ```
 
 ## Why another memory framework?

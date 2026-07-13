@@ -13,8 +13,10 @@
 
 ## Base install
 
+Elastimem is not published on PyPI — install directly from GitHub:
+
 ```bash
-pip install elastimem
+pip install git+https://github.com/CodebyKumar/elastimem.git
 ```
 
 This gives you the full public API (`open`, `remember`, `recall`,
@@ -33,16 +35,27 @@ This gives you the full public API (`open`, `remember`, `recall`,
 
 ## Optional extras
 
+Extras work the same way through a git install — reference them with the
+`@ git+...` form:
+
 ```bash
-pip install elastimem[system]   # + psutil, richer hardware probing
-pip install elastimem[vec]      # reserved for a future accelerated vector index — no effect yet
-pip install elastimem[embed]    # + fastembed, activates the built-in embedder
+pip install "elastimem[system] @ git+https://github.com/CodebyKumar/elastimem.git"   # + psutil, richer hardware probing
+pip install "elastimem[vec] @ git+https://github.com/CodebyKumar/elastimem.git"      # reserved for a future accelerated vector index — no effect yet
+pip install "elastimem[embed] @ git+https://github.com/CodebyKumar/elastimem.git"    # + fastembed, activates the built-in embedder
 ```
 
 You can combine them:
 
 ```bash
-pip install "elastimem[system,vec,embed]"
+pip install "elastimem[system,vec,embed] @ git+https://github.com/CodebyKumar/elastimem.git"
+```
+
+If you've already cloned the repo, the same extras work with a local
+editable install too — see [Editable / development install](#editable--development-install)
+below:
+
+```bash
+pip install -e ".[system,vec,embed]"
 ```
 
 None of these change how you call the API — they only change what runs

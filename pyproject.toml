@@ -9,7 +9,7 @@ description = "Elastic, resource-adaptive memory framework for local-first AI ag
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
-authors = [{ name = "Kumarswami Kallimath" }]
+authors = [{ name = "Kumarswami K" }]
 keywords = ["ai", "agents", "memory", "local-first", "llm", "sqlite"]
 classifiers = [
     "Development Status :: 3 - Alpha",
