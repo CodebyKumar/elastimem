@@ -80,36 +80,36 @@ works; it's just progressively less clever.
 
 ## The four memory layers
 
-| Layer | What it holds | Where |
-|---|---|---|
-| **Working** | current conversation window + rolling summary of evicted turns | host's message list, planned by Elastimem |
-| **Episodic** | full past transcripts, chunked and indexed for recall | `messages` / `chunks` (+FTS5, +vectors) |
-| **Semantic** | facts about the user, temporally versioned, importance-decayed | `facts` |
-| **Procedural** | lessons the agent learned about its own behavior | `lessons` |
+| Layer                | What it holds                                                  | Where                                       |
+| -------------------- | -------------------------------------------------------------- | ------------------------------------------- |
+| **Working**    | current conversation window + rolling summary of evicted turns | host's message list, planned by Elastimem   |
+| **Episodic**   | full past transcripts, chunked and indexed for recall          | `messages` / `chunks` (+FTS5, +vectors) |
+| **Semantic**   | facts about the user, temporally versioned, importance-decayed | `facts`                                   |
+| **Procedural** | lessons the agent learned about its own behavior               | `lessons`                                 |
 
 ## The Memory Governor
 
 At startup (and on every `tick()`), Elastimem classifies the machine into a tier
 and derives token budgets from your model's context size:
 
-| Capability | FULL (≥16 GB) | STANDARD (≥8 GB) | LITE |
-|---|---|---|---|
-| Embeddings used | yes | yes, if provided | never |
-| Episodic injection | hybrid, top 4 | FTS5, top 3 | `recall()` only |
-| Working window | ~8–10 turns | ~5–6 turns | 2 turns + newest |
-| Rolling summary | LLM, every eviction | LLM, every 2nd batch | placeholder marker |
-| LLM fact extraction | background, per turn | batched every 3 turns | off (rules only) |
-| Rule capture, transcripts | always | always | always |
+| Capability                | FULL (≥16 GB)       | STANDARD (≥8 GB)     | LITE               |
+| ------------------------- | -------------------- | --------------------- | ------------------ |
+| Embeddings used           | yes                  | yes, if provided      | never              |
+| Episodic injection        | hybrid, top 4        | FTS5, top 3           | `recall()` only  |
+| Working window            | ~8–10 turns         | ~5–6 turns           | 2 turns + newest   |
+| Rolling summary           | LLM, every eviction  | LLM, every 2nd batch  | placeholder marker |
+| LLM fact extraction       | background, per turn | batched every 3 turns | off (rules only)   |
+| Rule capture, transcripts | always               | always                | always             |
 
 Full spec: [docs/governor.md](docs/governor.md). Architecture and rationale:
 [docs/architecture.md](docs/architecture.md). Integration guides (llama.cpp,
-OpenAI-compatible, no-LLM): [docs/integration.md](docs/integration.md).
+OpenAI-compatible, no-LLM): [docs/integrations.md](docs/integrations.md).
 
 ## Status
 
-Alpha (0.1.0). API may move before 1.0. Built as the memory engine for
-[Tuffy](https://github.com/CodebyKumar), an on-device agent for 8 GB Apple
-Silicon and Jetson Orin — Elastimem's constraints are real-device constraints.
+Alpha (0.1.0). API may move before 1.0. 
+
+Built as the memory engine for [Tuffy](https://github.com/CodebyKumar/tuffy)
 
 ## License
 

@@ -168,7 +168,10 @@ user input
 
 ## Reference
 
+- [quickstart.md](quickstart.md) — install to first recall
+- [installation.md](installation.md) — extras, supported Python versions
 - [governor.md](governor.md) — tiers, budget math, degradation matrix
 - [schema.md](schema.md) — every table and index
-- [integration.md](integration.md) — wiring guides (llama.cpp, API, no-LLM)
+- [integrations.md](integrations.md) — wiring guides (llama.cpp, API, no-LLM)
 - [api.md](api.md) — public API reference
+- [api_stability.md](api_stability.md) — what's safe to depend on long-term

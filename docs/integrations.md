@@ -193,3 +193,17 @@ Two natural tool bindings:
       memory" feature), not just an explicit model switch. A freshly
       reopened store resets to whatever `context_tokens` you pass it at
       that moment, not whatever was correct before.
+
+## Example programs
+
+- `examples/minimal_bot.py` — Level 0, no LLM at all.
+- `examples/llama_cpp_bot.py` — full-capability, local `llama-cpp-python`.
+- `examples/openai_agent.py` — any OpenAI-compatible HTTP endpoint (OpenAI,
+  Groq, Together, a local vLLM/llama.cpp server) via a plain `requests` call
+  — no vendor SDK required.
+- `examples/memory_search.py` — `remember()`/`recall()`/`facts()` used
+  directly, no chat loop, no LLM.
+
+All four use the same `llm=` shape — `(prompt, *, max_tokens, temperature) ->
+str` — so switching backends is a matter of swapping which example you start
+from, not restructuring how you call Elastimem.
