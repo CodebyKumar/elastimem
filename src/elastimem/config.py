@@ -83,6 +83,19 @@ DEFAULT_PROFILE_KEYS = frozenset(
     {"name", "email", "location", "age", "occupation", "pronouns"}
 )
 
+# Governor defaults, defined here (not in governor.py) so ElastimemConfig is
+# the single source of truth for every user-tunable value. Tier thresholds
+# are (total_gib, available_gib) pairs; FULL and STANDARD are checked in
+# that order, anything below STANDARD's floor is LITE.
+DEFAULT_TIER_THRESHOLDS_GIB: dict[str, tuple[float, float]] = {
+    "full": (16.0, 6.0),
+    "standard": (8.0, 2.5),
+}
+DEFAULT_MEMORY_SPLIT: dict[str, float] = {
+    "facts": 0.40, "episodic": 0.30, "sessions": 0.15, "lessons": 0.15,
+}
+DEFAULT_WORKING_SHARE = 0.55
+
 
 @dataclass
 class ElastimemConfig:
@@ -150,6 +163,19 @@ class ElastimemConfig:
     tier_override: Tier | None = field(default_factory=Tier.from_env)
     upgrade_healthy_ticks: int = 10  # consecutive healthy ticks before tier upgrade
     idle_consolidate_seconds: float = 90.0
+    # RAM thresholds (GiB) for FULL/STANDARD tiers: (total_min, available_min).
+    # Below STANDARD's floor, the governor classifies the host as LITE.
+    tier_thresholds_gib: dict[str, tuple[float, float]] = field(
+        default_factory=lambda: dict(DEFAULT_TIER_THRESHOLDS_GIB)
+    )
+    # Share of the dynamic token pool reserved for the working window (the
+    # rest is split among facts/episodic/sessions/lessons per memory_split).
+    working_share: float = DEFAULT_WORKING_SHARE
+    # How the non-working share of the dynamic token pool is split across
+    # memory sections. Must sum to 1.0.
+    memory_split: dict[str, float] = field(
+        default_factory=lambda: dict(DEFAULT_MEMORY_SPLIT)
+    )
 
     # --- background worker -------------------------------------------------
     worker_max_tokens: int = 96      # cap on every background LLM call
@@ -160,3 +186,14 @@ class ElastimemConfig:
             raise ValueError("context_tokens must be >= 1024")
         self.profile_keys = frozenset(k.lower() for k in self.profile_keys)
         self.reserved_keys = frozenset(k.lower() for k in self.reserved_keys)
+        if not 0.0 < self.working_share < 1.0:
+            raise ValueError("working_share must be between 0 and 1")
+        if abs(sum(self.memory_split.values()) - 1.0) > 1e-6:
+            raise ValueError("memory_split values must sum to 1.0")
+        if set(self.memory_split) != {"facts", "episodic", "sessions", "lessons"}:
+            raise ValueError(
+                "memory_split must have exactly these keys: "
+                "facts, episodic, sessions, lessons"
+            )
+        if set(self.tier_thresholds_gib) != {"full", "standard"}:
+            raise ValueError("tier_thresholds_gib must have exactly keys: full, standard")

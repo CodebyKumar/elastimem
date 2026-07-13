@@ -42,11 +42,6 @@ log = logging.getLogger("elastimem")
 
 GIB = 1024**3
 
-# Tier thresholds (bytes): (total_min, available_min)
-_TIER_THRESHOLDS = {
-    Tier.FULL: (16 * GIB, 6 * GIB),
-    Tier.STANDARD: (8 * GIB, int(2.5 * GIB)),
-}
 _PRESSURE_AVAILABLE = int(1.2 * GIB)   # below this, downgrade immediately
 # A burst of host-reported pressure events (several decode failures in the
 # same bad turn, or one failure surfacing through more than one call site)
@@ -57,9 +52,15 @@ _PRESSURE_AVAILABLE = int(1.2 * GIB)   # below this, downgrade immediately
 # downgrade rather than each dropping the tier again.
 _PRESSURE_REPORT_COOLDOWN_SECONDS = 30.0
 
-# Budget shares (of the dynamic token pool)
-_WORKING_SHARE = 0.55
-_MEMORY_SPLIT = {"facts": 0.40, "episodic": 0.30, "sessions": 0.15, "lessons": 0.15}
+
+def _tier_thresholds_bytes(cfg: ElastimemConfig) -> dict[Tier, tuple[int, int]]:
+    """User-tunable GiB thresholds (config.py) converted to bytes."""
+    full_total, full_avail = cfg.tier_thresholds_gib["full"]
+    std_total, std_avail = cfg.tier_thresholds_gib["standard"]
+    return {
+        Tier.FULL: (int(full_total * GIB), int(full_avail * GIB)),
+        Tier.STANDARD: (int(std_total * GIB), int(std_avail * GIB)),
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -118,9 +119,9 @@ def _darwin_available() -> int:
         return 0
 
 
-def _classify(total: int, available: int) -> Tier:
+def _classify(total: int, available: int, thresholds: dict[Tier, tuple[int, int]]) -> Tier:
     for tier in (Tier.FULL, Tier.STANDARD):
-        t_min, a_min = _TIER_THRESHOLDS[tier]
+        t_min, a_min = thresholds[tier]
         if total >= t_min and available >= a_min:
             return tier
     return Tier.LITE
@@ -151,13 +152,14 @@ class Governor:
         self._lock = threading.Lock()
         self._healthy_streak = 0
         self._last_pressure_report = 0.0
+        self._thresholds = _tier_thresholds_bytes(config)
 
         total, available = self._probe()
         # Explicit None check: Tier.LITE is 0 and would be swallowed by `or`.
         self._startup_tier = (
             config.tier_override
             if config.tier_override is not None
-            else _classify(total, available)
+            else _classify(total, available, self._thresholds)
         )
         self._tier = self._startup_tier
         self._profile = self._build_profile(self._tier)
@@ -182,7 +184,7 @@ class Governor:
             if available < _PRESSURE_AVAILABLE:
                 self._set_tier(Tier.LITE)
             else:
-                measured = _classify(total, available)
+                measured = _classify(total, available, self._thresholds)
                 if measured < self._tier:
                     self._set_tier(measured)          # downgrade immediately
                 elif measured > self._tier:
@@ -239,9 +241,10 @@ class Governor:
         post-load memory pressure instead of a stale pre-load guess.
         """
         with self._lock:
+            self._thresholds = _tier_thresholds_bytes(self.config)
             if reprobe and self.config.tier_override is None:
                 total, available = self._probe()
-                self._set_tier(_classify(total, available))
+                self._set_tier(_classify(total, available, self._thresholds))
             self._profile = self._build_profile(self._tier)
         return self._profile
 
@@ -266,9 +269,9 @@ class Governor:
             cfg.context_tokens - cfg.output_reserve - cfg.tool_reserve
             - cfg.static_prompt_tokens,
         )
-        working = int(dynamic * _WORKING_SHARE)
+        working = int(dynamic * cfg.working_share)
         memory_pool = dynamic - working
-        split = dict(_MEMORY_SPLIT)
+        split = dict(cfg.memory_split)
 
         if tier is Tier.LITE:
             # No episodic injection, half the session summaries; the freed

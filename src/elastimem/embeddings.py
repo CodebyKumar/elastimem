@@ -106,7 +106,7 @@ def similar_chunks(store: "Elastimem", query: str, limit: int = 20) -> list[tupl
     """
     if store.embed_fn is None or getattr(store, "_embed_failed", False):
         raise RuntimeError("no embedder available")
-    if not store.governor.profile.embeddings_enabled:
+    if not store.profile.embeddings_enabled:
         raise RuntimeError("embeddings disabled by governor tier")
 
     try:

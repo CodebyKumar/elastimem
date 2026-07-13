@@ -86,7 +86,7 @@ class Elastimem:
         **config_overrides,
     ) -> None:
         self.path = os.path.expanduser(path) if path != ":memory:" else path
-        self.config = _resolve_config(config, config_overrides)
+        self._config = _resolve_config(config, config_overrides)
         self.complete_fn = complete_fn if complete_fn is not None else llm
         self.embed_fn = embed_fn if embed_fn is not None else embedder
         # Query-side encoder for an asymmetrically-trained embedder (see
@@ -94,7 +94,7 @@ class Elastimem:
         # common case — most embedding APIs are symmetric): retrieval then
         # reuses embed_fn for queries exactly as before this existed.
         self.embed_query_fn = None
-        if self.embed_fn is None and not self.config.disable_builtin_embedder:
+        if self.embed_fn is None and not self._config.disable_builtin_embedder:
             # No embedder supplied — activate elastimem's own built-in
             # semantic search so hosts get real recall quality with zero
             # setup. Both functions are lazy: nothing downloads or loads
@@ -115,7 +115,7 @@ class Elastimem:
         governor_kwargs = {"on_tier_change": on_tier_change}
         if probe_fn is not None:
             governor_kwargs["probe_fn"] = probe_fn
-        self.governor = Governor(self.config, **governor_kwargs)
+        self._governor = Governor(self._config, **governor_kwargs)
 
         # Session state (lazy: first record_turn opens one).
         self.session_id: int | None = None
@@ -148,21 +148,30 @@ class Elastimem:
             self._local.conn = conn
         return conn
 
+    @property
+    def config(self) -> ElastimemConfig:
+        """Read-only snapshot of the active config. Mutating the returned
+        object has no effect — call :meth:`reconfigure` to change settings,
+        so budgets stay in sync with whatever changed."""
+        import dataclasses
+
+        return dataclasses.replace(self._config)
+
     # ------------------------------------------------------------------ #
     # governor / context
     # ------------------------------------------------------------------ #
     @property
     def profile(self) -> MemoryProfile:
         """The governor's current capability/budget snapshot."""
-        return self.governor.profile
+        return self._governor.profile
 
     def tick(self) -> MemoryProfile:
         """Call once per turn: cheap hardware re-check, may change the tier."""
-        return self.governor.tick()
+        return self._governor.tick()
 
     def report_pressure(self) -> MemoryProfile:
         """Host signal that an OOM/decode failure happened; downgrades a tier."""
-        return self.governor.report_pressure()
+        return self._governor.report_pressure()
 
     def reconfigure(self, *, reprobe: bool = False, **config_overrides) -> MemoryProfile:
         """Update config fields (e.g. after a model switch) and immediately
@@ -186,9 +195,9 @@ class Elastimem:
         Returns the refreshed :class:`MemoryProfile`.
         """
         if config_overrides:
-            self.config = _resolve_config(self.config, config_overrides)
-            self.governor.config = self.config
-        return self.governor.reconfigure(reprobe=reprobe)
+            self._config = _resolve_config(self._config, config_overrides)
+            self._governor.config = self._config
+        return self._governor.reconfigure(reprobe=reprobe)
 
     def build_context(self, user_input: str = "") -> ContextPlan:
         """Assemble this turn's budgeted memory sections.
@@ -196,12 +205,12 @@ class Elastimem:
         ``user_input`` (when given) makes retrieval query-aware; retrieval
         never raises — on any failure a section is simply empty.
         """
-        profile = self.governor.profile
+        profile = self._governor.profile
         conn = self._conn
 
         relevance: dict[int, float] = {}
         episodic_text = ""
-        if user_input and len(user_input.split()) >= self.config.min_retrieval_query_words:
+        if user_input and len(user_input.split()) >= self._config.min_retrieval_query_words:
             try:
                 from . import retrieval
 
@@ -216,7 +225,7 @@ class Elastimem:
                 log.exception("elastimem: retrieval failed; sections degraded to empty")
 
         facts_text, fact_ids = assembly.build_facts_section(
-            conn, self.config, profile, relevance, self.tokenizer_fn
+            conn, self._config, profile, relevance, self.tokenizer_fn
         )
         if fact_ids:
             with self._write_lock:
@@ -227,7 +236,7 @@ class Elastimem:
             assembly.SECTION_EPISODIC: episodic_text,
             assembly.SECTION_SESSIONS: self._sessions_section(profile),
             assembly.SECTION_LESSONS: assembly.build_lessons_section(
-                conn, self.config, profile, self.tokenizer_fn
+                conn, self._config, profile, self.tokenizer_fn
             ),
         }
         return ContextPlan(
@@ -281,7 +290,7 @@ class Elastimem:
                     self.session_id = episodic.begin_session(self._conn)
                 self._turn += 1
                 chunk_ids = episodic.record_turn(
-                    self._conn, self.config, self.session_id, self._turn,
+                    self._conn, self._config, self.session_id, self._turn,
                     user_text, assistant_text, tokenizer_fn=self.tokenizer_fn,
                 )
             captured = rules.capture(user_text)
@@ -298,10 +307,10 @@ class Elastimem:
         self, user_text: str, assistant_text: str, chunk_ids: list[int]
     ) -> None:
         """Enqueue deferred work: LLM extraction, chunk embedding."""
-        profile = self.governor.profile
+        profile = self._governor.profile
         if (self.complete_fn is not None
                 and profile.llm_extraction_enabled
-                and len(user_text.split()) >= self.config.min_query_words):
+                and len(user_text.split()) >= self._config.min_query_words):
             self._worker.submit(Job(
                 "extract", needs_llm=True,
                 payload={"user": user_text, "assistant": assistant_text,
@@ -332,7 +341,7 @@ class Elastimem:
         they fold into the rolling summary (already persisted verbatim)."""
         if not turns:
             return
-        profile = self.governor.profile
+        profile = self._governor.profile
         if profile.rolling_summary_enabled and self.complete_fn is not None:
             self._worker.submit(Job(
                 "rolling_summary", needs_llm=True, payload={"turns": turns},
@@ -359,7 +368,7 @@ class Elastimem:
         conn = self._conn  # worker thread gets its own connection
         if job.kind == "extract" and self.complete_fn is not None:
             stored = extraction.extract_facts(
-                conn, self.config, self.complete_fn,
+                conn, self._config, self.complete_fn,
                 job.payload["user"], job.payload["assistant"],
                 store_fn=lambda k, v, s: self.remember(k, v, source=s),
             )
@@ -370,7 +379,7 @@ class Elastimem:
             with self._rolling_lock:
                 previous = self._rolling
             summary = extraction.rolling_summary(
-                self.complete_fn, self.config, previous, job.payload["turns"]
+                self.complete_fn, self._config, previous, job.payload["turns"]
             )
             if summary:
                 with self._rolling_lock:
@@ -387,11 +396,11 @@ class Elastimem:
 
             embeddings.embed_chunks(self, job.payload["chunk_ids"])
         elif job.kind == "consolidate":
-            level = self.governor.profile.consolidation_level
+            level = self._governor.profile.consolidation_level
             if level is not ConsolidationLevel.OFF:
                 with self._write_lock:
                     extraction.consolidate(
-                        conn, self.config, self.complete_fn,
+                        conn, self._config, self.complete_fn,
                         llm_merge=(level is ConsolidationLevel.FULL
                                    and self.complete_fn is not None),
                     )
@@ -425,7 +434,7 @@ class Elastimem:
                 return None, []
             session_id = row["id"]
         return episodic.session_tail(
-            conn, session_id, self.governor.profile.budgets.working
+            conn, session_id, self._governor.profile.budgets.working
         )
 
     def end_session(self) -> None:
@@ -452,10 +461,10 @@ class Elastimem:
             # non-thread-safe) model. Mirrors Worker._execute's own guard.
             with self._worker.llm_lock:
                 summary = extraction.session_summary(
-                    self.complete_fn, self.config, user_turns
+                    self.complete_fn, self._config, user_turns
                 ) or None
 
-        level = self.governor.profile.consolidation_level
+        level = self._governor.profile.consolidation_level
         llm_merge = level is ConsolidationLevel.FULL and self.complete_fn is not None
         # consolidate() interleaves complete_fn calls with the writes below
         # (contradiction-merge reviews a row, calls the model, writes the
@@ -476,7 +485,7 @@ class Elastimem:
             episodic.end_session(self._conn, self.session_id, summary)
             if level is not ConsolidationLevel.OFF:
                 extraction.consolidate(
-                    self._conn, self.config, self.complete_fn,
+                    self._conn, self._config, self.complete_fn,
                     llm_merge=llm_merge,
                 )
             self.session_id = None
@@ -490,7 +499,7 @@ class Elastimem:
     def remember(self, key: str, value: str, source: str = "explicit") -> tuple[bool, str]:
         """Durably store one fact, synchronously. Returns ``(changed, reason)``."""
         with self._write_lock:
-            return semantic.store_fact(self._conn, self.config, key, value, source)
+            return semantic.store_fact(self._conn, self._config, key, value, source)
 
     def facts(self) -> dict[str, str]:
         """Current facts as a merged ``{key: value}`` dict."""
@@ -510,10 +519,10 @@ class Elastimem:
     # ------------------------------------------------------------------ #
     def add_lesson(self, text: str, tag: str | None = None) -> bool:
         with self._write_lock:
-            return procedural.add_lesson(self._conn, self.config, text, tag)
+            return procedural.add_lesson(self._conn, self._config, text, tag)
 
     def lessons(self, n: int | None = None) -> list[str]:
-        return procedural.load_lessons(self._conn, n or self.config.lessons_in_prompt)
+        return procedural.load_lessons(self._conn, n or self._config.lessons_in_prompt)
 
     # ------------------------------------------------------------------ #
     # inspection / maintenance

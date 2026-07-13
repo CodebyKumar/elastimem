@@ -18,6 +18,8 @@ With an LLM and embedder (both optional — everything degrades gracefully)::
     )
 """
 
+from importlib.metadata import PackageNotFoundError, version
+
 from .config import (
     Budgets,
     Cadence,
@@ -29,7 +31,11 @@ from .config import (
 from .semantic import Fact
 from .store import Elastimem
 
-__version__ = "0.1.0"
+try:
+    __version__ = version("elastimem")
+except PackageNotFoundError:
+    # Editable/dev checkout with no installed distribution metadata.
+    __version__ = "0.0.0+dev"
 
 
 def open(path: str, **kwargs) -> Elastimem:

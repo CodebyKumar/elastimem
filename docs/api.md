@@ -1,6 +1,9 @@
 # Public API reference
 
-Everything importable from `elastimem` is public; everything else is internal.
+The surface documented here is stable — see [api_stability.md](api_stability.md)
+for the precise Stable/Experimental/Internal boundaries. Anything not listed
+there (submodules like `elastimem.governor`, underscore-prefixed members) is
+internal even though Python does not prevent importing it.
 
 `elastimem.open(path, **kwargs) -> Elastimem`
 
@@ -37,6 +40,17 @@ One persistent store backed by one SQLite file (`":memory:"` supported).
   trained embedder (set automatically alongside `embed_fn` when the
   built-in default activates; `None` for a host-supplied `embedder=`, which
   is assumed symmetric — retrieval then reuses `embed_fn` for queries too).
+- `config` — read-only snapshot (`ElastimemConfig`) of the active
+  configuration. Mutating the returned object has no effect; use
+  `reconfigure()` to change settings, which keeps derived budgets in sync.
+  There is no public `governor` attribute — the equivalent operations are
+  `profile`, `tick()`, `report_pressure()`, and `reconfigure()` on `Elastimem`
+  itself.
+
+`embed_fn`, `embed_query_fn`, `tokenizer_fn`, `path`, and `session_id` are
+construction-time only: set them via `open()`/`Elastimem(...)` and don't
+reassign after construction (the background worker may hold a reference to
+the original callable).
 
 ### Per-turn
 
@@ -48,7 +62,7 @@ One persistent store backed by one SQLite file (`":memory:"` supported).
 | `record_turn(user_text, assistant_text)`                                         | persist exchange, rule capture, enqueue extraction/embedding; never raises                                       |
 | `report_evictions(turns: list[tuple[str, str]])`                                 | fold host-evicted (user, assistant) pairs into the rolling summary                                               |
 | `report_pressure() -> MemoryProfile`                                             | OOM/decode-failure signal; downgrades one tier on first call, coalesces repeat calls within a 30s cooldown (see [governor.md](governor.md)) |
-| `reconfigure(**config_overrides) -> MemoryProfile`                               | update config (e.g.`context_tokens` after a model switch) and rebuild budgets immediately — see warning below |
+| `reconfigure(**config_overrides) -> MemoryProfile`                               | update config (e.g.`context_tokens` after a model switch) and rebuild budgets immediately — the only supported way to change config after construction |
 
 ### Memory operations
 
@@ -106,5 +120,9 @@ One persistent store backed by one SQLite file (`":memory:"` supported).
   — deliberately much lower than `min_query_words` since retrieval is free
   and a short query still carries real intent), `disable_builtin_embedder`
   (default `False` — set `True` to force FTS5-only retrieval and prevent
-  the built-in embedder from ever activating, e.g. for an air-gapped host).
+  the built-in embedder from ever activating, e.g. for an air-gapped host),
+  `tier_thresholds_gib` (RAM thresholds the governor uses to classify
+  FULL/STANDARD/LITE), `memory_split` (how the non-working token pool
+  divides across facts/episodic/sessions/lessons), `working_share`
+  (fraction of the dynamic token pool reserved for the working window).
 - **`Tier`** — `LITE < STANDARD < FULL`; env override `ELASTIMEM_TIER`.
