@@ -40,7 +40,7 @@ One per exchange (`User: …\nAssistant: …`), sentence-split beyond
 | `first_msg_id`, `last_msg_id` | span of source messages |
 | `text` | the condensed exchange |
 | `embedding` | little-endian float32 BLOB (`array('f')`), NULL until embedded |
-| `embedding_model` | label; lets a re-index detect stale vectors |
+| `embedding_model` | label; lets a re-index detect stale vectors. `"elastimem:bge-small-en-v1.5"` for vectors from the built-in default embedder, `"host"` for any host-supplied `embedder=` (the label doesn't distinguish between different host embedders — a host that swaps its own embedding model should re-embed or track that distinction itself) |
 | `importance` | default 0.5; consolidation may raise/lower later |
 
 Indexes: `(session_id)`; partial `WHERE embedding IS NULL` (the embed queue).

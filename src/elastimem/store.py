@@ -89,6 +89,22 @@ class Elastimem:
         self.config = _resolve_config(config, config_overrides)
         self.complete_fn = complete_fn if complete_fn is not None else llm
         self.embed_fn = embed_fn if embed_fn is not None else embedder
+        # Query-side encoder for an asymmetrically-trained embedder (see
+        # default_embedder.py). None for a host-supplied embed_fn (the
+        # common case — most embedding APIs are symmetric): retrieval then
+        # reuses embed_fn for queries exactly as before this existed.
+        self.embed_query_fn = None
+        if self.embed_fn is None and not self.config.disable_builtin_embedder:
+            # No embedder supplied — activate elastimem's own built-in
+            # semantic search so hosts get real recall quality with zero
+            # setup. Both functions are lazy: nothing downloads or loads
+            # until the first chunk/query is actually embedded, so this
+            # never slows down __init__ or blocks on network access, and
+            # degrades silently to FTS5/keyword search if the optional
+            # 'embed' extra isn't installed or the download fails.
+            from . import default_embedder
+            self.embed_fn = default_embedder.default_embed_fn
+            self.embed_query_fn = default_embedder.embed_query
         self.tokenizer_fn = tokenizer_fn
         self._write_lock = threading.RLock()
         self._local = threading.local()
@@ -105,6 +121,16 @@ class Elastimem:
         self.session_id: int | None = None
         self._turn = 0
         self._rolling: str | None = None
+        # _rolling is read/written from both the main thread (begin_session,
+        # report_evictions' degradation-floor path, build_context's reader)
+        # and the worker thread (_execute_job's rolling_summary handler) -
+        # a plain attribute access is torn-write-safe under the GIL but NOT
+        # race-free: two writers close together can silently drop one side's
+        # contribution (a fresh LLM-condensed summary racing a degradation
+        # marker append). _write_lock isn't reused here on purpose - that
+        # lock guards SQLite writes specifically, and _rolling is a plain
+        # in-memory attribute, not a DB write.
+        self._rolling_lock = threading.Lock()
         with self._write_lock:
             episodic.close_orphan_sessions(conn)
 
@@ -175,7 +201,7 @@ class Elastimem:
 
         relevance: dict[int, float] = {}
         episodic_text = ""
-        if user_input and len(user_input.split()) >= self.config.min_query_words:
+        if user_input and len(user_input.split()) >= self.config.min_retrieval_query_words:
             try:
                 from . import retrieval
 
@@ -227,7 +253,8 @@ class Elastimem:
 
     def _rolling_summary(self) -> str | None:
         """Current session's rolling summary (maintained by the worker)."""
-        return self._rolling
+        with self._rolling_lock:
+            return self._rolling
 
     # ------------------------------------------------------------------ #
     # episodic memory (turns, sessions, recall)
@@ -239,6 +266,7 @@ class Elastimem:
                 episodic.end_session(self._conn, self.session_id)
             self.session_id = episodic.begin_session(self._conn, host_tag)
             self._turn = 0
+        with self._rolling_lock:
             self._rolling = None
         return self.session_id
 
@@ -312,12 +340,13 @@ class Elastimem:
         else:
             # Degradation floor: a marker line, so the model knows history
             # exists and recall() can retrieve it.
-            self._rolling = (
-                f"[{len(turns)} earlier turn(s) omitted — memory search can"
-                " recall them]"
-                if self._rolling is None
-                else self._rolling + f" [+{len(turns)} more turn(s) omitted]"
-            )
+            with self._rolling_lock:
+                self._rolling = (
+                    f"[{len(turns)} earlier turn(s) omitted — memory search can"
+                    " recall them]"
+                    if self._rolling is None
+                    else self._rolling + f" [+{len(turns)} more turn(s) omitted]"
+                )
 
     def drain(self, timeout: float = 5.0) -> bool:
         """Finish queued background work (call before unloading the model)."""
@@ -338,11 +367,14 @@ class Elastimem:
                 with self._write_lock:
                     episodic.bump_importance(conn, job.payload["chunk_ids"])
         elif job.kind == "rolling_summary" and self.complete_fn is not None:
+            with self._rolling_lock:
+                previous = self._rolling
             summary = extraction.rolling_summary(
-                self.complete_fn, self.config, self._rolling, job.payload["turns"]
+                self.complete_fn, self.config, previous, job.payload["turns"]
             )
             if summary:
-                self._rolling = summary
+                with self._rolling_lock:
+                    self._rolling = summary
                 if self.session_id is not None:
                     with self._write_lock:
                         conn.execute(
@@ -449,7 +481,8 @@ class Elastimem:
                 )
             self.session_id = None
             self._turn = 0
-            self._rolling = None
+            with self._rolling_lock:
+                self._rolling = None
 
     # ------------------------------------------------------------------ #
     # semantic memory (facts)

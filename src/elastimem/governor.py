@@ -26,6 +26,7 @@ import logging
 import subprocess
 import sys
 import threading
+import time
 from typing import Callable
 
 from .config import (
@@ -47,6 +48,14 @@ _TIER_THRESHOLDS = {
     Tier.STANDARD: (8 * GIB, int(2.5 * GIB)),
 }
 _PRESSURE_AVAILABLE = int(1.2 * GIB)   # below this, downgrade immediately
+# A burst of host-reported pressure events (several decode failures in the
+# same bad turn, or one failure surfacing through more than one call site)
+# must not cascade the tier down multiple levels for what is really one
+# underlying event. This does NOT weaken "downgrades are immediate" - the
+# FIRST report in a burst still downgrades right away, same as before; only
+# additional reports within the window are coalesced into that same
+# downgrade rather than each dropping the tier again.
+_PRESSURE_REPORT_COOLDOWN_SECONDS = 30.0
 
 # Budget shares (of the dynamic token pool)
 _WORKING_SHARE = 0.55
@@ -141,6 +150,7 @@ class Governor:
         self._on_tier_change = on_tier_change
         self._lock = threading.Lock()
         self._healthy_streak = 0
+        self._last_pressure_report = 0.0
 
         total, available = self._probe()
         # Explicit None check: Tier.LITE is 0 and would be swallowed by `or`.
@@ -184,8 +194,21 @@ class Governor:
         return self._profile
 
     def report_pressure(self) -> MemoryProfile:
-        """Host signal: an OOM/decode failure happened. Downgrade one tier now."""
+        """Host signal: an OOM/decode failure happened. Downgrades one tier
+        immediately - UNLESS this report arrives within
+        _PRESSURE_REPORT_COOLDOWN_SECONDS of the last one, in which case it's
+        coalesced into that same downgrade instead of dropping the tier
+        again. Without this, a burst of several decode failures in one bad
+        turn (a plausible retry pattern, or the same failure surfacing
+        through more than one call site) could cascade the tier down
+        multiple levels for what is really one underlying event, needing
+        many more healthy ticks than warranted to recover."""
         with self._lock:
+            now = time.monotonic()
+            if now - self._last_pressure_report < _PRESSURE_REPORT_COOLDOWN_SECONDS:
+                self._last_pressure_report = now
+                return self._profile
+            self._last_pressure_report = now
             if self._tier > Tier.LITE:
                 self._set_tier(Tier(self._tier - 1))
         return self._profile

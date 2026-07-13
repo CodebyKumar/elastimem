@@ -44,7 +44,15 @@ _STOPWORDS = frozenset(
     "his how i if in is it its me my of on or our she so that the their them "
     "they this to unclear us was we were what when where which who will with "
     "you your about again also can could should would tell remind know talk "
-    "talked discuss discussed say said".split()
+    "talked discuss discussed say said "
+    # Every episodic chunk is stored as "User: ...\nAssistant: ..."
+    # (episodic.py's record_turn) — these two words are a structural
+    # formatting artifact present in EVERY chunk, not a content word. Left
+    # unfiltered, "user"/"assistant" match every row equally in the FTS5
+    # leg and inject noise into RRF fusion strong enough to outrank a
+    # genuinely relevant vector-leg match (e.g. "where does the user "
+    # "currently live" matching on the literal word 'user' in every chunk).
+    "user assistant".split()
 )
 
 
@@ -120,9 +128,26 @@ def search_chunks(
     k: int = 8,
     exclude_session: int | None = None,
 ) -> list[Hit]:
-    """Hybrid search over episodic chunks. FTS5 + vectors when available."""
+    """Hybrid search over episodic chunks. FTS5 + vectors when available.
+
+    The two legs are fused differently from a textbook RRF because BM25
+    rank and cosine similarity carry very different amounts of information:
+    BM25's own score isn't cheaply comparable across queries, so the FTS leg
+    stays rank-based (RRF). Cosine similarity IS directly meaningful and
+    comparable (a 0.60 match really is stronger than a 0.15 match, same
+    query) — discarding it into rank-only RRF was the actual bug here: with
+    a small candidate set, RRF assigns every retrieved chunk a score that's
+    only marginally lower than the top match regardless of whether it's
+    genuinely relevant or just "the 5th-least-irrelevant of 5 chunks", which
+    let importance/recency multipliers trivially flip the ranking (a
+    fact-bearing but topically unrelated chunk beating the actually-relevant
+    one). The vector leg's raw cosine score is used directly instead,
+    min-max normalized against the best score in this result set so it's
+    comparable in scale to the FTS leg's RRF score.
+    """
     conn = store._conn
-    fused: dict[int, float] = {}
+    fts_scores: dict[int, float] = {}
+    vec_scores: dict[int, float] = {}
 
     q = _fts_query(query)
     if q:
@@ -136,24 +161,47 @@ def search_chunks(
             else:
                 rows = _like_match(conn, query, table="chunks", columns=("text",))
             for i, row in enumerate(rows):
-                fused[row["id"]] = fused.get(row["id"], 0.0) + _rrf(i)
+                fts_scores[row["id"]] = fts_scores.get(row["id"], 0.0) + _rrf(i)
         except sqlite3.Error:
             log.exception("elastimem: chunk FTS query failed")
 
-    # Vector leg (phase 5): only when the store has an embedder wired and the
-    # governor allows it.
+    # Vector leg: only when the store has an embedder wired and the governor
+    # allows it. Raw cosine scores, not just rank (see docstring above).
     try:
         from . import embeddings
 
-        vec_rows = embeddings.similar_chunks(store, query, limit=20)
-        for i, chunk_id in enumerate(vec_rows):
-            fused[chunk_id] = fused.get(chunk_id, 0.0) + _rrf(i)
+        vec_hits = embeddings.similar_chunks(store, query, limit=20)
+        if vec_hits:
+            best_cosine = vec_hits[0][1]
+            if best_cosine > 0:
+                for chunk_id, cosine_score in vec_hits:
+                    # Negative/zero cosine carries no positive relevance
+                    # signal - clamp rather than let it drag the fused
+                    # score negative.
+                    vec_scores[chunk_id] = max(0.0, cosine_score) / best_cosine
     except Exception:
         pass  # no embeddings available — FTS leg stands alone
+
+    # Fuse: whichever leg found a chunk contributes its own normalized
+    # relevance; a chunk both legs agree on gets the stronger of the two
+    # signals rather than double-counted, since FTS's RRF scale (~0.016 max)
+    # and the vector leg's 0-1 cosine scale aren't the same unit - summing
+    # them would let FTS silently dominate every fused score.
+    fused: dict[int, float] = {}
+    for chunk_id in set(fts_scores) | set(vec_scores):
+        fts_component = fts_scores.get(chunk_id, 0.0) / _rrf(0)  # normalize RRF to ~0-1 too
+        vec_component = vec_scores.get(chunk_id, 0.0)
+        fused[chunk_id] = max(fts_component, vec_component)
 
     if not fused:
         return []
 
+    # importance/recency are intentionally gentle secondary factors: each
+    # leg's contribution to `fused` is already normalized to its own 0-1
+    # scale (RRF-vs-RRF-max for the FTS leg, cosine-vs-cosine-max for the
+    # vector leg), so they break ties among comparably-relevant hits instead
+    # of being able to override relevance itself (see the docstring above
+    # for the bug this replaced).
     placeholders = ",".join("?" * len(fused))
     rows = conn.execute(
         f"SELECT id, session_id, text, created_at, importance FROM chunks"
@@ -169,12 +217,26 @@ def search_chunks(
             -_days_since(row["created_at"])
             / store.config.episodic_recency_half_life_days
         )
+        relevance = fused[row["id"]]
+        # importance/recency are tie-breaker NUDGES, not multipliers, now
+        # that relevance is a real 0-1 signal from actual cosine similarity
+        # / BM25 rank. A multiplier (importance in [0.5, 0.8], a 1.6x swing)
+        # was strong enough to let a fact-bearing-but-topically-unrelated
+        # chunk (bumped by episodic.bump_importance) outrank a chunk that
+        # scored meaningfully higher on actual query relevance - e.g. "where
+        # does the user live" losing to an unrelated favorite-food chunk
+        # purely because the food chunk happened to yield a stored fact
+        # earlier. Recency gets the same treatment for the same reason (an
+        # old, highly-relevant chunk shouldn't lose to a new, irrelevant
+        # one). Both are scaled to a small additive nudge instead.
+        importance_nudge = (row["importance"] - 0.5) * 0.15   # +/- 0.045 max
+        recency_nudge = recency * 0.1                          # 0 to +0.1
         hits.append(
             Hit(
                 kind="chunk",
                 text=row["text"],
                 date=row["created_at"][:10],
-                score=fused[row["id"]] * row["importance"] * recency,
+                score=relevance + importance_nudge + recency_nudge,
                 session_id=row["session_id"],
             )
         )

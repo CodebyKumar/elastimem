@@ -64,8 +64,43 @@ def test_pressure_report_downgrades():
     g = gov(32, 20)
     assert g.tier is Tier.FULL
     assert g.report_pressure().tier is Tier.STANDARD
-    assert g.report_pressure().tier is Tier.LITE
+
+
+def test_pressure_report_floors_at_lite():
+    g = gov(32, 20)
+    g._last_pressure_report -= 1000  # bypass cooldown between calls in this test
+    g.report_pressure()
+    g._last_pressure_report -= 1000
+    g.report_pressure()
+    g._last_pressure_report -= 1000
     assert g.report_pressure().tier is Tier.LITE  # floor
+
+
+def test_pressure_report_burst_coalesces_into_one_downgrade():
+    """Regression test: several pressure reports in quick succession (a
+    burst of decode failures within one bad turn, or the same failure
+    surfacing through more than one call site) must drop the tier once, not
+    cascade through every tier - otherwise a single bad turn could tank
+    memory quality all the way to LITE and require far more healthy ticks
+    to recover than the underlying event actually warranted."""
+    g = gov(32, 20)
+    assert g.tier is Tier.FULL
+    g.report_pressure()
+    assert g.tier is Tier.STANDARD
+    # Two more reports arriving immediately after (same burst) must NOT
+    # each drop the tier again.
+    g.report_pressure()
+    g.report_pressure()
+    assert g.tier is Tier.STANDARD
+
+
+def test_pressure_report_after_cooldown_downgrades_again():
+    g = gov(32, 20)
+    g.report_pressure()
+    assert g.tier is Tier.STANDARD
+    g._last_pressure_report -= 1000  # simulate cooldown window elapsing
+    g.report_pressure()
+    assert g.tier is Tier.LITE
 
 
 def test_tier_change_callback():

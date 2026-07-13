@@ -12,9 +12,21 @@ capacity.
 
 ## Design principles
 
-- **Host-agnostic.** Elastimem never loads a model, imports an inference
-  library, or calls an API. The host injects `llm` (text completion)
-  and `embedder` (embeddings) as plain callables. Both are optional.
+- **Host-agnostic, with one deliberate exception.** Elastimem never loads a
+  chat/completion model or calls an inference API itself — the host injects
+  `llm` (text completion) as a plain callable, and it's fully optional
+  (see the [degradation matrix](governor.md#degradation-matrix): no `llm`
+  means rule-based fact capture only, no LLM extraction/summarization/
+  consolidation). Embeddings are different: if the host doesn't supply
+  `embedder`, Elastimem activates its **own built-in embedder**
+  (`default_embedder.py`, via the optional `elastimem[embed]` extra) rather
+  than leaving semantic search off by default — see
+  [governor.md's "Built-in embedder" section](governor.md#built-in-embedder-auto-activates-read-this-before-assuming-embeddings-are-off)
+  for the full story (lazy loading, first-run download, silent fallback to
+  FTS5 if the extra isn't installed, the `disable_builtin_embedder` opt-out).
+  This is intentional: a host that does nothing beyond
+  `elastimem.open(path)` still gets real semantic recall, not just
+  keyword matching, once resources allow it (STANDARD tier or above).
 - **Elastic.** The [Memory Governor](governor.md) probes RAM and the model's
   context size, then budgets every capability. Same code on a 4 GB Jetson
   and a 128 GB workstation.
@@ -52,19 +64,50 @@ searchable.
 `record_turn()` writes each exchange verbatim to `messages` and condensed to
 `chunks` (~1 chunk per exchange, sentence-split beyond
 `chunk_target_tokens`). Chunks are indexed by FTS5 and, when an embedder
-exists, by float32 vector BLOBs. Retrieval at turn start injects the top
-chunks from *previous* sessions as `RELEVANT PAST MOMENTS` (the current
-session is already in the window). `recall(query)` searches everything,
-including the current session — it backs an agent-visible `memory_search`
-tool and user-facing `/memory search` commands.
+exists (host-supplied or the built-in default — see the design principles
+above), by float32 vector BLOBs. Retrieval at turn start injects the top
+chunks from *previous* sessions as `RELEVANT PAST MOMENTS` — deliberately
+excluding the current, still-live session (it's already in the working
+window, so re-injecting it would be redundant and would waste budget).
+`recall(query)` searches everything, including the current session — it
+backs an agent-visible `memory_search` tool and user-facing `/memory
+search` commands.
+
+**Ranking (`retrieval.search_chunks`)**: the FTS5 leg and vector leg are
+fused differently on purpose. FTS5's own BM25 score isn't cheaply
+comparable across different queries, so that leg stays rank-based
+(Reciprocal Rank Fusion, `1/(60+rank)`). The vector leg's cosine similarity
+IS directly meaningful — a 0.60 match really is stronger than a 0.15 one,
+for the same query — so `similar_chunks()` returns real `(chunk_id, score)`
+pairs, and `search_chunks()` min-max normalizes those against the best
+score in the current result set, giving each leg its own comparable 0-1
+relevance signal before fusing them (`max()` of the two, not a sum — the
+two legs' raw scales aren't the same unit, so summing would let FTS's much
+smaller RRF numbers get silently dominated by cosine, or vice versa
+depending on normalization order). Only after that fused relevance score
+exists do `importance` and `recency` apply, as small **additive** nudges
+(not multipliers) — enough to break a near-tie between two similarly
+relevant chunks, not enough to let a topically-irrelevant-but-fact-bearing
+chunk (importance gets bumped when a chunk yields a stored fact, see
+`episodic.bump_importance`) outrank a chunk that's actually relevant to the
+query. This replaced an earlier design where relevance × importance ×
+recency were multiplied together directly — since RRF's raw scores are
+deliberately flat across ranks (by design, so no single ranker dominates),
+that multiplication let importance's ~1.6x swing (0.5 → 0.8) trivially flip
+rankings on real queries. If you're touching this code, `search_chunks()`'s
+own docstring in `retrieval.py` has the fuller before/after story.
 
 ### Semantic memory (`semantic.py`)
 Facts are `key → value` rows with **temporal versioning**: an update
 invalidates the old row (`invalidated_at`, `invalidated_by`) and inserts a
 new one. `fact_history(key)` is the audit chain; `forget(key)` tombstones.
 Profile-category facts (name, location, …) are always injected; note facts
-compete by `relevance × importance × recency`. Never-accessed auto-extracted
-facts decay and archive; explicit facts never auto-archive.
+compete on **relevance first**, with importance and recency as small
+additive tie-breaking nudges (not multipliers — see the ranking note in
+episodic memory below, since chunks and facts share the same underlying
+principle even though the exact formulas differ per query surface). Never-
+accessed auto-extracted facts decay and archive; explicit facts never
+auto-archive.
 
 Three write paths, in increasing cost:
 1. **Rules** (`rules.py`) — ~10 compiled regexes on the user text, inline,

@@ -29,6 +29,12 @@ dependencies = []
 [project.optional-dependencies]
 system = ["psutil>=5.9"]      # richer hardware probing for the Memory Governor
 vec = ["sqlite-vec>=0.1"]     # accelerated vector search (brute-force cosine otherwise)
+# Elastimem's built-in default embedder (see default_embedder.py) — activates
+# automatically when a host doesn't supply its own embedder=/embed_fn=, so
+# semantic recall works with zero setup. ONNX Runtime, no torch. Purely
+# optional: without it, Elastimem falls back to FTS5/keyword retrieval, same
+# as before this extra existed.
+embed = ["fastembed>=0.4"]
 
 [project.urls]
 Homepage = "https://github.com/CodebyKumar/elastimem"
@@ -41,3 +47,7 @@ packages = ["src/elastimem"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "slow: downloads/loads a real model (the built-in embedder) — excluded by default, run explicitly with -m slow",
+]
+addopts = "-m 'not slow'"

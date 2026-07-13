@@ -60,10 +60,35 @@ def test_lite_tier_plan(tmp_path):
     s.close()
 
 
-def test_short_input_skips_retrieval(tmp_path):
+def test_empty_input_skips_retrieval(tmp_path):
     s = make_store(tmp_path)
-    plan = s.build_context("hi")   # under min_query_words
+    plan = s.build_context("")
     assert plan.sections[assembly.SECTION_EPISODIC] == ""
+    s.close()
+
+
+def test_short_meaningful_query_still_triggers_retrieval(tmp_path):
+    """Regression test: min_query_words (4) used to gate BOTH the expensive
+    LLM-extraction path and the cheap local retrieval path with the same
+    threshold, so a short-but-real question like "my birthday?" (2 words)
+    got zero episodic/fact retrieval - silently weaker recall on exactly the
+    kind of short follow-up that's common in real conversation. Retrieval
+    now uses its own much lower min_retrieval_query_words gate (1) so only
+    genuinely empty input is skipped; a short query that matches something
+    in the store must actually retrieve it."""
+    s = make_store(tmp_path)
+    s.record_turn("my birthday is on October 3rd", "Got it, October 3rd — noted!")
+    s.drain(timeout=5)
+    # episodic_section deliberately excludes the CURRENT session (it's for
+    # past sessions, not the live one) - end this session first so the next
+    # build_context() call is a genuine "later session asks a short
+    # follow-up" scenario, matching real usage.
+    s.end_session()
+    s.begin_session()
+    plan = s.build_context("my birthday?")
+    assert plan.sections[assembly.SECTION_EPISODIC] != "", (
+        "a short (2-word) but meaningful query should still trigger retrieval"
+    )
     s.close()
 
 

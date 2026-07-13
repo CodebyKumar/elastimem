@@ -120,7 +120,25 @@ class ElastimemConfig:
 
     # --- episodic memory ---------------------------------------------------
     chunk_target_tokens: int = 400   # split exchanges bigger than this
-    min_query_words: int = 4         # skip retrieval/extraction below this
+    # Gates LLM-based fact extraction (a real cost/latency operation) below
+    # this word count - not worth a model call for "ok" or "thanks".
+    min_query_words: int = 4
+    # Gates retrieval (FTS5/vector search - local, no LLM, cheap) below this
+    # word count. Deliberately much lower than min_query_words: a short but
+    # meaningful question ("my birthday?", "where do I live") would
+    # otherwise get zero episodic/fact-relevance retrieval just because it's
+    # under 4 words, silently weakening recall on exactly the kind of short
+    # follow-up question that's common in real conversation. 1 excludes only
+    # single-word inputs ("hi", "thanks", "ok") that carry no query intent.
+    min_retrieval_query_words: int = 1
+
+    # --- embeddings ----------------------------------------------------------
+    # When the host supplies no embedder=/embed_fn=, Elastimem activates its
+    # own built-in one (see default_embedder.py) so semantic recall works
+    # with zero setup. Set True to force FTS5/keyword-only retrieval instead
+    # (e.g. an air-gapped environment that must never attempt the optional
+    # extra's first-run model download).
+    disable_builtin_embedder: bool = False
 
     # --- forgetting --------------------------------------------------------
     fact_decay_half_life_days: float = 60.0

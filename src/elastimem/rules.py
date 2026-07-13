@@ -20,11 +20,17 @@ import re
 # _LEADING_STOPWORD rejects it when that word is a stopword rather than part
 # of a name/place ("my name is not important" must not yield "not").
 _RULES: list[tuple[re.Pattern, str]] = [
-    (re.compile(r"\b[Mm]y name is ([A-Z][\w'-]+(?: [A-Z][\w'-]+)?)"), "name"),
-    (re.compile(r"\b[Mm]y name is ([a-z][\w'-]+)\b"), "name"),
+    # "my (full/real/actual) name is X" - an adjective between "my" and
+    # "name" (very common phrasing when correcting/expanding on an earlier
+    # short name) must not block the match.
+    (re.compile(r"\b[Mm]y (?:\w+ )?name is ([A-Z][\w'-]+(?: [A-Z][\w'-]+)?)"), "name"),
+    (re.compile(r"\b[Mm]y (?:\w+ )?name is ([a-z][\w'-]+)\b"), "name"),
+    # "call me X" / "you can call me X" - typo tolerance ("all me" for "call
+    # me") is NOT attempted here; that's indistinguishable from genuine
+    # other text without much higher false-positive risk.
     (re.compile(r"\b[Cc]all me ([A-Za-z][\w'-]+)\b"), "name"),
-    (re.compile(r"\b[Ii] live in ([A-Z][\w'-]+(?:[ ,][A-Z][\w'-]+){0,2})"), "location"),
-    (re.compile(r"\b[Ii] live in ([a-z][\w'-]+)\b"), "location"),
+    (re.compile(r"\b[Ii] (?:live|stay) in ([A-Z][\w'-]+(?:[ ,][A-Z][\w'-]+){0,2})"), "location"),
+    (re.compile(r"\b[Ii] (?:live|stay) in ([a-z][\w'-]+)\b"), "location"),
     (re.compile(r"\b[Ii](?:'m| am) from ([A-Z][\w'-]+(?:[ ,][A-Z][\w'-]+){0,2})"), "location"),
     (re.compile(r"\b[Ii](?:'m| am) from ([a-z][\w'-]+)\b"), "location"),
     (re.compile(r"\bi work (?:as an? |at )([\w &'-]{2,40})", re.I), "occupation"),
