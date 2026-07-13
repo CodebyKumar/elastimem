@@ -3,9 +3,12 @@
 Vectors are stored as little-endian float32 BLOBs (``array('f')``) alongside
 their chunk rows — no separate index. At personal-memory scale (thousands of
 chunks, not millions) brute-force cosine in pure Python answers in tens of
-milliseconds; ``benchmarks/bench_recall.py`` keeps that claim honest. When
-``sqlite-vec`` is installed the same BLOBs can be indexed for larger stores,
-but it is never required.
+milliseconds; ``benchmarks/bench_recall.py`` keeps that claim honest. Cosine
+scoring here is unconditional and brute-force — every embedded chunk is
+scanned per query. The ``elastimem[vec]`` extra is reserved for a future
+``sqlite-vec``-backed index for larger stores; it is declared in
+``pyproject.toml`` but not yet wired into this module, so installing it
+today has no effect.
 
 Elastimem never embeds on its own: the host's ``embed_fn`` does the work, the
 governor decides whether it may be called at all, and a failing ``embed_fn``

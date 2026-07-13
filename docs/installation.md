@@ -4,6 +4,12 @@
 
 - Python 3.10, 3.11, 3.12, or 3.13.
 - No required third-party dependencies — the base install is stdlib-only.
+- Linux and macOS are actively supported, including the stdlib (no-`psutil`)
+  hardware-probing fallback. **Windows has no stdlib RAM probe** — without
+  the `system` extra (`psutil`), tier classification on Windows falls back
+  to a fixed 8/4 GiB assumption rather than a real measurement; see
+  [governor.md](governor.md#inputs) for details. Installing `elastimem[system]`
+  is effectively required for correct tier behavior on Windows.
 
 ## Base install
 
@@ -16,8 +22,10 @@ This gives you the full public API (`open`, `remember`, `recall`,
 
 - SQLite storage (stdlib `sqlite3`).
 - FTS5 keyword search when the local SQLite build supports it (most do);
-  falls back to a `LIKE`-based scan otherwise — see
-  [troubleshooting](governor.md) for how to check `mem.stats()["fts_enabled"]`.
+  falls back to a `LIKE`-based scan otherwise — check `mem.stats()["fts_enabled"]`
+  to see which mode is active, and see the
+  [degradation matrix](governor.md#degradation-matrix) for the full fallback
+  chain.
 - Hardware probing via `/proc/meminfo` (Linux) or `vm_stat`/`sysctl` (macOS)
   when `psutil` isn't installed.
 - A built-in semantic embedder that activates automatically once the
@@ -27,7 +35,7 @@ This gives you the full public API (`open`, `remember`, `recall`,
 
 ```bash
 pip install elastimem[system]   # + psutil, richer hardware probing
-pip install elastimem[vec]      # + sqlite-vec, accelerated vector search
+pip install elastimem[vec]      # reserved for a future accelerated vector index — no effect yet
 pip install elastimem[embed]    # + fastembed, activates the built-in embedder
 ```
 
@@ -45,7 +53,7 @@ extra unlocks and what happens when it's absent.
 | Extra | Adds | Without it |
 |---|---|---|
 | `system` | `psutil`-based RAM probing | stdlib-only probing (still works, slightly less precise) |
-| `vec` | `sqlite-vec` accelerated vector search | brute-force cosine similarity in Python (fine at typical scales) |
+| `vec` | nothing yet — reserved for a future `sqlite-vec`-backed index, not wired in | brute-force cosine similarity in Python (fine at typical scales) — this is what runs today regardless of whether `vec` is installed |
 | `embed` | `fastembed`, activates the built-in embedder | FTS5/keyword-only retrieval, unless you supply your own `embedder=` |
 
 ## Bringing your own LLM / embedder

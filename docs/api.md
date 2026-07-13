@@ -32,6 +32,15 @@ One persistent store backed by one SQLite file (`":memory:"` supported).
 - `probe_fn() -> (total_bytes, available_bytes)` — override hardware probe.
 - `on_tier_change(old: Tier, new: Tier)` — governor callback.
 
+**Construction can raise** (e.g. an unwritable `path`, disk full during
+initial schema creation, or an unknown `config_overrides` key →
+`TypeError`) — this is the one exception to the "never raises" invariant
+documented below. Wrap `Elastimem(path, ...)` / `elastimem.open(...)` in
+your own error handling if the store might be opened somewhere failure
+needs to be user-visible (e.g. an unwritable data directory). Once
+construction succeeds, `build_context`, `record_turn`, and `recall` are
+guaranteed not to raise into the host — see the per-method notes below.
+
 ### Attributes (post-construction, read-only in normal use)
 
 - `embed_fn` — the resolved passage-side embedder (host-supplied, the
@@ -47,10 +56,14 @@ One persistent store backed by one SQLite file (`":memory:"` supported).
   `profile`, `tick()`, `report_pressure()`, and `reconfigure()` on `Elastimem`
   itself.
 
-`embed_fn`, `embed_query_fn`, `tokenizer_fn`, `path`, and `session_id` are
-construction-time only: set them via `open()`/`Elastimem(...)` and don't
-reassign after construction (the background worker may hold a reference to
-the original callable).
+`embed_fn`, `embed_query_fn`, `tokenizer_fn`, and `path` are construction-time
+only — set them via `open()`/`Elastimem(...)`; reassigning any of them after
+construction raises `AttributeError` (the background worker reads them
+without synchronization, so silently swapping the callable out from under
+it would race rather than fail loudly). `session_id` is different: it is
+genuine, actively-mutated internal state (a new session begins on the first
+`record_turn()` and again after `end_session()`) — read it if you need it,
+but treat it as informational, not something you set.
 
 ### Per-turn
 
@@ -58,7 +71,7 @@ the original callable).
 | ---------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
 | `tick() -> MemoryProfile`                                                        | cheap hardware re-check; call once per turn                                                                      |
 | `build_context(user_input="") -> ContextPlan`                                    | budgeted prompt sections + window plan; never raises                                                             |
-| `foreground()` (context manager) / `foreground_begin()` / `foreground_end()` | hold background LLM jobs while the host generates                                                                |
+| `foreground()` (context manager) / `foreground_begin()` / `foreground_end()` | hold background LLM jobs while the host generates — prefer the context manager; use explicit begin/end only when generation can't be bracketed in one `with` block (e.g. streaming across separate callbacks) |
 | `record_turn(user_text, assistant_text)`                                         | persist exchange, rule capture, enqueue extraction/embedding; never raises                                       |
 | `report_evictions(turns: list[tuple[str, str]])`                                 | fold host-evicted (user, assistant) pairs into the rolling summary                                               |
 | `report_pressure() -> MemoryProfile`                                             | OOM/decode-failure signal; downgrades one tier on first call, coalesces repeat calls within a 30s cooldown (see [governor.md](governor.md)) |

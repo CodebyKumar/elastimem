@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "elastimem"
-version = "0.1.1"
+version = "0.1.0a1"
 description = "Elastic, resource-adaptive memory framework for local-first AI agents"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -20,6 +20,8 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS :: MacOS X",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Database",
 ]
@@ -28,7 +30,10 @@ dependencies = []
 
 [project.optional-dependencies]
 system = ["psutil>=5.9"]      # richer hardware probing for the Memory Governor
-vec = ["sqlite-vec>=0.1"]     # accelerated vector search (brute-force cosine otherwise)
+# Reserved for a future sqlite-vec-backed vector index; NOT wired into
+# src/elastimem yet — installing this extra currently has no effect.
+# Brute-force cosine (embeddings.py) is used unconditionally today.
+vec = ["sqlite-vec>=0.1"]
 # Elastimem's built-in default embedder (see default_embedder.py) — activates
 # automatically when a host doesn't supply its own embedder=/embed_fn=, so
 # semantic recall works with zero setup. ONNX Runtime, no torch. Purely

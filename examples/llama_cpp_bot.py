@@ -10,11 +10,8 @@ report_evictions, and end_session.
 """
 
 import os
-import sys
 
-sys.path.insert(0, "src")
-
-import elastimem  # noqa: E402
+import elastimem
 
 CHAT_MODEL = os.environ.get("CHAT_MODEL", "models/chat.gguf")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "")   # optional

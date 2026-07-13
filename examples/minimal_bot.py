@@ -8,11 +8,7 @@ Try:  "my name is Sam", restart, "what do you know about me?",
       "recall: <anything you said last run>", "quit".
 """
 
-import sys
-
-sys.path.insert(0, "src")
-
-import elastimem  # noqa: E402
+import elastimem
 
 
 def main() -> None:

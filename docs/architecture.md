@@ -32,7 +32,9 @@ capacity.
   and a 128 GB workstation.
 - **Defined floors.** Every capability degrades to a documented fallback
   rather than failing (see the [degradation matrix](governor.md#degradation-matrix)).
-  `record_turn`, `recall`, and `build_context` never raise into the host.
+  `record_turn`, `recall`, and `build_context` never raise into the host —
+  this guarantee starts *after* construction succeeds; `Elastimem(path, ...)`
+  itself can raise (bad path, unknown config key), see [api.md](api.md).
 - **Never destroy.** Fact updates version; forgetting archives; corrupt
   databases are quarantined and rebuilt. The raw transcript is always kept,
   so future (better) models can re-index the past.

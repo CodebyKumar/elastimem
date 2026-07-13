@@ -10,14 +10,17 @@ Env:       OPENAI_API_KEY (or GROQ_API_KEY etc.), OPENAI_BASE_URL,
 This is the same `llm=` shape as any other example — a plain
 ``(prompt, *, max_tokens, temperature) -> str`` callable — just backed by a
 network call instead of an in-process model.
+
+No `embedder=` is passed below, so Elastimem's built-in embedder
+auto-activates (see docs/governor.md) once the `elastimem[embed]` extra is
+installed — its first use downloads a small model from Hugging Face Hub in
+the background. Pass `disable_builtin_embedder=True` to opt out and stay
+FTS5-only.
 """
 
 import os
-import sys
 
-sys.path.insert(0, "src")
-
-import elastimem  # noqa: E402
+import elastimem
 
 BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.groq.com/openai/v1")
 MODEL = os.environ.get("OPENAI_MODEL", "llama-3.1-8b-instant")

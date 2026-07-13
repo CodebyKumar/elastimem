@@ -67,7 +67,15 @@ def _tier_thresholds_bytes(cfg: ElastimemConfig) -> dict[Tier, tuple[int, int]]:
 # hardware probe
 # --------------------------------------------------------------------------- #
 def probe_ram() -> tuple[int, int]:
-    """Return ``(total_bytes, available_bytes)``, best effort, stdlib-safe."""
+    """Return ``(total_bytes, available_bytes)``, best effort, stdlib-safe.
+
+    Stdlib-only probing is implemented for Linux (``/proc/meminfo``) and
+    macOS (``sysctl``/``vm_stat``). Windows and any other platform have no
+    stdlib probe here and fall through to the "assume a mid-size machine"
+    floor below (8/4 GiB) — install the ``system`` extra (``psutil``) for
+    accurate probing on Windows; without it, tier classification on Windows
+    is a guess, not a measurement.
+    """
     try:
         import psutil  # optional [system] extra
 

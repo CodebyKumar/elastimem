@@ -48,6 +48,9 @@ def _resolve_config(
     return config
 
 
+_IMMUTABLE_AFTER_INIT = frozenset({"embed_fn", "embed_query_fn", "tokenizer_fn", "path"})
+
+
 class Elastimem:
     """One persistent memory store backed by a single SQLite file.
 
@@ -135,6 +138,20 @@ class Elastimem:
             episodic.close_orphan_sessions(conn)
 
         self._worker = Worker(self)
+        self._initialized = True
+
+    def __setattr__(self, name: str, value) -> None:
+        # embed_fn/embed_query_fn/tokenizer_fn/path are read by the
+        # background worker without synchronization (see the module
+        # docstring's thread model) — reassigning them after construction
+        # would race the worker rather than raise, so guard it explicitly
+        # instead of leaving it as a documented-but-unenforced "don't."
+        if getattr(self, "_initialized", False) and name in _IMMUTABLE_AFTER_INIT:
+            raise AttributeError(
+                f"Elastimem.{name} is set at construction and cannot be "
+                f"reassigned — open a new store instead"
+            )
+        super().__setattr__(name, value)
 
     # ------------------------------------------------------------------ #
     # connections
@@ -323,7 +340,14 @@ class Elastimem:
     @contextlib.contextmanager
     def foreground(self):
         """Bracket the host's own LLM generation: while held, the worker
-        will not start background LLM jobs (single-model-instance safety)."""
+        will not start background LLM jobs (single-model-instance safety).
+
+        Prefer this over `foreground_begin()`/`foreground_end()` whenever
+        generation happens inside a single synchronous call — it can't be
+        left unbalanced. The explicit begin/end pair exists only for hosts
+        that can't bracket generation in one `with` block (e.g. streaming
+        token-by-token across separate callback invocations, where "begin"
+        and "end" naturally happen in different stack frames)."""
         self._worker.foreground_begin()
         try:
             yield
@@ -331,6 +355,11 @@ class Elastimem:
             self._worker.foreground_end()
 
     def foreground_begin(self) -> None:
+        """Explicit half of the foreground gate — see `foreground()`'s
+        docstring for when to prefer this over the context manager. Every
+        call must be matched by exactly one `foreground_end()`; unbalanced
+        calls leave the worker permanently blocked (or unblocked when it
+        shouldn't be)."""
         self._worker.foreground_begin()
 
     def foreground_end(self) -> None:

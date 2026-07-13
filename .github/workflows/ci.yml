@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install (base, zero required deps)
+        run: uv sync --python ${{ matrix.python-version }}
+
+      - name: Run test suite (fast, excludes slow/model-download tests)
+        run: uv run pytest
+
+  test-extras:
+    # Separate job: exercises the optional extras (psutil / fastembed),
+    # including the `slow` marker that downloads a real embedding model.
+    # Kept apart from the base matrix so a flaky Hugging Face Hub download
+    # can't block the zero-dependency core from being verified.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          python-version: "3.12"
+
+      - name: Install (all extras)
+        run: uv sync --all-extras
+
+      - name: Run full suite including slow tests
+        run: uv run pytest -m ""

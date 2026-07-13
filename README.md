@@ -13,7 +13,7 @@ small.
 ```
 pip install elastimem            # zero dependencies
 pip install elastimem[system]    # + psutil for richer hardware probing
-pip install elastimem[vec]       # + sqlite-vec for accelerated vector search
+pip install elastimem[embed]     # + fastembed, activates the built-in embedder
 ```
 
 ## Why another memory framework?
@@ -107,7 +107,12 @@ OpenAI-compatible, no-LLM): [docs/integrations.md](docs/integrations.md).
 
 ## Status
 
-Alpha (0.1.0). API may move before 1.0. 
+Pre-release alpha (0.1.0a1). The core API (`open`, `remember`, `recall`,
+`record_turn`, `build_context`, see [docs/api_stability.md](docs/api_stability.md)
+for the exact Stable surface) is expected to stay stable; internal
+implementation details and advanced features may still evolve based on
+feedback from early adopters. See [CHANGELOG.md](CHANGELOG.md) for release
+history.
 
 Built as the memory engine for [Tuffy](https://github.com/CodebyKumar/tuffy)
 

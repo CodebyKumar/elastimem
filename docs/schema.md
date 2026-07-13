@@ -75,5 +75,6 @@ misbehavior is inspectable.
 
 384-dim float32 vector = 1.5 KB/chunk → 10k chunks ≈ 15 MB of vectors.
 Benchmarked recall at 10k chunks (pure Python): FTS5 ~2 ms, hybrid ~43 ms.
-`sqlite-vec`, when installed, can index the same BLOBs for much larger
-stores; it is optional and unused by default.
+The `elastimem[vec]` extra is reserved for a future `sqlite-vec`-backed
+index over the same BLOBs, for much larger stores — it is declared but not
+yet wired into the codebase; brute-force cosine runs unconditionally today.

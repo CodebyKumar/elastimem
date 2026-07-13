@@ -9,7 +9,7 @@ the specification; `governor.py` implements it and `tests/test_governor.py` +
 
 | Input | Source | When |
 |---|---|---|
-| RAM total / available | `psutil` if installed, else `/proc/meminfo` (Linux) or `sysctl` + `vm_stat` (macOS); unknown platforms assume 8/4 GiB | startup + every `tick()` |
+| RAM total / available | `psutil` if installed, else `/proc/meminfo` (Linux) or `sysctl` + `vm_stat` (macOS); **Windows and any other platform have no stdlib probe and assume 8/4 GiB** (a guess, not a measurement) — install the `system` extra (`psutil`) for accurate probing on Windows | startup + every `tick()` |
 | `context_tokens` | `ElastimemConfig` (host passes its model's `n_ctx`) | construction |
 | `static_prompt_tokens` | `ElastimemConfig` (host measures its fixed prompt) | construction |
 | Tier override | `ELASTIMEM_TIER=lite\|standard\|full` or `ElastimemConfig.tier_override` | construction (pins the tier) |
@@ -311,6 +311,14 @@ one, update this list.
    can recover to STANDARD but will never reach FULL for the rest of that
    process's lifetime, even if RAM later becomes genuinely abundant. Only a
    fresh process restart re-measures the ceiling.
+9. **No stdlib RAM probe on Windows.** `probe_ram()`'s fallback path (used
+   when `psutil` isn't installed) only implements Linux (`/proc/meminfo`)
+   and macOS (`sysctl`/`vm_stat`). On Windows — or any other platform — it
+   silently assumes 8 GiB total / 4 GiB available, a guess rather than a
+   measurement, which can misclassify the tier in either direction. Install
+   the `system` extra (`psutil`) for accurate probing on Windows; this is
+   the only platform where that extra is effectively required rather than
+   a precision upgrade.
 
 ## Why this design
 

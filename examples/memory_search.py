@@ -5,11 +5,7 @@ mem.facts(), mem.fact_history() used directly. No LLM, no embedder required
 Run:  python examples/memory_search.py
 """
 
-import sys
-
-sys.path.insert(0, "src")
-
-import elastimem  # noqa: E402
+import elastimem
 
 
 def main() -> None:
