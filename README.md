@@ -126,6 +126,14 @@ history.
 
 Built as the memory engine for [Tuffy](https://github.com/CodebyKumar/tuffy)
 
+## Contributing
+
+Bug reports, feature requests, and PRs are welcome — see
+[CONTRIBUTING.md](CONTRIBUTING.md) for dev setup and what to read before
+touching the governor, retrieval ranking, or the worker's locking (several
+current behaviors replaced an earlier, buggier design — the docs explain
+why). See [CHANGELOG.md](CHANGELOG.md) for release history.
+
 ## License
 
 MIT
