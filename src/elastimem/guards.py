@@ -42,6 +42,30 @@ _SELF_REFERENTIAL_MARKERS = (
     "large language model", "ai assistant",
 )
 
+# Short, common all-consonant (or otherwise vowel-less) English words/
+# abbreviations that must NOT be flagged as gibberish fragments below:
+# ordinary compact keys ("dob", "mfg_date", "hr_contact") use these
+# constantly, and none of them are LLM-hallucination artifacts.
+_VOWELLESS_ALLOWLIST = frozenset({
+    "by", "my", "dry", "fly", "sky", "shy", "try", "why", "cry", "spy",
+    "dob", "ssn", "id", "mfg", "hr", "hq", "vp", "ceo", "cfo", "cto",
+    "st", "dr", "rd", "ave", "blvd", "nth", "mph", "gym", "gps", "tv",
+})
+
+# A key fragment with no vowel at all and long enough that it's very
+# unlikely to be a real word/abbreviation (short ones are allowlisted
+# above) is the strongest single signal of hallucinated LLM-extraction
+# output rather than a human-chosen key: real snake_case keys are written
+# by either the user's own wording or an extraction prompt explicitly
+# asked for "short snake_case labels" from real vocabulary, and virtually
+# never land on a 4+ letter, vowel-free fragment by chance. Observed in
+# practice: a Q4 quantized 2B model produced the key "ol_taht_you_have"
+# ("taht" - scrambled "that", vowel-free is incidental here but paired
+# with the anagram check below it's a strong combined signal).
+_VOWELLESS_MIN_LEN = 4
+
+_VOWELS = frozenset("aeiou")
+
 
 def normalize_key(key: str) -> str:
     """Lowercase snake_case, stripped of anything but [a-z0-9_]."""
@@ -54,6 +78,23 @@ def is_placeholder(value: str) -> bool:
 
 def is_transcript_key(normalized_key: str) -> bool:
     return any(part in _TRANSCRIPT_KEY_MARKERS for part in normalized_key.split("_"))
+
+
+def is_gibberish_key(normalized_key: str) -> bool:
+    """True when a key fragment looks like scrambled/hallucinated output
+    rather than a real word a human or a well-behaved extraction prompt
+    would produce - a long, vowel-free, non-allowlisted fragment. Narrow
+    and conservative on purpose: false negatives (a genuinely garbled key
+    that happens to contain a vowel) are fine, since this only needs to
+    catch the pattern actually observed in practice, not every possible
+    hallucination shape. Numeric-only fragments (ids, years, counts) are
+    never flagged - digits carry no "is this a real word" signal at all."""
+    for part in normalized_key.split("_"):
+        if not part or part in _VOWELLESS_ALLOWLIST or part.isdigit():
+            continue
+        if len(part) >= _VOWELLESS_MIN_LEN and not any(c in _VOWELS for c in part):
+            return True
+    return False
 
 
 def is_reserved_key(normalized_key: str, reserved: frozenset[str]) -> bool:
@@ -91,6 +132,8 @@ def validate_fact(
         return None, "reserved key (owned by the host application)"
     if source in ("auto", "rule") and is_transcript_key(normalized):
         return None, "transcript-shaped key, not a fact"
+    if source == "auto" and is_gibberish_key(normalized):
+        return None, "gibberish key, likely hallucinated extraction output"
     if is_self_referential_value(value, self_ref_markers):
         return None, "self-referential value (describes the agent, not the user)"
     if is_placeholder(value):
