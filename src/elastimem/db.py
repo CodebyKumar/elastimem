@@ -19,7 +19,7 @@ import time
 
 log = logging.getLogger("elastimem")
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _PRAGMAS = (
     "PRAGMA journal_mode=WAL",
@@ -117,7 +117,9 @@ CREATE TABLE IF NOT EXISTS graph_nodes (
   updated_at      TEXT NOT NULL,
   importance      REAL NOT NULL DEFAULT 0.5,
   confidence      REAL NOT NULL DEFAULT 0.5,
-  mention_count   INTEGER NOT NULL DEFAULT 1
+  mention_count   INTEGER NOT NULL DEFAULT 1,
+  cluster_id      INTEGER,
+  cluster_label   TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_graph_nodes_canonical
   ON graph_nodes(type, canonical_name);
@@ -140,6 +142,18 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_graph_edges_dedup
 CREATE INDEX IF NOT EXISTS idx_graph_edges_source ON graph_edges(source_node);
 CREATE INDEX IF NOT EXISTS idx_graph_edges_target ON graph_edges(target_node);
 """
+
+# Applied separately from _GRAPH_SCHEMA (not folded into the CREATE TABLE
+# block above): the cluster_id/cluster_label columns are new as of v3, so
+# this index can only be created after a v2 store's ALTER TABLE has run
+# (see _migrate's `current < 3` step). A fresh store gets both the columns
+# (baked into _GRAPH_SCHEMA's CREATE TABLE) and this index applied here,
+# in open_store(), right after _GRAPH_SCHEMA - safe either way since
+# CREATE INDEX IF NOT EXISTS is idempotent and the column always exists by
+# this point on a fresh store.
+_GRAPH_CLUSTER_INDEX = (
+    "CREATE INDEX IF NOT EXISTS idx_graph_nodes_cluster ON graph_nodes(cluster_id)"
+)
 
 _FTS_SCHEMA = """
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
@@ -218,6 +232,11 @@ def open_store(path: str) -> tuple[sqlite3.Connection, bool]:
         if fts:
             conn.executescript(_FTS_SCHEMA)
         _migrate(conn)
+        # Only safe to run after _migrate(): on a store upgrading from v2,
+        # cluster_id doesn't exist as a column until _migrate's `current <
+        # 3` step adds it. On a fresh store the column already exists (see
+        # _GRAPH_SCHEMA above), so this is a harmless no-op there.
+        conn.execute(_GRAPH_CLUSTER_INDEX)
     return conn, fts
 
 
@@ -239,6 +258,19 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if current < 2:
         conn.executescript(_GRAPH_SCHEMA)
         current = 2
+    if current < 3:
+        # cluster_id/cluster_label are new columns on an existing table for
+        # any v2 store — CREATE TABLE IF NOT EXISTS (already applied above/
+        # unconditionally in open_store) is a no-op here, unlike the v1->v2
+        # step where graph_nodes didn't exist at all yet.
+        existing_cols = {
+            r["name"] for r in conn.execute("PRAGMA table_info(graph_nodes)")
+        }
+        if "cluster_id" not in existing_cols:
+            conn.execute("ALTER TABLE graph_nodes ADD COLUMN cluster_id INTEGER")
+        if "cluster_label" not in existing_cols:
+            conn.execute("ALTER TABLE graph_nodes ADD COLUMN cluster_label TEXT")
+        current = 3
     if current != int(row["value"]):
         conn.execute(
             "UPDATE meta SET value=? WHERE key='schema_version'", (str(current),)

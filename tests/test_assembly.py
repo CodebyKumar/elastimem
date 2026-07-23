@@ -92,6 +92,81 @@ def test_short_meaningful_query_still_triggers_retrieval(tmp_path):
     s.close()
 
 
+def test_graph_context_section_populated_on_full_tier(tmp_path):
+    from elastimem import graph
+
+    s = make_store(tmp_path, tier_override=Tier.FULL)
+    conn = s._conn
+    j = graph.upsert_node(conn, "thing", "Jetson", confidence=1.0)
+    t = graph.upsert_node(conn, "thing", "Tuffy", confidence=1.0)
+    graph.upsert_edge(conn, t, j, "runs_on", confidence=1.0)
+    graph.store_clusters(conn, graph.compute_clusters(conn))
+    conn.execute("UPDATE graph_nodes SET cluster_label='Local AI' WHERE cluster_id IS NOT NULL")
+
+    plan = s.build_context("tell me about my Jetson")
+    graph_text = plan.sections[assembly.SECTION_GRAPH_CONTEXT]
+    assert "Local AI" in graph_text
+    assert "jetson" in graph_text and "tuffy" in graph_text
+    assert "RELATED TOPICS" in plan.render()
+    s.close()
+
+
+def test_graph_context_section_empty_at_lite_tier(tmp_path):
+    from elastimem import graph
+
+    s = make_store(tmp_path, avail_gib=1.0)
+    assert s.profile.tier is Tier.LITE
+    conn = s._conn
+    j = graph.upsert_node(conn, "thing", "Jetson")
+    t = graph.upsert_node(conn, "thing", "Tuffy")
+    graph.upsert_edge(conn, t, j, "runs_on")
+
+    plan = s.build_context("tell me about my Jetson")
+    assert plan.sections[assembly.SECTION_GRAPH_CONTEXT] == ""
+    s.close()
+
+
+def test_graph_context_section_empty_when_no_seed_matches(tmp_path):
+    from elastimem import graph
+
+    s = make_store(tmp_path, tier_override=Tier.FULL)
+    graph.upsert_node(s._conn, "thing", "Jetson")
+
+    plan = s.build_context("totally unrelated query about nothing stored")
+    assert plan.sections[assembly.SECTION_GRAPH_CONTEXT] == ""
+    s.close()
+
+
+def test_graph_context_section_unclustered_entities_still_shown(tmp_path):
+    """An entity with no cluster (below min_size, or clustering never ran)
+    still surfaces in graph context, just without a topic label."""
+    from elastimem import graph
+
+    s = make_store(tmp_path, tier_override=Tier.FULL)
+    graph.upsert_node(s._conn, "thing", "Jetson", confidence=1.0)
+
+    plan = s.build_context("tell me about my Jetson")
+    graph_text = plan.sections[assembly.SECTION_GRAPH_CONTEXT]
+    assert "jetson" in graph_text
+    s.close()
+
+
+def test_build_context_never_raises_when_graph_leg_fails(tmp_path, monkeypatch):
+    from elastimem import graph
+
+    s = make_store(tmp_path, tier_override=Tier.FULL)
+    graph.upsert_node(s._conn, "thing", "Jetson")
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("simulated failure")
+
+    monkeypatch.setattr(graph, "detect_seed_nodes", _boom)
+    plan = s.build_context("tell me about my Jetson")
+    assert plan.sections[assembly.SECTION_GRAPH_CONTEXT] == ""
+    assert plan.profile is not None
+    s.close()
+
+
 def test_custom_tokenizer_is_used(tmp_path):
     calls = []
 

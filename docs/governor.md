@@ -283,6 +283,44 @@ at LITE) — no new job kind, no new scheduling.
   edges are repointed to the older node and the newer node is deleted.
   This is the one piece of graph maintenance that costs an LLM call, so it
   never runs at STANDARD/LITE.
+- **Semantic clustering** (`graph.compute_clusters`/`store_clusters`, runs
+  whenever consolidation runs, any tier above OFF — always runs, unlike
+  duplicate merging, since it costs no LLM call): groups entities into
+  topics via **connected components** over `graph_edges` — no clustering
+  library, same union-find approach any graph toolkit uses internally
+  under the hood. A cluster is simply "all entities reachable from each
+  other," with no distance/similarity threshold, since a graph edge is the
+  only relationship signal available. Runs after decay/dedup, not before,
+  so stale or duplicate nodes don't fragment or pollute a topic group.
+  Singleton components (an entity with no surviving edges) aren't
+  considered a topic and get no `cluster_id`. **Labeling**
+  (`graph.label_clusters`, FULL tier only, same `llm_merge` gate) asks the
+  LLM for a short topic name (e.g. "Local AI") per unlabeled cluster, one
+  completion per *new* cluster — already-labeled clusters are skipped on
+  later sweeps. An unlabeled cluster is still a fully usable retrieval
+  grouping; the label is presentation sugar, not a requirement.
+
+```python
+for cluster in mem.clusters():   # largest first
+    print(cluster["label"] or "(unlabeled)", cluster["members"])
+```
+
+### Graph context in `build_context()`
+
+`build_context()`'s existing sections (facts, episodic, sessions, lessons)
+gained one more: `RELATED TOPICS`, populated from the same query-time
+graph traversal `recall()`'s graph leg already computes — entities
+reachable from the query, grouped by cluster label where one exists. This
+is **additive only**: the change adds a new `ContextPlan.sections` key
+without touching the existing four, their order, or their behavior, and
+without adding a new top-level `Budgets` field (which would touch the
+Stable `memory_split` contract). Its budget is instead a fixed share
+(`assembly.GRAPH_CONTEXT_SHARE`, 25%) carved out of the existing episodic
+budget — which means it inherits episodic's tier gating for free: since
+`budgets.episodic` is already 0 at LITE tier (the same tier `graph_hops`
+is 0), graph context is correctly empty there with no separate gate
+needed. Never raises; degrades to an empty section like every other piece
+of retrieval.
 
 ### `explain(query, k=5) -> ExplainResult`
 

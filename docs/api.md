@@ -88,6 +88,7 @@ but treat it as informational, not something you set.
 | `forget(key) -> bool`                                          | tombstone the current version              |
 | `recall(query, k=5) -> list[Hit]`                              | search chunks + facts; never raises        |
 | `explain(query, k=5) -> ExplainResult` *(Experimental)*        | same ranking as `recall`, plus every per-leg score (FTS/vector/graph/importance/recency) and the graph traversal path — see [governor.md](governor.md#knowledge-graph); never raises |
+| `clusters() -> list[dict]` *(Experimental)*                    | current knowledge-graph topic clusters (connected components over `graph_edges`, optionally LLM-labeled), largest first; see [governor.md](governor.md#graph-maintenance-decay-dedup-llm-assisted-merging); never raises |
 | `add_lesson(text, tag=None)` / `lessons(n=None)`             | procedural memory                          |
 
 ### Sessions
@@ -112,12 +113,15 @@ but treat it as informational, not something you set.
 ## Value types
 
 - **`ContextPlan`** — `sections: dict[str, str]` (keys: `user_facts`,
-  `relevant_past_moments`, `previous_sessions`, `lessons`),
+  `graph_context`, `relevant_past_moments`, `previous_sessions`, `lessons`
+  — `graph_context` is Experimental, budgeted from a share of the episodic
+  budget rather than its own `Budgets` field, see
+  [governor.md](governor.md#graph-context-in-build_context)),
   `rolling_summary: str | None`, `keep_last_n_turns: int`,
   `profile: MemoryProfile`, `render() -> str`.
 - **`MemoryProfile`** — `tier`, `budgets` (`working/facts/episodic/sessions/ lessons`, tokens), `embeddings_enabled`, `llm_extraction_enabled`,
   `extraction_cadence`, `rolling_summary_enabled`, `consolidation_level`,
-  `episodic_top_k`. Note: `embeddings_enabled` reflects the GOVERNOR's
+  `episodic_top_k`, `graph_hops`. Note: `embeddings_enabled` reflects the GOVERNOR's
   tier-based permission only (`False` at LITE, `True` otherwise) — it does
   NOT mean an embedder is actually configured and working. Check
   `store.embed_fn is not None` separately if you need to know whether

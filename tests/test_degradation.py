@@ -159,7 +159,7 @@ def test_no_llm_no_embedder_graph_absent_still_functional(tmp_path):
     s.close()
 
 
-def test_migration_v1_to_v2_adds_graph_tables(tmp_path):
+def test_migration_v1_to_latest_adds_graph_tables(tmp_path):
     import sqlite3
     from elastimem import db as db_mod
 
@@ -175,13 +175,64 @@ def test_migration_v1_to_v2_adds_graph_tables(tmp_path):
     version = conn2.execute(
         "SELECT value FROM meta WHERE key='schema_version'"
     ).fetchone()["value"]
-    assert version == "2"
+    assert version == str(db_mod.SCHEMA_VERSION)
     tables = {
         r["name"] for r in conn2.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"
         )
     }
     assert {"graph_nodes", "graph_edges"} <= tables
+    cols = {r["name"] for r in conn2.execute("PRAGMA table_info(graph_nodes)")}
+    assert {"cluster_id", "cluster_label"} <= cols
+    conn2.close()
+
+
+def test_migration_v2_to_v3_adds_cluster_columns(tmp_path):
+    """A v2 store (graph_nodes exists, but predates cluster_id/cluster_label)
+    must gain the new columns via ALTER TABLE, with existing data intact —
+    unlike the v1->v2 step, CREATE TABLE IF NOT EXISTS is a no-op here
+    since the table already exists."""
+    import sqlite3
+    from elastimem import db as db_mod
+
+    path = str(tmp_path / "v2.db")
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(db_mod._SCHEMA)
+    conn.executescript("""
+        CREATE TABLE graph_nodes (
+          id INTEGER PRIMARY KEY, type TEXT NOT NULL DEFAULT 'entity',
+          canonical_name TEXT NOT NULL, aliases TEXT NOT NULL DEFAULT '[]',
+          created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+          importance REAL NOT NULL DEFAULT 0.5, confidence REAL NOT NULL DEFAULT 0.5,
+          mention_count INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE UNIQUE INDEX idx_graph_nodes_canonical ON graph_nodes(type, canonical_name);
+        CREATE TABLE graph_edges (
+          id INTEGER PRIMARY KEY, source_node INTEGER NOT NULL REFERENCES graph_nodes(id),
+          target_node INTEGER NOT NULL REFERENCES graph_nodes(id), relationship TEXT NOT NULL,
+          confidence REAL NOT NULL DEFAULT 0.5, importance REAL NOT NULL DEFAULT 0.5,
+          weight REAL NOT NULL DEFAULT 1.0, created_at TEXT NOT NULL, last_seen TEXT NOT NULL,
+          seen_count INTEGER NOT NULL DEFAULT 1, source_chunk_id INTEGER
+        );
+    """)
+    conn.execute(
+        "INSERT INTO graph_nodes(type, canonical_name, created_at, updated_at)"
+        " VALUES ('thing', 'jetson', '2020-01-01', '2020-01-01')"
+    )
+    conn.execute("INSERT INTO meta(key, value) VALUES ('schema_version', '2')")
+    conn.commit()
+    conn.close()
+
+    conn2, _ = db_mod.open_store(path)
+    version = conn2.execute(
+        "SELECT value FROM meta WHERE key='schema_version'"
+    ).fetchone()["value"]
+    assert version == str(db_mod.SCHEMA_VERSION)
+    cols = {r["name"] for r in conn2.execute("PRAGMA table_info(graph_nodes)")}
+    assert {"cluster_id", "cluster_label"} <= cols
+    row = conn2.execute("SELECT canonical_name FROM graph_nodes").fetchone()
+    assert row["canonical_name"] == "jetson"  # pre-existing data survives
     conn2.close()
 
 

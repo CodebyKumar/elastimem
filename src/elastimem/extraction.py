@@ -232,6 +232,16 @@ def consolidate(
                 conn, complete_fn,
                 review_window_days=config.graph_merge_review_window_days,
             )
+
+        # Recompute clusters on the now-settled graph (after decay/merge,
+        # not before, so stale/duplicate nodes don't fragment or pollute a
+        # topic group). Labeling is a separate, LLM-gated step - a cluster
+        # is still a useful retrieval grouping unlabeled.
+        clusters = graph_mod.compute_clusters(conn)
+        graph_mod.store_clusters(conn, clusters)
+        stats["clusters"] = len(clusters)
+        if llm_merge and complete_fn is not None:
+            stats["clusters_labeled"] = graph_mod.label_clusters(conn, complete_fn)
     except Exception:
         log.exception("elastimem: graph maintenance sweep failed")
 

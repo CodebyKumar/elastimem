@@ -354,3 +354,172 @@ def test_merge_duplicates_llm_failure_never_raises(store):
     merged = graph.merge_duplicates(conn, broken_llm, review_window_days=30.0)
     assert merged == 0
     assert _count(conn, "graph_nodes") == 2
+
+
+# --------------------------------------------------------------------------- #
+# semantic clusters
+# --------------------------------------------------------------------------- #
+def _chain4(conn):
+    """Jetson - Tuffy - Whisper - CUDA, all one connected component."""
+    j = graph.upsert_node(conn, "thing", "Jetson")
+    t = graph.upsert_node(conn, "thing", "Tuffy")
+    w = graph.upsert_node(conn, "thing", "Whisper")
+    c = graph.upsert_node(conn, "thing", "CUDA")
+    graph.upsert_edge(conn, t, j, "runs_on")
+    graph.upsert_edge(conn, j, c, "supports")
+    graph.upsert_edge(conn, t, w, "uses")
+    return j, t, w, c
+
+
+def test_compute_clusters_groups_connected_entities(store):
+    conn = store._conn
+    j, t, w, c = _chain4(conn)
+    clusters = graph.compute_clusters(conn)
+    assert len(clusters) == 1
+    members = next(iter(clusters.values()))
+    assert set(members) == {j, t, w, c}
+
+
+def test_compute_clusters_excludes_singletons(store):
+    conn = store._conn
+    _chain4(conn)
+    graph.upsert_node(conn, "org", "Unrelated Corp")   # no edges at all
+    clusters = graph.compute_clusters(conn)
+    all_members = {m for members in clusters.values() for m in members}
+    unrelated_id = store._conn.execute(
+        "SELECT id FROM graph_nodes WHERE canonical_name='unrelated corp'"
+    ).fetchone()["id"]
+    assert unrelated_id not in all_members
+
+
+def test_compute_clusters_separates_disjoint_components(store):
+    conn = store._conn
+    a = graph.upsert_node(conn, "thing", "A")
+    b = graph.upsert_node(conn, "thing", "B")
+    graph.upsert_edge(conn, a, b, "rel")
+    c = graph.upsert_node(conn, "thing", "C")
+    d = graph.upsert_node(conn, "thing", "D")
+    graph.upsert_edge(conn, c, d, "rel")
+
+    clusters = graph.compute_clusters(conn)
+    assert len(clusters) == 2
+    member_sets = [set(m) for m in clusters.values()]
+    assert {a, b} in member_sets
+    assert {c, d} in member_sets
+
+
+def test_compute_clusters_empty_graph_returns_empty(store):
+    assert graph.compute_clusters(store._conn) == {}
+
+
+def test_store_clusters_stamps_cluster_id(store):
+    conn = store._conn
+    j, t, w, c = _chain4(conn)
+    clusters = graph.compute_clusters(conn)
+    graph.store_clusters(conn, clusters)
+    rows = conn.execute("SELECT id, cluster_id FROM graph_nodes").fetchall()
+    cluster_ids = {row["cluster_id"] for row in rows if row["id"] in (j, t, w, c)}
+    assert len(cluster_ids) == 1 and None not in cluster_ids
+
+
+def test_store_clusters_clears_stale_membership(store):
+    conn = store._conn
+    j, t, w, c = _chain4(conn)
+    graph.store_clusters(conn, graph.compute_clusters(conn))
+
+    # Now the graph changes: delete the edges so nothing is connected.
+    conn.execute("DELETE FROM graph_edges")
+    graph.store_clusters(conn, graph.compute_clusters(conn))
+
+    rows = conn.execute("SELECT cluster_id FROM graph_nodes").fetchall()
+    assert all(row["cluster_id"] is None for row in rows)
+
+
+def test_label_clusters_assigns_llm_label(store):
+    conn = store._conn
+    _chain4(conn)
+    graph.store_clusters(conn, graph.compute_clusters(conn))
+
+    def llm(prompt, *, max_tokens, temperature):
+        return "Local AI"
+
+    labeled = graph.label_clusters(conn, llm)
+    assert labeled == 1
+    row = conn.execute(
+        "SELECT DISTINCT cluster_label FROM graph_nodes WHERE cluster_id IS NOT NULL"
+    ).fetchone()
+    assert row["cluster_label"] == "Local AI"
+
+
+def test_label_clusters_skips_already_labeled(store):
+    conn = store._conn
+    _chain4(conn)
+    graph.store_clusters(conn, graph.compute_clusters(conn))
+
+    calls = []
+
+    def llm(prompt, *, max_tokens, temperature):
+        calls.append(prompt)
+        return "Local AI"
+
+    graph.label_clusters(conn, llm)
+    graph.label_clusters(conn, llm)   # second sweep: nothing left to label
+    assert len(calls) == 1
+
+
+def test_label_clusters_llm_failure_never_raises(store):
+    conn = store._conn
+    _chain4(conn)
+    graph.store_clusters(conn, graph.compute_clusters(conn))
+
+    def broken_llm(prompt, *, max_tokens, temperature):
+        raise RuntimeError("simulated failure")
+
+    labeled = graph.label_clusters(conn, broken_llm)
+    assert labeled == 0
+
+
+def test_label_clusters_rejects_overlong_label(store):
+    conn = store._conn
+    _chain4(conn)
+    graph.store_clusters(conn, graph.compute_clusters(conn))
+
+    def llm(prompt, *, max_tokens, temperature):
+        return "x" * 200
+
+    labeled = graph.label_clusters(conn, llm)
+    assert labeled == 0
+
+
+def test_list_clusters_returns_members_and_label(store):
+    conn = store._conn
+    _chain4(conn)
+    graph.store_clusters(conn, graph.compute_clusters(conn))
+
+    def llm(prompt, *, max_tokens, temperature):
+        return "Local AI"
+
+    graph.label_clusters(conn, llm)
+    clusters = graph.list_clusters(conn)
+    assert len(clusters) == 1
+    assert clusters[0]["label"] == "Local AI"
+    assert set(clusters[0]["members"]) == {"jetson", "tuffy", "whisper", "cuda"}
+
+
+def test_list_clusters_empty_graph_returns_empty(store):
+    assert graph.list_clusters(store._conn) == []
+
+
+def test_elastimem_clusters_end_to_end(store):
+    """Elastimem.clusters() through the public API, no direct graph.py use."""
+    conn = store._conn
+    _chain4(conn)
+    graph.store_clusters(conn, graph.compute_clusters(conn))
+    result = store.clusters()
+    assert len(result) == 1
+    assert set(result[0]["members"]) == {"jetson", "tuffy", "whisper", "cuda"}
+    assert result[0]["label"] is None  # no LLM involved in this test
+
+
+def test_elastimem_clusters_empty_store_never_raises(store):
+    assert store.clusters() == []

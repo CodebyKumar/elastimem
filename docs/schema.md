@@ -84,6 +84,8 @@ pipeline, not a separate store.
 | `aliases` | JSON array of raw surface forms seen, capped at 8 |
 | `importance`, `confidence` | `confidence` is a running average across re-extractions, used to weight the graph retrieval nudge |
 | `mention_count` | bumped on every re-extraction of the same entity |
+| `cluster_id` | nullable; the root node id of this entity's connected component (see `graph.compute_clusters`), NULL for a singleton with no edges |
+| `cluster_label` | nullable; a short LLM-generated topic name for the cluster (e.g. "Local AI"), set separately from clustering itself — see `graph.label_clusters` |
 
 Unique index `(type, canonical_name)` — write-time dedup; repeated
 mentions update the existing row (`ON CONFLICT DO UPDATE`) instead of
@@ -101,7 +103,7 @@ LLM-confirmed duplicate entities — see
 | `relationship` | short snake_case label, e.g. `works_at`, `builds`, `runs_on` |
 | `confidence`, `importance`, `weight` | `confidence` is a running average, same pattern as nodes |
 | `seen_count`, `last_seen` | bumped on repeated extraction of the same relationship |
-| `source_chunk_id → chunks` | nullable; the chunk that produced this edge (reserved for a future `explain()` API, unused by Phase 1 retrieval logic) |
+| `source_chunk_id → chunks` | nullable; the chunk that produced this edge (not currently surfaced by `explain()`, which computes its traversal fresh rather than reading provenance off individual edges — kept for a future direct-provenance lookup) |
 
 Unique index `(source_node, target_node, relationship)` — write-time
 dedup, same pattern as nodes. Rows beyond `graph_edge_cap` (default 5000)

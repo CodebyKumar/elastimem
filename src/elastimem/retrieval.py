@@ -616,6 +616,63 @@ def episodic_section(
     return "\n".join(fit_lines(lines, profile.budgets.episodic, tokenizer_fn))
 
 
+def graph_context_section(
+    store: "Elastimem",
+    query: str,
+    profile: MemoryProfile,
+    tokenizer_fn=None,
+) -> str:
+    """The RELATED TOPICS block: entities the query connects to via the
+    knowledge graph, grouped by cluster label where one exists (proposal's
+    Context Planner §16 "Graph Context" stage) — additive to the existing
+    section set, not a restructuring of build_context()'s assembly order.
+    Empty at LITE tier (``graph_hops == 0``) or when nothing resolves; never
+    raises. Budgeted from a fixed share of the episodic budget (see
+    ``assembly.GRAPH_CONTEXT_SHARE``) rather than a new top-level budget
+    field, so it inherits episodic's existing tier gating for free.
+    """
+    from .assembly import GRAPH_CONTEXT_SHARE
+
+    if profile.graph_hops <= 0:
+        return ""
+    try:
+        from . import graph as graph_mod
+
+        conn = store._conn
+        seeds = graph_mod.detect_seed_nodes(conn, query)
+        if not seeds:
+            return ""
+        expanded_ids = graph_mod.expand(conn, [s[0] for s in seeds], profile.graph_hops)
+        rows = conn.execute(
+            f"SELECT canonical_name, cluster_label FROM graph_nodes"
+            f" WHERE id IN ({','.join('?' * len(expanded_ids))})",
+            expanded_ids,
+        ).fetchall() if expanded_ids else []
+        if not rows:
+            return ""
+
+        clustered: dict[str, list[str]] = {}
+        unclustered: list[str] = []
+        for row in rows:
+            if row["cluster_label"]:
+                clustered.setdefault(row["cluster_label"], []).append(row["canonical_name"])
+            else:
+                unclustered.append(row["canonical_name"])
+
+        lines = [
+            f"- {label}: {', '.join(sorted(set(names)))}"
+            for label, names in sorted(clustered.items())
+        ]
+        if unclustered:
+            lines.append(f"- {', '.join(sorted(set(unclustered)))}")
+
+        budget = int(profile.budgets.episodic * GRAPH_CONTEXT_SHARE)
+        return "\n".join(fit_lines(lines, budget, tokenizer_fn))
+    except Exception:
+        log.exception("elastimem: graph context section failed")
+        return ""
+
+
 def _condense(chunk_text: str, limit: int = 240) -> str:
     one_line = " ".join(chunk_text.split())
     return one_line[:limit] + ("…" if len(one_line) > limit else "")

@@ -482,3 +482,161 @@ def merge_duplicates(
             except sqlite3.Error:
                 log.exception("elastimem: graph duplicate-merge apply failed")
     return merged
+
+
+# --------------------------------------------------------------------------- #
+# semantic clusters: topic discovery via connected components
+# --------------------------------------------------------------------------- #
+_CLUSTER_LABEL_PROMPT = (
+    "These are labels for related entities that came up in conversation. "
+    "Reply with ONLY a short (1-4 word) topic name covering all of them, "
+    "e.g. \"Local AI\" or \"Home Renovation\". No punctuation, no explanation."
+)
+
+
+def _find(parent: dict[int, int], x: int) -> int:
+    while parent[x] != x:
+        parent[x] = parent[parent[x]]   # path halving
+        x = parent[x]
+    return x
+
+
+def _union(parent: dict[int, int], a: int, b: int) -> None:
+    ra, rb = _find(parent, a), _find(parent, b)
+    if ra != rb:
+        parent[ra] = rb
+
+
+def compute_clusters(conn: sqlite3.Connection, *, min_size: int = 2) -> dict[int, list[int]]:
+    """Group entities into topics via connected components over
+    graph_edges — no clustering library, same union-find approach any
+    graph toolkit uses internally. A cluster is "all entities reachable
+    from each other," full stop; no distance/similarity threshold since
+    edges themselves are the only relationship signal available.
+
+    Returns ``{root_node_id: [member_node_id, ...]}`` for components with
+    at least ``min_size`` members — singletons (a node with no edges, or
+    only edges to nodes that were themselves filtered) aren't a "topic,"
+    just an isolated fact, so they're excluded by default. Never raises;
+    returns ``{}`` on any failure or an edgeless graph.
+    """
+    try:
+        node_ids = [r["id"] for r in conn.execute("SELECT id FROM graph_nodes")]
+        if not node_ids:
+            return {}
+        parent = {nid: nid for nid in node_ids}
+        for row in conn.execute("SELECT source_node, target_node FROM graph_edges"):
+            if row["source_node"] in parent and row["target_node"] in parent:
+                _union(parent, row["source_node"], row["target_node"])
+
+        components: dict[int, list[int]] = {}
+        for nid in node_ids:
+            root = _find(parent, nid)
+            components.setdefault(root, []).append(nid)
+        return {root: members for root, members in components.items()
+                if len(members) >= min_size}
+    except sqlite3.Error:
+        log.exception("elastimem: cluster computation failed")
+        return {}
+
+
+def store_clusters(conn: sqlite3.Connection, clusters: dict[int, list[int]]) -> None:
+    """Stamp ``cluster_id`` (the component's root node id — stable across
+    sweeps as long as the component doesn't split/merge) onto every
+    clustered node, and clear it from nodes no longer in any cluster.
+    ``cluster_label`` is left untouched here — see :func:`label_clusters`,
+    a separate step so unlabeled clustering never blocks on an LLM call.
+    Never raises.
+    """
+    try:
+        with conn:
+            clustered_ids = {nid for members in clusters.values() for nid in members}
+            conn.execute(
+                "UPDATE graph_nodes SET cluster_id=NULL, cluster_label=NULL"
+                " WHERE cluster_id IS NOT NULL"
+                + (" AND id NOT IN ({})".format(",".join("?" * len(clustered_ids)))
+                   if clustered_ids else ""),
+                list(clustered_ids),
+            )
+            for root, members in clusters.items():
+                placeholders = ",".join("?" * len(members))
+                conn.execute(
+                    f"UPDATE graph_nodes SET cluster_id=? WHERE id IN ({placeholders})",
+                    [root, *members],
+                )
+    except sqlite3.Error:
+        log.exception("elastimem: storing clusters failed")
+
+
+def label_clusters(
+    conn: sqlite3.Connection, complete_fn: CompleteFn, *, max_tokens: int = 16
+) -> int:
+    """FULL-tier-only: ask the LLM for a short topic name for each
+    unlabeled cluster (``cluster_label IS NULL``), one completion per
+    cluster. Costs an LLM call per new cluster, so — like
+    :func:`merge_duplicates` — this is a separate, tier-gated step from
+    :func:`store_clusters`, not folded into it. A cluster works fine as a
+    retrieval grouping with no label at all; the label is presentation
+    sugar for a host that wants to show "Local AI" instead of a bare list
+    of entity names. Returns the number of clusters labeled. Never raises;
+    a failed/malformed response leaves that cluster unlabeled rather than
+    stamping a bad label.
+    """
+    labeled = 0
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT cluster_id FROM graph_nodes"
+            " WHERE cluster_id IS NOT NULL AND cluster_label IS NULL"
+        ).fetchall()
+    except sqlite3.Error:
+        log.exception("elastimem: cluster label candidate scan failed")
+        return 0
+
+    for row in rows:
+        cluster_id = row["cluster_id"]
+        try:
+            members = conn.execute(
+                "SELECT canonical_name FROM graph_nodes WHERE cluster_id=? LIMIT 12",
+                (cluster_id,),
+            ).fetchall()
+            names = ", ".join(m["canonical_name"] for m in members)
+            label = complete_fn(
+                f"{_CLUSTER_LABEL_PROMPT}\n\nEntities: {names}",
+                max_tokens=max_tokens, temperature=0.0,
+            ) or ""
+            label = label.strip().strip('"').strip("'")
+            if not label or len(label) > 60:
+                continue
+            with conn:
+                conn.execute(
+                    "UPDATE graph_nodes SET cluster_label=? WHERE cluster_id=?",
+                    (label, cluster_id),
+                )
+            labeled += 1
+        except Exception:
+            log.exception("elastimem: cluster labeling failed for cluster %s", cluster_id)
+    return labeled
+
+
+def list_clusters(conn: sqlite3.Connection) -> list[dict]:
+    """Read-only view of all current clusters: ``[{"cluster_id": int,
+    "label": str | None, "members": [canonical_name, ...]}, ...]``, largest
+    first. Never raises."""
+    try:
+        rows = conn.execute(
+            "SELECT cluster_id, cluster_label, canonical_name FROM graph_nodes"
+            " WHERE cluster_id IS NOT NULL ORDER BY cluster_id"
+        ).fetchall()
+    except sqlite3.Error:
+        log.exception("elastimem: cluster listing failed")
+        return []
+    grouped: dict[int, dict] = {}
+    for row in rows:
+        entry = grouped.setdefault(
+            row["cluster_id"],
+            {"cluster_id": row["cluster_id"], "label": row["cluster_label"], "members": []},
+        )
+        entry["members"].append(row["canonical_name"])
+        if row["cluster_label"]:
+            entry["label"] = row["cluster_label"]
+    return sorted(grouped.values(), key=lambda c: -len(c["members"]))

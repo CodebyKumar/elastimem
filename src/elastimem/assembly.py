@@ -22,16 +22,27 @@ TokenizerFn = Callable[[str], int]
 
 # Section keys, in canonical injection order.
 SECTION_FACTS = "user_facts"
+SECTION_GRAPH_CONTEXT = "graph_context"
 SECTION_EPISODIC = "relevant_past_moments"
 SECTION_SESSIONS = "previous_sessions"
 SECTION_LESSONS = "lessons"
 
 _SECTION_TITLES = {
     SECTION_FACTS: "WHAT YOU KNOW ABOUT THE USER",
+    SECTION_GRAPH_CONTEXT: "RELATED TOPICS",
     SECTION_EPISODIC: "RELEVANT PAST MOMENTS (from earlier conversations)",
     SECTION_SESSIONS: "PREVIOUS SESSIONS",
     SECTION_LESSONS: "LESSONS FROM PAST MISTAKES",
 }
+
+# Graph context is carved out of the existing episodic budget (a fixed
+# fraction), not a new top-level Budgets field — adding one would touch the
+# Stable memory_split/Budgets contract (config.py validates memory_split
+# against exactly {facts, episodic, sessions, lessons}). Piggybacking here
+# also means it inherits episodic's existing governor gating for free:
+# episodic is already 0 at LITE tier (same tier graph_hops is 0), so graph
+# context correctly gets zero budget there without any new gating logic.
+GRAPH_CONTEXT_SHARE = 0.25
 
 
 def estimate_tokens(text: str, tokenizer_fn: TokenizerFn | None = None) -> int:

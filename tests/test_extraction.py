@@ -189,3 +189,37 @@ def test_consolidate_never_raises_on_graph_maintenance_failure(store, monkeypatc
     monkeypatch.setattr(graph, "apply_decay", _boom)
     stats = extraction.consolidate(store._conn, store._config, None, llm_merge=False)
     assert "archived" in stats  # fact decay still ran and returned normally
+
+
+def test_consolidate_computes_clusters(store):
+    from elastimem import extraction, graph
+
+    conn = store._conn
+    j = graph.upsert_node(conn, "thing", "Jetson")
+    t = graph.upsert_node(conn, "thing", "Tuffy")
+    graph.upsert_edge(conn, t, j, "runs_on")
+
+    stats = extraction.consolidate(conn, store._config, None, llm_merge=False)
+    assert stats["clusters"] == 1
+    assert "clusters_labeled" not in stats  # no llm_merge -> labeling not attempted
+    rows = conn.execute("SELECT cluster_id FROM graph_nodes").fetchall()
+    assert all(r["cluster_id"] is not None for r in rows)
+
+
+def test_consolidate_labels_clusters_under_llm_merge(store):
+    from elastimem import extraction, graph
+
+    conn = store._conn
+    j = graph.upsert_node(conn, "thing", "Jetson")
+    t = graph.upsert_node(conn, "thing", "Tuffy")
+    graph.upsert_edge(conn, t, j, "runs_on")
+
+    def llm(prompt, *, max_tokens, temperature):
+        return "Local AI"
+
+    stats = extraction.consolidate(conn, store._config, llm, llm_merge=True)
+    assert stats["clusters_labeled"] == 1
+    row = conn.execute(
+        "SELECT DISTINCT cluster_label FROM graph_nodes WHERE cluster_id IS NOT NULL"
+    ).fetchone()
+    assert row["cluster_label"] == "Local AI"

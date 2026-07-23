@@ -66,12 +66,23 @@ after construction. Reassignment is not guarded against today, but is
 unsupported: the background worker may hold a reference to the original
 callable.
 
+`ContextPlan.sections` and `MemoryProfile` gained new keys/fields
+(`sections["graph_context"]`, `MemoryProfile.graph_hops`) as part of the
+knowledge-graph work — additive per the semantic-versioning promise above:
+existing code that reads specific keys/fields is unaffected, but code that
+asserts an *exact* set of `sections` keys or does positional
+`MemoryProfile(...)` construction should account for the new members. (A
+grep of this codebase at the time these fields were added found no
+positional `MemoryProfile(...)` construction outside `governor.py` itself,
+which always constructs by keyword.)
+
 ## Experimental
 
 | method | purpose |
 |---|---|
 | `explain(query, k=5)` | retrieval transparency — per-leg score breakdown and graph traversal path behind a `recall()`-equivalent search |
 | `timeline(query)` | resolve `query` to a fact key and return its full version history, oldest first |
+| `clusters()` | current knowledge-graph topic clusters (connected components over `graph_edges`, optionally LLM-labeled), largest first |
 
 `explain()`'s return type (`ExplainResult` and its nested
 `ChunkScoreBreakdown`/`FactScoreBreakdown`/`GraphTraversalStep`

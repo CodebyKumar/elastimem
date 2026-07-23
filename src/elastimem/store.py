@@ -227,6 +227,7 @@ class Elastimem:
 
         relevance: dict[int, float] = {}
         episodic_text = ""
+        graph_context_text = ""
         if user_input and len(user_input.split()) >= self._config.min_retrieval_query_words:
             try:
                 from . import retrieval
@@ -236,6 +237,9 @@ class Elastimem:
                 )
                 if profile.budgets.episodic > 0:
                     episodic_text = retrieval.episodic_section(
+                        self, user_input, profile, tokenizer_fn=self.tokenizer_fn
+                    )
+                    graph_context_text = retrieval.graph_context_section(
                         self, user_input, profile, tokenizer_fn=self.tokenizer_fn
                     )
             except Exception:
@@ -250,6 +254,7 @@ class Elastimem:
 
         sections = {
             assembly.SECTION_FACTS: facts_text,
+            assembly.SECTION_GRAPH_CONTEXT: graph_context_text,
             assembly.SECTION_EPISODIC: episodic_text,
             assembly.SECTION_SESSIONS: self._sessions_section(profile),
             assembly.SECTION_LESSONS: assembly.build_lessons_section(
@@ -559,6 +564,16 @@ class Elastimem:
         from . import retrieval
 
         return retrieval.timeline(self, query)
+
+    def clusters(self) -> list[dict]:
+        """Current knowledge-graph topic clusters (computed during
+        consolidation — see governor.md's Knowledge graph section), largest
+        first: ``[{"cluster_id", "label", "members": [name, ...]}, ...]``.
+        Empty on LITE tier or a graph with no multi-node components yet.
+        Never raises."""
+        from . import graph
+
+        return graph.list_clusters(self._conn)
 
     def forget(self, key: str) -> bool:
         """Invalidate the current version of ``key`` (non-destructive tombstone)."""
