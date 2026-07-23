@@ -3,12 +3,12 @@
 **Elastic, resource-adaptive memory for local-first AI agents.**
 
 Elastimem gives your agent long-term memory — facts, past conversations, learned
-lessons — in a single SQLite file, with **zero required dependencies**. Its
-defining feature is the **Memory Governor**: Elastimem probes the machine it's
-running on and elastically sizes every memory capability to fit, so the same
-code serves a 4 GB Jetson and a 128 GB workstation. Every capability has a
-documented degradation floor; nothing ever hard-fails because the host is
-small.
+lessons, and an **embedded knowledge graph** connecting them — in a single
+SQLite file, with **zero required dependencies**. Its defining feature is
+the **Memory Governor**: Elastimem probes the machine it's running on and
+elastically sizes every memory capability to fit, so the same code serves a
+4 GB Jetson and a 128 GB workstation. Every capability has a documented
+degradation floor; nothing ever hard-fails because the host is small.
 
 Not on PyPI — install directly from this repository:
 
@@ -46,6 +46,14 @@ for that world:
   validation guards (placeholder junk, transcript echoes, the model storing
   facts about *itself*); rejects are quarantined for inspection, not silently
   dropped.
+- **Associative, not just keyword/semantic.** Entities and relationships are
+  extracted alongside facts (same background LLM pass, no extra model call)
+  and stored as an embedded knowledge graph in the same SQLite file. Asking
+  about "my Jetson" can surface a memory that only mentions "Tuffy" — because
+  the graph knows Tuffy runs on the Jetson — even though the two share no
+  vocabulary. This is one more retrieval signal, not a separate database;
+  the Memory Governor gates it exactly like everything else (off at LITE
+  tier, deeper at FULL).
 
 ## Quickstart
 
@@ -88,6 +96,47 @@ work). No `embedder` → keyword (FTS5 BM25) retrieval. No psutil → stdlib
 hardware probe. No FTS5 in your sqlite build → `LIKE` retrieval. It always
 works; it's just progressively less clever.
 
+## The knowledge graph
+
+With an `llm` configured, Elastimem extracts entities and relationships
+alongside facts from the same background reflection pass — no second model
+call, no NER library, no graph database. They're stored as plain tables
+(`graph_nodes`/`graph_edges`) in the same SQLite file and folded into
+retrieval as one more signal:
+
+```python
+mem.record_turn("I'm building a robot called Tuffy that runs on a Jetson",
+                "Sounds like a fun project!")
+mem.record_turn("Tuffy uses CUDA for the vision pipeline",
+                "Nice, that should help with real-time inference.")
+mem.end_session()   # graph maintenance runs here: decay, dedup, clustering
+
+# a query sharing no vocabulary with the CUDA memory still finds it,
+# because Jetson -> Tuffy -> CUDA are graph-connected:
+hits = mem.recall("what do I know about my Jetson")
+
+# see exactly why, with per-signal scores and the traversal path:
+result = mem.explain("what do I know about my Jetson")
+for step in result.graph_traversal:
+    print(step.canonical_name, step.hop_distance)
+
+# related entities auto-group into topics (connected components + an
+# optional LLM-generated label, e.g. "Local AI"):
+for cluster in mem.clusters():
+    print(cluster["label"], cluster["members"])
+
+# facts are versioned; resolve a natural-language question to the right
+# key and see the full history:
+mem.remember("occupation", "Student")
+mem.remember("occupation", "AI Engineer")
+mem.timeline("what did I do before AI")   # -> Student -> AI Engineer
+```
+
+Depth adapts with the Memory Governor exactly like everything else — 2-hop
+graph expansion at FULL tier, 1-hop at STANDARD, off entirely at LITE (zero
+extra queries, zero extra writes). Full design and the reasoning behind it:
+[governor.md's Knowledge graph section](docs/governor.md#knowledge-graph).
+
 ## The four memory layers
 
 | Layer                | What it holds                                                  | Where                                       |
@@ -96,6 +145,7 @@ works; it's just progressively less clever.
 | **Episodic**   | full past transcripts, chunked and indexed for recall          | `messages` / `chunks` (+FTS5, +vectors) |
 | **Semantic**   | facts about the user, temporally versioned, importance-decayed | `facts`                                   |
 | **Procedural** | lessons the agent learned about its own behavior               | `lessons`                                 |
+| **Graph**      | entities and relationships connecting the above, plus topic clusters | `graph_nodes` / `graph_edges`         |
 
 ## The Memory Governor
 
@@ -109,6 +159,7 @@ and derives token budgets from your model's context size:
 | Working window            | ~8–10 turns         | ~5–6 turns           | 2 turns + newest   |
 | Rolling summary           | LLM, every eviction  | LLM, every 2nd batch  | placeholder marker |
 | LLM fact extraction       | background, per turn | batched every 3 turns | off (rules only)   |
+| Knowledge graph           | 2-hop expansion       | 1-hop expansion        | off — no graph reads or writes |
 | Rule capture, transcripts | always               | always                | always             |
 
 Full spec: [docs/governor.md](docs/governor.md). Architecture and rationale:
@@ -121,7 +172,10 @@ Pre-release alpha (0.1.0a1). The core API (`open`, `remember`, `recall`,
 `record_turn`, `build_context`, see [docs/api_stability.md](docs/api_stability.md)
 for the exact Stable surface) is expected to stay stable; internal
 implementation details and advanced features may still evolve based on
-feedback from early adopters. See [CHANGELOG.md](CHANGELOG.md) for release
+feedback from early adopters. The knowledge-graph query surface
+(`explain()`, `timeline()`, `clusters()`) is marked **Experimental** —
+the underlying storage is stable, but their exact return shapes may still
+change based on real usage. See [CHANGELOG.md](CHANGELOG.md) for release
 history.
 
 Built as the memory engine for [Tuffy](https://github.com/CodebyKumar/tuffy)

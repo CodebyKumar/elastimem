@@ -39,7 +39,7 @@ capacity.
   databases are quarantined and rebuilt. The raw transcript is always kept,
   so future (better) models can re-index the past.
 
-## The four memory layers
+## The four memory layers (plus the graph that connects them)
 
 ```
                        ┌───────────────────────────────┐
@@ -52,7 +52,22 @@ capacity.
                        ├───────────────────────────────┤
                        │ PROCEDURAL lessons            │  lessons
                        └───────────────────────────────┘
+                                    ▲
+                                    │ one more retrieval signal, not
+                                    │ a separate store
+                       ┌───────────────────────────────┐
+                       │ GRAPH  entities + relationships│ graph_nodes, graph_edges
+                       │        + topic clusters        │
+                       └───────────────────────────────┘
 ```
+
+The graph is deliberately drawn separately above: it isn't a fifth
+peer memory layer that competes with the other four for the host's
+attention. It's an index *over* them — entities/relationships extracted
+from the same exchanges that feed episodic and semantic memory, used to
+widen retrieval (`recall`) and to populate one more `build_context()`
+section (`graph_context`, "RELATED TOPICS"). See "The knowledge graph"
+below.
 
 ### Working memory (`working` plan inside `ContextPlan`)
 Elastimem does not own the host's message list. `build_context()` returns
@@ -97,7 +112,9 @@ recency were multiplied together directly — since RRF's raw scores are
 deliberately flat across ranks (by design, so no single ranker dominates),
 that multiplication let importance's ~1.6x swing (0.5 → 0.8) trivially flip
 rankings on real queries. If you're touching this code, `search_chunks()`'s
-own docstring in `retrieval.py` has the fuller before/after story.
+own docstring in `retrieval.py` has the fuller before/after story. A third
+signal, the knowledge graph, was added later using the exact same
+additive-nudge principle — see "The knowledge graph" below.
 
 ### Semantic memory (`semantic.py`)
 Facts are `key → value` rows with **temporal versioning**: an update
@@ -126,6 +143,49 @@ automatic rejects land in `quarantine` for inspection.
 Short operational lessons (`add_lesson`), deduplicated, oldest archived
 beyond the cap, top-N injected.
 
+## The knowledge graph (`graph.py`)
+
+Entities and relationships ride the **same** background LLM completion
+`extraction.py` already makes for facts — one call per turn, not two. The
+extraction prompt asks for `facts`/`entities`/`relationships` in a single
+JSON object; a model that ignores the new shape and returns the old flat
+`{key: value}` JSON is still handled (backward-compatible fallback), so
+this never risked regressing plain fact extraction.
+
+Storage is two plain tables in the same file, no separate database:
+- **`graph_nodes`** — one row per distinct entity, write-time deduped by
+  normalized identity (`ON CONFLICT DO UPDATE` — repeated mentions bump a
+  running-average `confidence` and `mention_count` rather than inserting a
+  new row). Carries `cluster_id`/`cluster_label` once clustering has run.
+- **`graph_edges`** — directed relationships between two nodes, same
+  write-time dedup pattern on `(source, target, relationship)`.
+
+**Retrieval** (`retrieval.graph_relevance`): query-time entity detection is
+a plain substring scan over `canonical_name`/aliases (no NER call), then a
+`WITH RECURSIVE` SQL traversal expands N hops from those seeds — no graph
+library. The result folds into `search_chunks`/`search_all` as a small
+**additive** score nudge, same "nudge not multiplier" philosophy as
+importance/recency: the nudge's ceiling is a fraction of *that query's own*
+top relevance score (not a fixed constant), and each match is weighted by
+the entity's own confidence and match specificity. This means a graph
+match can break a near-tie or surface an associatively-connected memory
+that shares zero vocabulary with the query — but it can never manufacture
+a hit out of a query with zero real FTS/vector relevance to begin with.
+
+**Maintenance** piggybacks on the existing `consolidate` job (no new job
+kind, no new scheduler) — see "Consolidation" below.
+
+**Governor gating** (`MemoryProfile.graph_hops`): LITE=0 (the graph leg is
+never even queried — zero extra reads, zero extra writes, same "compiled
+out" treatment the embedder gets at LITE), STANDARD=1, FULL=2 hops.
+
+**`explain(query)`** (Experimental) and **`clusters()`** (Experimental)
+expose this machinery directly for debugging/UI: `explain` returns the
+per-leg score breakdown and the traversal path behind a `recall()`-
+equivalent search; `clusters` returns the topic groups (connected
+components over `graph_edges`, union-find — see "Consolidation" below —
+optionally LLM-labeled).
+
 ## The background worker (`worker.py`)
 
 One daemon thread, one queue. Job kinds: `extract`, `rolling_summary`,
@@ -151,7 +211,20 @@ idle in FULL tier:
 2. FULL only: LLM contradiction-merge for keys whose value changed within a
    week ("lives in Austin" vs "moving to Austin in May" → merged value,
    still versioned),
-3. cap maintenance (quarantine ≤ 200).
+3. **graph decay/archival** (any tier above OFF, no LLM): a node/edge's
+   confidence decays exponentially from its last reinforcement, same shape
+   as fact decay; below threshold, the row is hard-deleted (the graph has
+   no audit-trail requirement, unlike facts — decay removes rather than
+   soft-archives),
+4. FULL only: **graph duplicate-entity merging** — same-type node pairs
+   sharing a token get one LLM yes/no question each (capped at 5/sweep);
+   on "yes" the newer node's edges are repointed and it's deleted,
+5. **cluster recomputation** (any tier above OFF, no LLM) — connected
+   components over the now-settled graph, run *after* steps 3-4 so stale/
+   duplicate nodes don't fragment or pollute a topic group; FULL only asks
+   the LLM for a short label per *new* cluster,
+6. cap maintenance (quarantine ≤ 200, plus the graph's own
+   `graph_node_cap`/`graph_edge_cap` enforced at write time, not here).
 
 ## Data flow per turn
 
@@ -159,11 +232,12 @@ idle in FULL tier:
 user input
   │
   ├─ mem.tick()                    governor re-checks RAM (cheap)
-  ├─ plan = mem.build_context(q)   FTS+vector retrieval, budgeted sections
+  ├─ plan = mem.build_context(q)   FTS+vector+graph retrieval, budgeted sections
   ├─ host renders plan into its system prompt, trims window to plan
   ├─ with mem.foreground():        model generates the reply
   ├─ mem.record_turn(q, reply)     persist + rule capture (inline, fast)
-  │     └─ worker: extract facts, embed chunks     (background)
+  │     └─ worker: extract facts + graph entities/relationships,
+  │                embed chunks                    (background, one LLM call)
   └─ mem.report_evictions(...)     if the host trimmed its window
         └─ worker: fold into rolling summary       (background)
 ```

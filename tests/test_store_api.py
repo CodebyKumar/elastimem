@@ -60,6 +60,18 @@ def test_open_shorthand(tmp_path):
     mem.close()
 
 
+def test_open_shorthand_memory_store():
+    """':memory:' is documented as supported (see docs/api.md) - confirm
+    the friendly elastimem.open() front door works with it too, not just
+    the Elastimem(...) constructor directly."""
+    import elastimem
+
+    mem = elastimem.open(":memory:")
+    mem.remember("name", "Alex")
+    assert mem.facts() == {"name": "Alex"}
+    mem.close()
+
+
 def test_inline_config_overrides(tmp_path):
     import elastimem
 
