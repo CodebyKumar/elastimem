@@ -188,7 +188,10 @@ def consolidate(
     ``llm_merge`` (FULL tier + complete_fn present) reviews keys whose value
     changed recently and lets the model produce a merged value when the new
     one doesn't cleanly supersede the old ("moving to Austin in May" vs
-    "lives in Austin").
+    "lives in Austin"). The same flag also gates graph maintenance: decay/
+    archival always runs (mirrors fact decay running regardless of tier
+    beyond DEDUPE_ONLY/FULL), duplicate-entity merging only under
+    ``llm_merge`` since it costs an LLM call, same as the fact merge above.
     """
     stats = {"archived": semantic.apply_decay(conn, config), "merged": 0}
 
@@ -214,6 +217,23 @@ def consolidate(
                         (merged, utcnow(), row["new_id"]),
                     )
                 stats["merged"] += 1
+
+    try:
+        from . import graph as graph_mod
+
+        graph_stats = graph_mod.apply_decay(
+            conn, half_life_days=config.graph_decay_half_life_days,
+            archive_threshold=config.graph_archive_threshold,
+        )
+        stats["graph_nodes_archived"] = graph_stats["nodes"]
+        stats["graph_edges_archived"] = graph_stats["edges"]
+        if llm_merge and complete_fn is not None:
+            stats["graph_merged"] = graph_mod.merge_duplicates(
+                conn, complete_fn,
+                review_window_days=config.graph_merge_review_window_days,
+            )
+    except Exception:
+        log.exception("elastimem: graph maintenance sweep failed")
 
     with conn:
         conn.execute(

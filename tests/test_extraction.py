@@ -145,3 +145,47 @@ def test_extract_facts_source_chunk_id_threaded_through(store):
     )
     row = store._conn.execute("SELECT source_chunk_id FROM graph_edges").fetchone()
     assert row["source_chunk_id"] == chunk_id
+
+
+def test_consolidate_runs_graph_decay(store):
+    from elastimem import extraction, graph
+
+    conn = store._conn
+    node_id = graph.upsert_node(conn, "thing", "OldGadget", confidence=0.1)
+    with conn:
+        conn.execute(
+            "UPDATE graph_nodes SET updated_at='2020-01-01T00:00:00+00:00' WHERE id=?",
+            (node_id,),
+        )
+    stats = extraction.consolidate(conn, store._config, None, llm_merge=False)
+    assert stats["graph_nodes_archived"] == 1
+    assert conn.execute("SELECT count(*) c FROM graph_nodes").fetchone()["c"] == 0
+
+
+def test_consolidate_llm_merge_gates_graph_duplicate_merge(store):
+    from elastimem import extraction, graph
+
+    conn = store._conn
+    graph.upsert_node(conn, "org", "acme corp")
+    graph.upsert_node(conn, "org", "acme corporation")
+
+    stats = extraction.consolidate(conn, store._config, None, llm_merge=False)
+    assert "graph_merged" not in stats  # no complete_fn, no llm_merge -> not attempted
+    assert conn.execute("SELECT count(*) c FROM graph_nodes").fetchone()["c"] == 2
+
+    stats = extraction.consolidate(
+        conn, store._config, _CompleteFn("yes"), llm_merge=True,
+    )
+    assert stats["graph_merged"] == 1
+    assert conn.execute("SELECT count(*) c FROM graph_nodes").fetchone()["c"] == 1
+
+
+def test_consolidate_never_raises_on_graph_maintenance_failure(store, monkeypatch):
+    from elastimem import extraction, graph
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("simulated failure")
+
+    monkeypatch.setattr(graph, "apply_decay", _boom)
+    stats = extraction.consolidate(store._conn, store._config, None, llm_merge=False)
+    assert "archived" in stats  # fact decay still ran and returned normally

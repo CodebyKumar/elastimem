@@ -212,3 +212,145 @@ def test_detect_seed_nodes_prefers_longer_match(store):
     long_id = graph.upsert_node(conn, "org", "Acme Corp International")
     matches = graph.detect_seed_nodes(conn, "I work at Acme Corp International")
     assert matches[0][0] == long_id
+
+
+# --------------------------------------------------------------------------- #
+# maintenance: decay/archival
+# --------------------------------------------------------------------------- #
+def test_apply_decay_removes_stale_low_confidence_node(store):
+    conn = store._conn
+    node_id = graph.upsert_node(conn, "thing", "OldGadget", confidence=0.2)
+    with conn:
+        conn.execute(
+            "UPDATE graph_nodes SET updated_at='2020-01-01T00:00:00+00:00' WHERE id=?",
+            (node_id,),
+        )
+    removed = graph.apply_decay(conn, half_life_days=30.0, archive_threshold=0.15)
+    assert removed["nodes"] == 1
+    assert _count(conn, "graph_nodes") == 0
+
+
+def test_apply_decay_keeps_recently_reinforced_node(store):
+    conn = store._conn
+    node_id = graph.upsert_node(conn, "thing", "Jetson", confidence=0.9)
+    removed = graph.apply_decay(conn, half_life_days=30.0, archive_threshold=0.15)
+    assert removed["nodes"] == 0
+    assert _count(conn, "graph_nodes") == 1
+
+
+def test_apply_decay_removes_stale_edge_but_keeps_reinforced_node(store):
+    conn = store._conn
+    a = graph.upsert_node(conn, "thing", "A", confidence=0.9)
+    b = graph.upsert_node(conn, "thing", "B", confidence=0.9)
+    edge_id = graph.upsert_edge(conn, a, b, "rel", confidence=0.2)
+    with conn:
+        conn.execute(
+            "UPDATE graph_edges SET last_seen='2020-01-01T00:00:00+00:00' WHERE id=?",
+            (edge_id,),
+        )
+    removed = graph.apply_decay(conn, half_life_days=30.0, archive_threshold=0.15)
+    assert removed["edges"] == 1
+    assert _count(conn, "graph_edges") == 0
+    # Both nodes have high confidence and recent updated_at - survive.
+    assert _count(conn, "graph_nodes") == 2
+
+
+def test_apply_decay_cascade_deletes_orphaned_node_edges(store):
+    conn = store._conn
+    a = graph.upsert_node(conn, "thing", "A", confidence=0.2)
+    b = graph.upsert_node(conn, "thing", "B", confidence=0.9)
+    graph.upsert_edge(conn, a, b, "rel", confidence=0.9)
+    with conn:
+        conn.execute(
+            "UPDATE graph_nodes SET updated_at='2020-01-01T00:00:00+00:00' WHERE id=?",
+            (a,),
+        )
+    graph.apply_decay(conn, half_life_days=30.0, archive_threshold=0.15)
+    assert _count(conn, "graph_nodes") == 1
+    assert _count(conn, "graph_edges") == 0  # cascaded
+
+
+def test_apply_decay_empty_graph_noop(store):
+    removed = graph.apply_decay(store._conn, half_life_days=30.0, archive_threshold=0.15)
+    assert removed == {"nodes": 0, "edges": 0}
+
+
+# --------------------------------------------------------------------------- #
+# maintenance: LLM-assisted duplicate merging
+# --------------------------------------------------------------------------- #
+def test_merge_duplicates_merges_on_yes(store):
+    conn = store._conn
+    a = graph.upsert_node(conn, "org", "acme corp")
+    b = graph.upsert_node(conn, "org", "acme corporation")
+    other = graph.upsert_node(conn, "thing", "unrelated")
+    graph.upsert_edge(conn, b, other, "rel")
+
+    calls = []
+
+    def llm(prompt, *, max_tokens, temperature):
+        calls.append(prompt)
+        return "yes"
+
+    merged = graph.merge_duplicates(conn, llm, review_window_days=30.0)
+    assert merged == 1
+    assert calls  # the LLM was actually consulted
+    assert _count(conn, "graph_nodes") == 2  # a + other; b merged away
+    # b's edge repointed to a, not deleted
+    row = conn.execute("SELECT source_node FROM graph_edges").fetchone()
+    assert row["source_node"] == a
+
+
+def test_merge_duplicates_no_merge_on_no(store):
+    conn = store._conn
+    graph.upsert_node(conn, "org", "acme corp")
+    graph.upsert_node(conn, "org", "acme industries")
+
+    def llm(prompt, *, max_tokens, temperature):
+        return "no"
+
+    merged = graph.merge_duplicates(conn, llm, review_window_days=30.0)
+    assert merged == 0
+    assert _count(conn, "graph_nodes") == 2
+
+
+def test_merge_duplicates_skips_pairs_with_no_shared_token(store):
+    conn = store._conn
+    graph.upsert_node(conn, "org", "acme corp")
+    graph.upsert_node(conn, "org", "widgets inc")
+
+    calls = []
+
+    def llm(prompt, *, max_tokens, temperature):
+        calls.append(prompt)
+        return "yes"
+
+    graph.merge_duplicates(conn, llm, review_window_days=30.0)
+    assert calls == []  # pre-filter rejected the pair, no LLM call made
+
+
+def test_merge_duplicates_skips_different_types(store):
+    conn = store._conn
+    graph.upsert_node(conn, "org", "acme corp")
+    graph.upsert_node(conn, "place", "acme corp")
+
+    calls = []
+
+    def llm(prompt, *, max_tokens, temperature):
+        calls.append(prompt)
+        return "yes"
+
+    graph.merge_duplicates(conn, llm, review_window_days=30.0)
+    assert calls == []
+
+
+def test_merge_duplicates_llm_failure_never_raises(store):
+    conn = store._conn
+    graph.upsert_node(conn, "org", "acme corp")
+    graph.upsert_node(conn, "org", "acme corporation")
+
+    def broken_llm(prompt, *, max_tokens, temperature):
+        raise RuntimeError("simulated failure")
+
+    merged = graph.merge_duplicates(conn, broken_llm, review_window_days=30.0)
+    assert merged == 0
+    assert _count(conn, "graph_nodes") == 2

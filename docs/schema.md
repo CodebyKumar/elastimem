@@ -88,7 +88,11 @@ pipeline, not a separate store.
 Unique index `(type, canonical_name)` — write-time dedup; repeated
 mentions update the existing row (`ON CONFLICT DO UPDATE`) instead of
 inserting a new one. Rows beyond `graph_node_cap` (default 2000) are
-trimmed by lowest `(importance, mention_count, updated_at)`.
+trimmed by lowest `(importance, mention_count, updated_at)`. Beyond the
+cap, a background consolidation sweep (`graph.apply_decay`,
+`graph.merge_duplicates`) hard-deletes confidence-decayed rows and merges
+LLM-confirmed duplicate entities — see
+[governor.md](governor.md#graph-maintenance-decay-dedup-llm-assisted-merging).
 
 ### `graph_edges` — embedded semantic knowledge graph (relationships)
 | column | notes |

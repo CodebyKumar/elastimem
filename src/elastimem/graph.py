@@ -23,11 +23,16 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import sqlite3
+from datetime import datetime, timezone
+from typing import Callable
 
 from .db import utcnow
 
 log = logging.getLogger("elastimem")
+
+CompleteFn = Callable[..., str]
 
 _ARTICLES = ("the ", "a ", "an ")
 _MAX_ALIASES = 8
@@ -323,3 +328,157 @@ def nodes_for_ids(conn: sqlite3.Connection, node_ids: list[int]) -> list[sqlite3
     except sqlite3.Error:
         log.exception("elastimem: graph node lookup failed")
         return []
+
+
+# --------------------------------------------------------------------------- #
+# maintenance: decay/archival, duplicate merging
+# --------------------------------------------------------------------------- #
+def _days_since(iso_ts: str) -> float:
+    try:
+        then = datetime.fromisoformat(iso_ts)
+        if then.tzinfo is None:
+            then = then.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return 0.0
+    return max(0.0, (datetime.now(timezone.utc) - then).total_seconds() / 86400.0)
+
+
+def _decayed(confidence: float, anchor_ts: str, half_life_days: float) -> float:
+    """confidence * exp(-days_since_anchor / half_life) — same shape as
+    semantic.effective_importance, applied to graph confidence instead of
+    fact importance."""
+    return confidence * math.exp(-_days_since(anchor_ts) / half_life_days)
+
+
+def apply_decay(
+    conn: sqlite3.Connection, *, half_life_days: float, archive_threshold: float
+) -> dict[str, int]:
+    """Hard-delete nodes/edges whose decayed confidence has fallen below
+    ``archive_threshold``. Unlike facts (which soft-archive to preserve an
+    audit trail), the graph is a derived retrieval index with no audit
+    requirement, so a decayed row is simply removed — consistent with how
+    cap enforcement already hard-deletes on overflow. Reinforcement
+    (re-extraction bumping mention_count/seen_count and refreshing
+    updated_at/last_seen) resets the decay clock, so an entity that keeps
+    coming up in conversation never decays away.
+
+    Edges are checked first: a node with no edges left after edge decay is
+    a good deletion candidate on its own decay pass (ON DELETE CASCADE
+    handles the reverse — deleting a decayed node removes its edges).
+    Returns ``{"nodes": n, "edges": m}`` counts removed. Never raises.
+    """
+    removed = {"nodes": 0, "edges": 0}
+    try:
+        with conn:
+            edge_rows = conn.execute(
+                "SELECT id, confidence, last_seen FROM graph_edges"
+            ).fetchall()
+            stale_edges = [
+                row["id"] for row in edge_rows
+                if _decayed(row["confidence"], row["last_seen"], half_life_days)
+                < archive_threshold
+            ]
+            if stale_edges:
+                placeholders = ",".join("?" * len(stale_edges))
+                conn.execute(
+                    f"DELETE FROM graph_edges WHERE id IN ({placeholders})",
+                    stale_edges,
+                )
+                removed["edges"] = len(stale_edges)
+
+            node_rows = conn.execute(
+                "SELECT id, confidence, updated_at FROM graph_nodes"
+            ).fetchall()
+            stale_nodes = [
+                row["id"] for row in node_rows
+                if _decayed(row["confidence"], row["updated_at"], half_life_days)
+                < archive_threshold
+            ]
+            if stale_nodes:
+                placeholders = ",".join("?" * len(stale_nodes))
+                conn.execute(
+                    f"DELETE FROM graph_nodes WHERE id IN ({placeholders})",
+                    stale_nodes,
+                )
+                removed["nodes"] = len(stale_nodes)
+    except sqlite3.Error:
+        log.exception("elastimem: graph decay sweep failed")
+    return removed
+
+
+_MERGE_PROMPT = (
+    "Are these two labels the same real-world entity, just written "
+    "differently (e.g. abbreviation, typo, or rephrasing)? Reply with "
+    "ONLY \"yes\" or \"no\"."
+)
+
+
+def merge_duplicates(
+    conn: sqlite3.Connection,
+    complete_fn: CompleteFn,
+    *,
+    review_window_days: float,
+    max_tokens: int = 16,
+) -> int:
+    """FULL-tier-only maintenance: ask the LLM whether pairs of same-type
+    entities created within ``review_window_days`` of each other and
+    sharing a token (cheap pre-filter — no fuzzy-matching library, see
+    graph._canonicalize's docstring) are actually the same entity under
+    different names. On "yes", the newer node's edges are repointed to the
+    older node and the newer node is deleted.
+
+    This is the one piece of graph maintenance that costs an LLM call, so
+    it is capped at a handful of pairs per sweep (mirrors
+    extraction.consolidate's fact-merge review, which caps at 5). Never
+    raises; a malformed/absent response is treated as "no merge".
+    """
+    merged = 0
+    try:
+        candidates = conn.execute(
+            "SELECT id, type, canonical_name, created_at FROM graph_nodes"
+            " WHERE created_at >= datetime('now', ?) ORDER BY created_at",
+            (f"-{review_window_days} days",),
+        ).fetchall()
+    except sqlite3.Error:
+        log.exception("elastimem: graph duplicate-merge candidate scan failed")
+        return 0
+
+    checked = 0
+    for i, a in enumerate(candidates):
+        if checked >= 5:
+            break
+        a_tokens = set(a["canonical_name"].split())
+        for b in candidates[i + 1:]:
+            if checked >= 5:
+                break
+            if b["type"] != a["type"]:
+                continue
+            b_tokens = set(b["canonical_name"].split())
+            if not (a_tokens & b_tokens):
+                continue
+            checked += 1
+            try:
+                answer = complete_fn(
+                    f"{_MERGE_PROMPT}\n\nA: {a['canonical_name']}\nB: {b['canonical_name']}",
+                    max_tokens=max_tokens, temperature=0.0,
+                ) or ""
+            except Exception:
+                log.exception("elastimem: graph duplicate-merge completion failed")
+                continue
+            if not answer.strip().lower().startswith("y"):
+                continue
+            try:
+                with conn:
+                    conn.execute(
+                        "UPDATE OR IGNORE graph_edges SET source_node=? WHERE source_node=?",
+                        (a["id"], b["id"]),
+                    )
+                    conn.execute(
+                        "UPDATE OR IGNORE graph_edges SET target_node=? WHERE target_node=?",
+                        (a["id"], b["id"]),
+                    )
+                    conn.execute("DELETE FROM graph_nodes WHERE id=?", (b["id"],))
+                merged += 1
+            except sqlite3.Error:
+                log.exception("elastimem: graph duplicate-merge apply failed")
+    return merged

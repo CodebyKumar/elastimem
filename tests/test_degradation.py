@@ -88,6 +88,37 @@ def test_consolidation_llm_merge(tmp_path):
     s.close()
 
 
+def test_end_session_consolidation_runs_graph_maintenance(tmp_path):
+    from elastimem import graph
+
+    def merging_llm(prompt, *, max_tokens, temperature):
+        if "same real-world entity" in prompt:
+            return "yes"
+        return "NONE"
+
+    s = Elastimem(str(tmp_path / "gm.db"), complete_fn=merging_llm,
+               probe_fn=lambda: (32 * GIB, 20 * GIB))
+    conn = s._conn
+    stale_id = graph.upsert_node(conn, "thing", "StaleThing", confidence=0.1)
+    with conn:
+        conn.execute(
+            "UPDATE graph_nodes SET updated_at='2020-01-01T00:00:00+00:00' WHERE id=?",
+            (stale_id,),
+        )
+    graph.upsert_node(conn, "org", "acme corp")
+    graph.upsert_node(conn, "org", "acme corporation")
+
+    s.record_turn("hello there", "hi!")
+    s.end_session()  # FULL tier -> consolidation, including graph maintenance
+
+    remaining = {r["canonical_name"] for r in conn.execute(
+        "SELECT canonical_name FROM graph_nodes"
+    )}
+    assert "stalething" not in remaining          # decayed away
+    assert len(remaining & {"acme corp", "acme corporation"}) == 1  # merged
+    s.close()
+
+
 def test_pressure_report_is_immediate_and_survives_recovery_rules(tmp_path):
     s = Elastimem(str(tmp_path / "p.db"), probe_fn=lambda: (32 * GIB, 20 * GIB))
     assert s.profile.tier is Tier.FULL

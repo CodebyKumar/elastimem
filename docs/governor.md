@@ -254,6 +254,36 @@ FTS/vector relevance to begin with. A query with no keyword or semantic
 overlap with anything in the store returns nothing, same as before the
 graph existed.
 
+### Graph maintenance (decay, dedup, LLM-assisted merging)
+
+Write-time dedup (`graph.py`'s `ON CONFLICT DO UPDATE` upserts) and the
+row caps (`graph_node_cap`/`graph_edge_cap`) are the *floor* — they stop
+unbounded growth but don't improve graph quality over time. Real upkeep
+piggybacks on the same `consolidate` job that already handles fact decay
+and quarantine trimming (`extraction.consolidate`), triggered the same way
+(idle sweep or session end on FULL tier, exit-only dedupe on STANDARD, off
+at LITE) — no new job kind, no new scheduling.
+
+- **Decay/archival** (`graph.apply_decay`, runs whenever consolidation
+  runs, any tier above OFF): a node/edge's confidence decays
+  exponentially from its last reinforcement (`updated_at`/`last_seen`),
+  same shape as `semantic.effective_importance`. Below
+  `graph_archive_threshold` (default 0.15, half-life
+  `graph_decay_half_life_days` = 30 days), the row is hard-deleted —
+  unlike facts, the graph has no audit-trail requirement, so decay removes
+  rather than soft-archives. An entity that keeps coming up in
+  conversation resets its own clock on every re-extraction and never
+  decays away.
+- **Duplicate-entity merging** (`graph.merge_duplicates`, FULL tier only,
+  same `llm_merge` gate as the fact contradiction-merge): reviews recently
+  created node pairs of the same type that share a token (a cheap
+  pre-filter — no fuzzy-matching library, see `graph._canonicalize`'s
+  docstring for why) and asks the LLM a single yes/no question per
+  candidate pair, capped at 5 pairs per sweep. On "yes", the newer node's
+  edges are repointed to the older node and the newer node is deleted.
+  This is the one piece of graph maintenance that costs an LLM call, so it
+  never runs at STANDARD/LITE.
+
 ### `explain(query, k=5) -> ExplainResult`
 
 Retrieval transparency: runs the same ranking `recall()` does, but returns

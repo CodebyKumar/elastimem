@@ -191,6 +191,19 @@ class ElastimemConfig:
     # pattern as quarantine_cap.
     graph_node_cap: int = 2000
     graph_edge_cap: int = 5000
+    # Decay/archival, mirroring fact_decay_half_life_days/fact_archive_threshold
+    # (semantic.apply_decay) but applied to graph_nodes.confidence and
+    # graph_edges.confidence instead of fact importance. A node/edge that
+    # hasn't been re-extracted in a while decays toward archival; one that
+    # keeps getting reinforced (mention_count/seen_count going up) never
+    # decays meaningfully because each reinforcement resets the clock
+    # (updated_at/last_seen) that the decay is measured from.
+    graph_decay_half_life_days: float = 30.0
+    graph_archive_threshold: float = 0.15
+    # How far back a consolidation sweep looks for entity pairs to offer the
+    # LLM for duplicate-merge review (FULL tier only) - same idea as
+    # fact_merge_review_window_days.
+    graph_merge_review_window_days: float = 7.0
 
     def __post_init__(self) -> None:
         if self.context_tokens < 1024:
