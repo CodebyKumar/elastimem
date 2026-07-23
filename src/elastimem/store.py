@@ -114,6 +114,23 @@ class Elastimem:
 
         conn, self.fts_enabled = open_store(self.path)
         self._local.conn = conn
+        # A ":memory:" database is private to the connection that created
+        # it - sqlite3.connect(":memory:") from another thread opens a
+        # SEPARATE, empty database, not the same one. Every other _conn
+        # user (record_turn, remember, ...) works fine on the main thread
+        # BUT the background worker thread's _conn would silently see an
+        # empty schema-less database, so writes from `extract`/`embed`/
+        # `consolidate` jobs would raise "no such table" - not a hang, but
+        # a silent-looking failure logged only via Worker._run's exception
+        # catch. The fix: for ":memory:" specifically, every thread reuses
+        # this one connection instead of opening its own. sqlite3
+        # connections are not documented thread-safe for concurrent
+        # *statement execution* from multiple threads simultaneously, but
+        # Elastimem already serializes all writes through `_write_lock`
+        # and every read here is a short, synchronous call - the same
+        # safety property file-backed stores get from WAL is provided here
+        # by the existing write lock instead.
+        self._memory_conn = conn if self.path == ":memory:" else None
 
         governor_kwargs = {"on_tier_change": on_tier_change}
         if probe_fn is not None:
@@ -158,7 +175,13 @@ class Elastimem:
     # ------------------------------------------------------------------ #
     @property
     def _conn(self) -> sqlite3.Connection:
-        """Per-thread connection (:memory: stores share the creating thread's)."""
+        """Per-thread connection. ``:memory:`` stores are the one exception:
+        every thread shares the single connection created in ``__init__``,
+        since sqlite3 gives each new connection to ``:memory:`` its own
+        separate (and here, empty) database — see the comment in
+        ``__init__`` next to ``self._memory_conn``."""
+        if self._memory_conn is not None:
+            return self._memory_conn
         conn = getattr(self._local, "conn", None)
         if conn is None:
             conn = connect(self.path)

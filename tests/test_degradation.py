@@ -254,6 +254,26 @@ def test_graph_nudge_works_without_fts5(tmp_path):
     s.close()
 
 
+def test_memory_store_background_worker_shares_schema(tmp_path):
+    """Regression: sqlite3.connect(':memory:') from a second thread opens a
+    SEPARATE, empty database - not the same one - unlike file-backed
+    stores where every thread's own connection sees the same on-disk file.
+    Elastimem._conn used to call connect(self.path) unconditionally per
+    thread, so a ':memory:' store's background worker thread (which runs
+    every LLM-extraction/embed/consolidate job) would silently hit a
+    schema-less database and every background write would fail. This
+    exercises the exact path that broke: record_turn -> background
+    extraction job -> remember() from the worker thread."""
+    def llm(prompt, *, max_tokens, temperature):
+        return '{"facts": {"favorite_color": "blue"}}'
+
+    s = Elastimem(":memory:", complete_fn=llm, probe_fn=lambda: (32 * GIB, 20 * GIB))
+    s.record_turn("my favorite color is blue", "Noted!")
+    assert s.drain(timeout=5)
+    assert s.facts().get("favorite_color") == "blue"
+    s.close()
+
+
 def test_build_context_never_raises(tmp_path):
     s = Elastimem(str(tmp_path / "n.db"), probe_fn=lambda: (32 * GIB, 20 * GIB))
     for weird in ["", "hi", '"; DROP TABLE chunks; --', "🦆" * 500, "a " * 3000]:

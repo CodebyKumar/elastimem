@@ -198,8 +198,23 @@ def _fts5_available(conn: sqlite3.Connection) -> bool:
 
 
 def connect(path: str) -> sqlite3.Connection:
-    """Open a connection to an existing store. One per thread; no schema work."""
-    conn = sqlite3.connect(path, timeout=10.0)
+    """Open a connection to an existing store. One per thread; no schema work.
+
+    ``:memory:`` is the one exception to "one per thread": sqlite3 gives
+    each new connection to ``:memory:`` its own separate, empty database,
+    so a ":memory:" store must share a single connection across every
+    thread that touches it (see ``store.py``'s ``_memory_conn``) rather
+    than opening a fresh one per thread the way file-backed stores do.
+    That shared connection is therefore genuinely used from multiple
+    threads, so it needs ``check_same_thread=False`` — safe here because
+    every write already goes through ``Elastimem._write_lock``, and reads
+    are short synchronous calls, the same safety property WAL mode
+    provides for file-backed stores' actually-separate per-thread
+    connections.
+    """
+    conn = sqlite3.connect(
+        path, timeout=10.0, check_same_thread=(path != ":memory:")
+    )
     conn.row_factory = sqlite3.Row
     for pragma in _PRAGMAS:
         conn.execute(pragma)
