@@ -45,6 +45,12 @@ def test_lite_zeroes_episodic_and_boosts_working():
     assert lite.profile.embeddings_enabled is False
 
 
+def test_graph_hops_by_tier():
+    assert gov(32, 20).profile.graph_hops == 2      # FULL
+    assert gov(8, 4).profile.graph_hops == 1        # STANDARD
+    assert gov(4, 2).profile.graph_hops == 0        # LITE
+
+
 def test_immediate_downgrade_and_cautious_upgrade():
     ram = {"avail": 20.0}
     cfg = ElastimemConfig(upgrade_healthy_ticks=3)

@@ -27,7 +27,7 @@ class FakeLLM:
         time.sleep(0.02)  # simulate generation
         with self.lock:
             self.active -= 1
-        if "extract durable facts" in prompt:
+        if "extract information ABOUT THE USER" in prompt:
             return json.dumps(self.fact_json) if self.fact_json else "NONE"
         if "Condense" in prompt:
             return "The user discussed early topics that were evicted."

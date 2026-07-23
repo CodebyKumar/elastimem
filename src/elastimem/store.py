@@ -396,10 +396,13 @@ class Elastimem:
     def _execute_job(self, job: Job) -> None:
         conn = self._conn  # worker thread gets its own connection
         if job.kind == "extract" and self.complete_fn is not None:
+            chunk_ids = job.payload.get("chunk_ids") or []
             stored = extraction.extract_facts(
                 conn, self._config, self.complete_fn,
                 job.payload["user"], job.payload["assistant"],
                 store_fn=lambda k, v, s: self.remember(k, v, source=s),
+                graph_hops=self._governor.profile.graph_hops,
+                source_chunk_id=chunk_ids[0] if chunk_ids else None,
             )
             if stored and job.payload.get("chunk_ids"):
                 with self._write_lock:
@@ -444,6 +447,17 @@ class Elastimem:
         except Exception:
             log.exception("elastimem: recall failed")
             return []
+
+    def explain(self, query: str, k: int = 5) -> "retrieval.ExplainResult":
+        """Retrieval transparency: same ranking as ``recall()``, but keeps
+        every per-leg score (FTS, vector, graph, importance, recency) and
+        the graph traversal path instead of collapsing them into a final
+        number. For debugging retrieval quality, not the per-turn hot path
+        — it recomputes rather than reusing ``recall()``'s work. Never
+        raises."""
+        from . import retrieval
+
+        return retrieval.explain(self, query, k=k)
 
     def sessions(self, n: int = 20) -> list[dict]:
         """Recent sessions, newest first."""

@@ -314,4 +314,5 @@ class Governor:
                 Tier.LITE: ConsolidationLevel.OFF,
             }[tier],
             episodic_top_k={Tier.FULL: 4, Tier.STANDARD: 3, Tier.LITE: 0}[tier],
+            graph_hops={Tier.FULL: 2, Tier.STANDARD: 1, Tier.LITE: 0}[tier],
         )

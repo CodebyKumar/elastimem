@@ -19,7 +19,7 @@ import time
 
 log = logging.getLogger("elastimem")
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _PRAGMAS = (
     "PRAGMA journal_mode=WAL",
@@ -107,6 +107,40 @@ CREATE TABLE IF NOT EXISTS quarantine (
 );
 """
 
+_GRAPH_SCHEMA = """
+CREATE TABLE IF NOT EXISTS graph_nodes (
+  id              INTEGER PRIMARY KEY,
+  type            TEXT NOT NULL DEFAULT 'entity',
+  canonical_name  TEXT NOT NULL,
+  aliases         TEXT NOT NULL DEFAULT '[]',
+  created_at      TEXT NOT NULL,
+  updated_at      TEXT NOT NULL,
+  importance      REAL NOT NULL DEFAULT 0.5,
+  confidence      REAL NOT NULL DEFAULT 0.5,
+  mention_count   INTEGER NOT NULL DEFAULT 1
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_graph_nodes_canonical
+  ON graph_nodes(type, canonical_name);
+
+CREATE TABLE IF NOT EXISTS graph_edges (
+  id               INTEGER PRIMARY KEY,
+  source_node      INTEGER NOT NULL REFERENCES graph_nodes(id) ON DELETE CASCADE,
+  target_node      INTEGER NOT NULL REFERENCES graph_nodes(id) ON DELETE CASCADE,
+  relationship     TEXT NOT NULL,
+  confidence       REAL NOT NULL DEFAULT 0.5,
+  importance       REAL NOT NULL DEFAULT 0.5,
+  weight           REAL NOT NULL DEFAULT 1.0,
+  created_at       TEXT NOT NULL,
+  last_seen        TEXT NOT NULL,
+  seen_count       INTEGER NOT NULL DEFAULT 1,
+  source_chunk_id  INTEGER REFERENCES chunks(id) ON DELETE SET NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_graph_edges_dedup
+  ON graph_edges(source_node, target_node, relationship);
+CREATE INDEX IF NOT EXISTS idx_graph_edges_source ON graph_edges(source_node);
+CREATE INDEX IF NOT EXISTS idx_graph_edges_target ON graph_edges(target_node);
+"""
+
 _FTS_SCHEMA = """
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
   text, content='chunks', content_rowid='id', tokenize='porter unicode61');
@@ -180,6 +214,7 @@ def open_store(path: str) -> tuple[sqlite3.Connection, bool]:
     fts = _fts5_available(conn)
     with conn:
         conn.executescript(_SCHEMA)
+        conn.executescript(_GRAPH_SCHEMA)
         if fts:
             conn.executescript(_FTS_SCHEMA)
         _migrate(conn)
@@ -201,7 +236,14 @@ def _migrate(conn: sqlite3.Connection) -> None:
             f"store schema v{current} is newer than this elastimem (v{SCHEMA_VERSION}); "
             "upgrade the elastimem package"
         )
-    # future: stepwise `if current < 2: ...` blocks, then bump the meta row.
+    if current < 2:
+        conn.executescript(_GRAPH_SCHEMA)
+        current = 2
+    if current != int(row["value"]):
+        conn.execute(
+            "UPDATE meta SET value=? WHERE key='schema_version'", (str(current),)
+        )
+    # future: stepwise `if current < 3: ...` blocks, then bump the meta row.
 
 
 def utcnow() -> str:

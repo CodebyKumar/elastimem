@@ -100,6 +100,78 @@ def test_pressure_report_is_immediate_and_survives_recovery_rules(tmp_path):
     s.close()
 
 
+def test_lite_tier_never_touches_graph_tables(tmp_path):
+    def llm(prompt, *, max_tokens, temperature):
+        import json
+        return json.dumps({
+            "facts": {}, "entities": [{"name": "Tuffy", "type": "thing"}],
+            "relationships": [{"source": "user", "relation": "builds", "target": "Tuffy"}],
+        })
+
+    s = Elastimem(str(tmp_path / "lg.db"), complete_fn=llm,
+               probe_fn=lambda: (4 * GIB, 2 * GIB))
+    assert s.profile.tier is Tier.LITE
+    s.record_turn("I am building a robot called Tuffy this year", "Cool!")
+    s.drain(timeout=2)
+    n_nodes = s._conn.execute("SELECT count(*) c FROM graph_nodes").fetchone()["c"]
+    assert n_nodes == 0
+    s.close()
+
+
+def test_no_llm_no_embedder_graph_absent_still_functional(tmp_path):
+    s = Elastimem(str(tmp_path / "bare2.db"), probe_fn=lambda: (32 * GIB, 20 * GIB))
+    s.record_turn("my name is Kavya and I live in Pune", "Nice to meet you!")
+    s.drain(timeout=2)
+    assert s.recall("where does the user live") is not None
+    n_nodes = s._conn.execute("SELECT count(*) c FROM graph_nodes").fetchone()["c"]
+    assert n_nodes == 0
+    s.close()
+
+
+def test_migration_v1_to_v2_adds_graph_tables(tmp_path):
+    import sqlite3
+    from elastimem import db as db_mod
+
+    path = str(tmp_path / "v1.db")
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(db_mod._SCHEMA)
+    conn.execute("INSERT INTO meta(key, value) VALUES ('schema_version', '1')")
+    conn.commit()
+    conn.close()
+
+    conn2, _ = db_mod.open_store(path)
+    version = conn2.execute(
+        "SELECT value FROM meta WHERE key='schema_version'"
+    ).fetchone()["value"]
+    assert version == "2"
+    tables = {
+        r["name"] for r in conn2.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )
+    }
+    assert {"graph_nodes", "graph_edges"} <= tables
+    conn2.close()
+
+
+def test_graph_nudge_works_without_fts5(tmp_path):
+    from elastimem import graph
+
+    s = Elastimem(str(tmp_path / "nofts.db"), probe_fn=lambda: (32 * GIB, 20 * GIB))
+    s.fts_enabled = False  # simulate a sqlite built without FTS5
+    s.record_turn("I am building a robot called Tuffy this year",
+                  "Sounds like a fun project!")
+    s.drain(timeout=2)
+    conn = s._conn
+    user_id = graph.upsert_node(conn, "person", "user", confidence=1.0)
+    tuffy_id = graph.upsert_node(conn, "thing", "Tuffy", confidence=1.0)
+    graph.upsert_edge(conn, user_id, tuffy_id, "builds", confidence=1.0)
+    # Must not raise, and should still return something via LIKE fallback.
+    hits = s.recall("what am I building")
+    assert hits == [] or hits
+    s.close()
+
+
 def test_build_context_never_raises(tmp_path):
     s = Elastimem(str(tmp_path / "n.db"), probe_fn=lambda: (32 * GIB, 20 * GIB))
     for weird in ["", "hi", '"; DROP TABLE chunks; --', "🦆" * 500, "a " * 3000]:

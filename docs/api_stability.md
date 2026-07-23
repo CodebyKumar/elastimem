@@ -68,9 +68,21 @@ callable.
 
 ## Experimental
 
-None yet. Future additions the team wants public feedback on before
-committing to stability will be exposed under `elastimem.experimental` and
-may change or disappear at any time, including in patch releases.
+| method | purpose |
+|---|---|
+| `explain(query, k=5)` | retrieval transparency — per-leg score breakdown and graph traversal path behind a `recall()`-equivalent search |
+
+`explain()`'s return type (`ExplainResult` and its nested
+`ChunkScoreBreakdown`/`FactScoreBreakdown`/`GraphTraversalStep`
+dataclasses, all in `elastimem.retrieval`) is new and may still change
+shape — field names, added/removed signals — as real usage surfaces what's
+actually useful to expose. The method itself (never raises, mirrors
+`recall()`'s ranking) is expected to stay stable; the breakdown's internal
+shape is what's still settling.
+
+Future additions the team wants public feedback on before committing to
+stability will be exposed under `elastimem.experimental` and may change or
+disappear at any time, including in patch releases.
 
 ## Internal
 

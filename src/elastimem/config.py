@@ -75,6 +75,7 @@ class MemoryProfile:
     consolidation_level: ConsolidationLevel
     episodic_top_k: int
     window_min_turns: int = 2
+    graph_hops: int = 0
 
 
 # Default allowlist of keys that belong to the stable user profile (always
@@ -180,6 +181,16 @@ class ElastimemConfig:
     # --- background worker -------------------------------------------------
     worker_max_tokens: int = 96      # cap on every background LLM call
     batched_every_n_turns: int = 3
+
+    # --- knowledge graph -----------------------------------------------------
+    # Row-count ceilings for graph_nodes/graph_edges. Write-time dedup (a
+    # unique index on canonical entity/relationship identity) already stops
+    # repeated mentions from creating new rows; these caps bound growth from
+    # genuinely distinct low-value entities, evicting the least
+    # important/least recently seen rows on overflow — same trim-on-write
+    # pattern as quarantine_cap.
+    graph_node_cap: int = 2000
+    graph_edge_cap: int = 5000
 
     def __post_init__(self) -> None:
         if self.context_tokens < 1024:

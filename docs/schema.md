@@ -71,6 +71,43 @@ Rejected automatic extractions: `ts, key, value, reason, source`. Capped at
 `quarantine_cap` (200). Never injected into prompts; exists so extractor
 misbehavior is inspectable.
 
+### `graph_nodes` — embedded semantic knowledge graph (entities)
+Extracted alongside facts by the same LLM completion (`extraction.py`),
+gated by `MemoryProfile.graph_hops` (LITE=0, STANDARD=1, FULL=2 — see
+`governor.py`). One more retrieval signal inside the existing hybrid
+pipeline, not a separate store.
+
+| column | notes |
+|---|---|
+| `type` | `person \| place \| org \| thing \| entity` |
+| `canonical_name` | normalized (lowercased, whitespace-collapsed, leading article stripped) identity — see `graph._canonicalize` |
+| `aliases` | JSON array of raw surface forms seen, capped at 8 |
+| `importance`, `confidence` | `confidence` is a running average across re-extractions, used to weight the graph retrieval nudge |
+| `mention_count` | bumped on every re-extraction of the same entity |
+
+Unique index `(type, canonical_name)` — write-time dedup; repeated
+mentions update the existing row (`ON CONFLICT DO UPDATE`) instead of
+inserting a new one. Rows beyond `graph_node_cap` (default 2000) are
+trimmed by lowest `(importance, mention_count, updated_at)`.
+
+### `graph_edges` — embedded semantic knowledge graph (relationships)
+| column | notes |
+|---|---|
+| `source_node`, `target_node → graph_nodes` | `ON DELETE CASCADE`; directed, but traversed bidirectionally at retrieval time (`graph.expand`) |
+| `relationship` | short snake_case label, e.g. `works_at`, `builds`, `runs_on` |
+| `confidence`, `importance`, `weight` | `confidence` is a running average, same pattern as nodes |
+| `seen_count`, `last_seen` | bumped on repeated extraction of the same relationship |
+| `source_chunk_id → chunks` | nullable; the chunk that produced this edge (reserved for a future `explain()` API, unused by Phase 1 retrieval logic) |
+
+Unique index `(source_node, target_node, relationship)` — write-time
+dedup, same pattern as nodes. Rows beyond `graph_edge_cap` (default 5000)
+are trimmed by lowest `(importance, seen_count, last_seen)`.
+
+Traversal is a `WITH RECURSIVE` CTE bounded by the governor's hop count —
+no graph library, no separate index. Query-time entity detection
+(`graph.detect_seed_nodes`) is a plain substring scan over
+`canonical_name`/`aliases`, no NER call.
+
 ## Size expectations
 
 384-dim float32 vector = 1.5 KB/chunk → 10k chunks ≈ 15 MB of vectors.

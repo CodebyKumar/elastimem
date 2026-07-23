@@ -129,6 +129,7 @@ also raise the bar for local retrieval, and vice versa.
 | LLM fact extraction | background, per turn | batched every 3 turns | off |
 | Rolling summary | LLM | LLM | marker line |
 | Consolidation | full (incl. LLM merge), idle + exit | dedupe + decay, exit | off |
+| Knowledge graph (`graph_hops`) | 2-hop expansion | 1-hop expansion | **off — no graph writes or reads at all** |
 | Rule capture | always | always | always |
 | Transcript persistence | always | always | always |
 | `remember` / `recall` / `forget` | always | always | always |
@@ -221,6 +222,59 @@ spellings), the store activates its own built-in embedder
   is genuinely ambiguous with "the host simply didn't pass this optional
   parameter," which is exactly the case the auto-activation is designed
   for. `disable_builtin_embedder=True` is the unambiguous opt-out.
+
+## Knowledge graph
+
+Entities and relationships are extracted alongside facts by the same
+per-turn LLM completion (`extraction.py`) — never a second model call —
+and stored as plain tables in the same SQLite file (`graph_nodes`,
+`graph_edges`; see [schema.md](schema.md)). The graph is one more
+retrieval signal, not a separate store or a separate retrieval path:
+`recall()` still returns FTS5/vector hits exactly as before, with a small
+score nudge when a hit's chunk or fact also mentions an entity reachable
+from the query via the graph.
+
+`graph_hops` (LITE=0, STANDARD=1, FULL=2, from the table above) bounds a
+`WITH RECURSIVE` SQL traversal — no graph library. At LITE, `graph_hops`
+is 0 and the graph leg is never even queried: no seed-entity detection, no
+traversal, no writes to `graph_nodes`/`graph_edges` during extraction
+either (see `extraction.extract_facts`'s `graph_hops` gate). This mirrors
+the embedder row above — an entire capability compiled out at the
+resource-constrained tier, not just quietly weakened.
+
+The nudge is deliberately small and self-relative rather than a fixed
+constant: it can never exceed 15% of a query's own top FTS/vector
+relevance score, and each matched entity's contribution is weighted by
+that entity's own extraction-time confidence (a running average across
+repeated extractions) and match specificity. In practice this means the
+graph can break a near-tie or surface an associatively-connected memory
+that shares no vocabulary with a chunk that *does* share vocabulary with
+the query — but it can never manufacture a hit out of a query with zero
+FTS/vector relevance to begin with. A query with no keyword or semantic
+overlap with anything in the store returns nothing, same as before the
+graph existed.
+
+### `explain(query, k=5) -> ExplainResult`
+
+Retrieval transparency: runs the same ranking `recall()` does, but returns
+every per-leg score instead of collapsing them into one number —
+`ChunkScoreBreakdown`/`FactScoreBreakdown` (FTS, vector, fused relevance,
+importance/recency/graph nudges, matched entity names) plus
+`graph_traversal` (the hop path — which entities were detected in the
+query, which were reached and at what distance). Intended for debugging
+retrieval quality and building "why was this retrieved" views, not the
+per-turn hot path: it recomputes rather than reusing `recall()`'s work.
+Never raises; a failed leg (e.g. a corrupted graph table) degrades that
+one leg to empty, same as every other retrieval failure mode in this
+module.
+
+```python
+result = mem.explain("what do I know about my Jetson")
+for step in result.graph_traversal:
+    print(step.canonical_name, step.hop_distance, step.is_seed)
+for b in result.chunk_breakdowns:
+    print(b.total, "fts=", b.fts, "vector=", b.vector, "graph=", b.graph_nudge)
+```
 
 ## Degradation matrix
 

@@ -24,14 +24,23 @@ log = logging.getLogger("elastimem")
 CompleteFn = Callable[..., str]
 
 _EXTRACT_PROMPT = (
-    "You extract durable facts ABOUT THE USER ONLY from one chat exchange — "
+    "You extract information ABOUT THE USER ONLY from one chat exchange — "
     "never facts about the assistant itself, and never the exchange itself. "
-    "Valid: the user's name, preferences, location, occupation, interests, "
-    "plans, corrections about THEMSELVES. Invalid: keys like 'user_message' "
-    "or 'assistant_reply' — copying what either side said is not a fact. "
-    "Output ONLY a flat JSON object of snake_case keys to short string "
-    'values, e.g. {"favorite_color": "blue"}. If there is no durable fact, '
-    "output exactly NONE."
+    "Output ONLY a JSON object with three keys:\n"
+    '"facts": a flat object of snake_case keys to short string values, e.g. '
+    '{"favorite_color": "blue"}. Valid: the user\'s name, preferences, '
+    "location, occupation, interests, plans, corrections about THEMSELVES. "
+    "Invalid: keys like 'user_message' or 'assistant_reply' — copying what "
+    "either side said is not a fact.\n"
+    '"entities": a list of {"name": str, "type": str} for notable people, '
+    'places, organizations, or things mentioned. type is one of "person", '
+    '"place", "org", "thing". Omit the user themself.\n'
+    '"relationships": a list of {"source": str, "relation": str, "target": '
+    'str} short snake_case relations between two entities or between the '
+    'user and an entity (use "user" for the user), e.g. {"source": "user", '
+    '"relation": "works_at", "target": "Acme Corp"}.\n'
+    "Use an empty object/list for any key with nothing to report. If there "
+    "is nothing at all to extract, output exactly NONE."
 )
 
 _ROLLING_PROMPT = (
@@ -64,6 +73,21 @@ def _call(complete_fn: CompleteFn, system: str, user: str, max_tokens: int) -> s
         return ""
 
 
+def _store_facts_from_payload(
+    facts_payload: object, store_fn: Callable[[str, str, str], tuple[bool, str]]
+) -> dict[str, str]:
+    if not isinstance(facts_payload, dict):
+        return {}
+    stored: dict[str, str] = {}
+    for key, value in facts_payload.items():
+        if not isinstance(value, (str, int, float)):
+            continue
+        changed, _ = store_fn(str(key), str(value), "auto")
+        if changed:
+            stored[str(key)] = str(value)
+    return stored
+
+
 def extract_facts(
     conn: sqlite3.Connection,
     config: ElastimemConfig,
@@ -71,8 +95,17 @@ def extract_facts(
     user_text: str,
     assistant_text: str,
     store_fn: Callable[[str, str, str], tuple[bool, str]],
+    graph_hops: int = 0,
+    source_chunk_id: int | None = None,
 ) -> dict[str, str]:
-    """Reflection pass over one exchange; validated stores via ``store_fn``."""
+    """Reflection pass over one exchange; validated stores via ``store_fn``.
+
+    One completion call produces both facts and (when ``graph_hops`` > 0,
+    i.e. the governor's tier permits graph retrieval) entities/relationships
+    for the knowledge graph — never a second model call per turn. Graph
+    storage failures are caught and logged, never allowed to affect fact
+    extraction's own result.
+    """
     text = _call(
         complete_fn,
         _EXTRACT_PROMPT,
@@ -85,18 +118,29 @@ def extract_facts(
     if not match:
         return {}
     try:
-        candidates = json.loads(match.group(0))
+        payload = json.loads(match.group(0))
     except json.JSONDecodeError:
         return {}
-    if not isinstance(candidates, dict):
+    if not isinstance(payload, dict):
         return {}
-    stored: dict[str, str] = {}
-    for key, value in candidates.items():
-        if not isinstance(value, (str, int, float)):
-            continue
-        changed, _ = store_fn(str(key), str(value), "auto")
-        if changed:
-            stored[str(key)] = str(value)
+
+    # Backward compat: a model that ignores the new prompt shape and
+    # returns the old flat {key: value} JSON (no "facts" wrapper) is
+    # treated as if the whole payload were the facts dict.
+    stored = _store_facts_from_payload(payload.get("facts", payload), store_fn)
+
+    if graph_hops > 0:
+        try:
+            from . import graph as graph_mod
+
+            graph_mod.store_extraction(
+                conn, payload.get("entities"), payload.get("relationships"),
+                node_cap=config.graph_node_cap, edge_cap=config.graph_edge_cap,
+                source_chunk_id=source_chunk_id,
+            )
+        except Exception:
+            log.exception("elastimem: graph extraction storage failed")
+
     return stored
 
 

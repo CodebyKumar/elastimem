@@ -109,8 +109,81 @@ def fact_relevance(
 
 
 # --------------------------------------------------------------------------- #
+# knowledge graph
+# --------------------------------------------------------------------------- #
+def graph_relevance(
+    store: "Elastimem", query: str, *, hops: int
+) -> tuple[dict[int, float], set[str]]:
+    """(chunk_id -> weighted graph-match strength in [0,1], expanded entity
+    canonical_names). Empty when ``hops`` is 0 (LITE tier) or the graph has
+    no match for this query. Never raises.
+
+    Each expanded entity's contribution is weighted by the node's own
+    extraction-time confidence (a running average built up across repeated
+    extractions — see graph.upsert_node) scaled by match specificity (a
+    longer canonical-name/alias match is stronger evidence than a short
+    one). This keeps a one-off, low-confidence, short entity match (e.g. an
+    entity literally named "May" colliding with the month) from carrying
+    the same weight as a well-corroborated, specific one — weight is
+    self-relative, normalized against the strongest match in this query's
+    own expanded set, mirroring how fact_relevance() normalizes its own
+    RRF scores to the query's top match.
+    """
+    if hops <= 0:
+        return {}, set()
+    conn = store._conn
+    try:
+        from . import graph as graph_mod
+
+        seeds = graph_mod.detect_seed_nodes(conn, query)
+        if not seeds:
+            return {}, set()
+        expanded_ids = graph_mod.expand(conn, [s[0] for s in seeds], hops)
+        rows = graph_mod.nodes_for_ids(conn, expanded_ids)
+        if not rows:
+            return {}, set()
+
+        raw = {
+            r["canonical_name"]: r["confidence"] * min(1.0, len(r["canonical_name"]) / 12)
+            for r in rows
+        }
+        top = max(raw.values()) or 1.0
+        weights = {name: w / top for name, w in raw.items()}
+        names = set(weights)
+
+        scored: dict[int, float] = {}
+        for name, weight in weights.items():
+            for row in conn.execute(
+                "SELECT id FROM chunks WHERE lower(text) LIKE ? LIMIT 50",
+                (f"%{name}%",),
+            ):
+                scored[row["id"]] = max(scored.get(row["id"], 0.0), weight)
+        return scored, names
+    except Exception:
+        log.exception("elastimem: graph relevance failed")
+        return {}, set()
+
+
+# --------------------------------------------------------------------------- #
 # episodic chunks
 # --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class ChunkScoreBreakdown:
+    """Per-chunk score components behind one ``search_chunks`` hit — the
+    same numbers that produce ``Hit.score``, kept separate so
+    :func:`explain` can show its work instead of just a final number."""
+
+    chunk_id: int
+    fts: float
+    vector: float
+    fused_relevance: float
+    importance_nudge: float
+    recency_nudge: float
+    graph_nudge: float
+    graph_matched_names: tuple[str, ...]
+    total: float
+
+
 @dataclass(frozen=True)
 class Hit:
     """One retrieval result, ready to render."""
@@ -129,6 +202,28 @@ def search_chunks(
     exclude_session: int | None = None,
 ) -> list[Hit]:
     """Hybrid search over episodic chunks. FTS5 + vectors when available.
+    Thin wrapper over :func:`_search_chunks_scored` — see its docstring for
+    the fusion/nudge model. This function only exists to keep the public
+    ``Hit`` shape unchanged for existing callers; :func:`explain` uses the
+    scored variant directly to show its work.
+    """
+    return [
+        breakdown_hit[1]
+        for breakdown_hit in _search_chunks_scored(
+            store, query, k=k, exclude_session=exclude_session
+        )
+    ]
+
+
+def _search_chunks_scored(
+    store: "Elastimem",
+    query: str,
+    k: int = 8,
+    exclude_session: int | None = None,
+) -> list[tuple[ChunkScoreBreakdown, "Hit"]]:
+    """Same result as ``search_chunks``, paired with the score breakdown
+    that produced each hit. Hybrid search over episodic chunks. FTS5 +
+    vectors when available.
 
     The two legs are fused differently from a textbook RRF because BM25
     rank and cosine similarity carry very different amounts of information:
@@ -196,6 +291,16 @@ def search_chunks(
     if not fused:
         return []
 
+    # Graph leg: a chunk mentioning an entity reachable from the query is
+    # corroborating evidence, not independent relevance evidence of the
+    # same strength as FTS/vector — so it's an additive nudge like
+    # importance/recency below, not a fourth `max()` leg. The nudge ceiling
+    # is a fraction of THIS query's own top fused relevance (not a fixed
+    # constant), so a graph match can break a near-tie but can never
+    # manufacture a top result out of an otherwise weak query.
+    graph_scores, graph_names = graph_relevance(store, query, hops=store.profile.graph_hops)
+    graph_cap = 0.15 * max(fused.values(), default=0.0)
+
     # importance/recency are intentionally gentle secondary factors: each
     # leg's contribution to `fused` is already normalized to its own 0-1
     # scale (RRF-vs-RRF-max for the FTS leg, cosine-vs-cosine-max for the
@@ -209,7 +314,7 @@ def search_chunks(
         list(fused),
     ).fetchall()
 
-    hits = []
+    scored: list[tuple[ChunkScoreBreakdown, Hit]] = []
     for row in rows:
         if exclude_session is not None and row["session_id"] == exclude_session:
             continue
@@ -231,24 +336,46 @@ def search_chunks(
         # one). Both are scaled to a small additive nudge instead.
         importance_nudge = (row["importance"] - 0.5) * 0.15   # +/- 0.045 max
         recency_nudge = recency * 0.1                          # 0 to +0.1
-        hits.append(
+        chunk_graph_score = graph_scores.get(row["id"], 0.0)
+        graph_nudge = graph_cap * chunk_graph_score
+        total = relevance + importance_nudge + recency_nudge + graph_nudge
+        matched_names = tuple(
+            n for n in graph_names if n in row["text"].lower()
+        ) if chunk_graph_score > 0 else ()
+        breakdown = ChunkScoreBreakdown(
+            chunk_id=row["id"],
+            fts=fts_scores.get(row["id"], 0.0) / _rrf(0),
+            vector=vec_scores.get(row["id"], 0.0),
+            fused_relevance=relevance,
+            importance_nudge=importance_nudge,
+            recency_nudge=recency_nudge,
+            graph_nudge=graph_nudge,
+            graph_matched_names=matched_names,
+            total=total,
+        )
+        scored.append((
+            breakdown,
             Hit(
                 kind="chunk",
                 text=row["text"],
                 date=row["created_at"][:10],
-                score=relevance + importance_nudge + recency_nudge,
+                score=total,
                 session_id=row["session_id"],
-            )
-        )
-    hits.sort(key=lambda h: h.score, reverse=True)
-    return hits[:k]
+            ),
+        ))
+    scored.sort(key=lambda pair: pair[1].score, reverse=True)
+    return scored[:k]
 
 
 def search_all(store: "Elastimem", query: str, k: int = 5) -> list[Hit]:
     """Chunks + facts combined — backs ``Elastimem.recall()`` and search tools."""
     hits = search_chunks(store, query, k=k)
     conn = store._conn
-    for fact_id, rel in fact_relevance(conn, query, fts=store.fts_enabled).items():
+    fact_scores = fact_relevance(conn, query, fts=store.fts_enabled)
+    top_fact_relevance = max(fact_scores.values(), default=0.0)
+    fact_graph_cap = 0.15 * top_fact_relevance
+    _, graph_names = graph_relevance(store, query, hops=store.profile.graph_hops)
+    for fact_id, rel in fact_scores.items():
         row = conn.execute(
             "SELECT key, value, importance, valid_from FROM facts WHERE id=?",
             (fact_id,),
@@ -258,13 +385,153 @@ def search_all(store: "Elastimem", query: str, k: int = 5) -> list[Hit]:
         recency = math.exp(
             -_days_since(row["valid_from"]) / store.config.fact_recency_half_life_days
         )
+        # Additive on top of the (pre-existing, unchanged) multiplicative
+        # rel*importance*recency fact score — deliberately not folded into
+        # the multiplication, consistent with the "nudge not multiplier"
+        # convention for this new signal specifically.
+        graph_nudge = fact_graph_cap if any(
+            n in row["value"].lower() for n in graph_names
+        ) else 0.0
         hits.append(
             Hit(kind="fact", text=f"{row['key']}: {row['value']}",
                 date=row["valid_from"][:10],
-                score=rel * row["importance"] * recency)
+                score=rel * row["importance"] * recency + graph_nudge)
         )
     hits.sort(key=lambda h: h.score, reverse=True)
     return hits[:k]
+
+
+# --------------------------------------------------------------------------- #
+# explain — retrieval transparency
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class FactScoreBreakdown:
+    """Per-fact score components, the fact-side analogue of
+    :class:`ChunkScoreBreakdown`."""
+
+    fact_id: int
+    relevance: float
+    importance: float
+    recency_nudge: float
+    graph_nudge: float
+    graph_matched_names: tuple[str, ...]
+    total: float
+
+
+@dataclass(frozen=True)
+class GraphTraversalStep:
+    """One node reached during query-time graph expansion."""
+
+    canonical_name: str
+    hop_distance: int
+    is_seed: bool
+
+
+@dataclass(frozen=True)
+class ExplainResult:
+    """Full retrieval breakdown for one query — what :func:`explain`
+    returns. Mirrors ``search_all``'s hits (chunks + facts, same ranking)
+    but keeps every signal that produced each score, plus the graph
+    traversal that ran underneath it. Never raises to the caller; a
+    failure in any one leg degrades that leg to empty, same as the rest of
+    this module.
+    """
+
+    query: str
+    graph_hops: int
+    chunk_breakdowns: tuple[ChunkScoreBreakdown, ...]
+    fact_breakdowns: tuple[FactScoreBreakdown, ...]
+    graph_traversal: tuple[GraphTraversalStep, ...]
+    hits: tuple["Hit", ...]   # chunks + facts, ranked — same ordering as search_all
+
+
+def explain(store: "Elastimem", query: str, k: int = 5) -> ExplainResult:
+    """Retrieval transparency: run the same search ``recall()`` runs, but
+    keep every per-leg score and the graph traversal path instead of
+    collapsing them into a final number. Intended for debugging retrieval
+    quality and building user-facing "why was this retrieved" views — not
+    on the hot path of every turn, so it recomputes rather than caching
+    anything ``recall()`` already computed. Never raises.
+    """
+    try:
+        conn = store._conn
+        hops = store.profile.graph_hops
+
+        chunk_scored = _search_chunks_scored(store, query, k=k)
+        chunk_breakdowns = tuple(breakdown for breakdown, _ in chunk_scored)
+
+        fact_scores = fact_relevance(conn, query, fts=store.fts_enabled)
+        top_fact_relevance = max(fact_scores.values(), default=0.0)
+        fact_graph_cap = 0.15 * top_fact_relevance
+        _, graph_names = graph_relevance(store, query, hops=hops)
+
+        fact_breakdowns: list[FactScoreBreakdown] = []
+        fact_hits: list[Hit] = []
+        for fact_id, rel in fact_scores.items():
+            row = conn.execute(
+                "SELECT key, value, importance, valid_from FROM facts WHERE id=?",
+                (fact_id,),
+            ).fetchone()
+            if row is None:
+                continue
+            recency = math.exp(
+                -_days_since(row["valid_from"]) / store.config.fact_recency_half_life_days
+            )
+            matched_names = tuple(
+                n for n in graph_names if n in row["value"].lower()
+            )
+            graph_nudge = fact_graph_cap if matched_names else 0.0
+            total = rel * row["importance"] * recency + graph_nudge
+            fact_breakdowns.append(FactScoreBreakdown(
+                fact_id=fact_id, relevance=rel, importance=row["importance"],
+                recency_nudge=recency, graph_nudge=graph_nudge,
+                graph_matched_names=matched_names, total=total,
+            ))
+            fact_hits.append(Hit(
+                kind="fact", text=f"{row['key']}: {row['value']}",
+                date=row["valid_from"][:10], score=total,
+            ))
+
+        traversal: tuple[GraphTraversalStep, ...] = ()
+        if hops > 0:
+            try:
+                from . import graph as graph_mod
+
+                seeds = graph_mod.detect_seed_nodes(conn, query)
+                seed_ids = {s[0] for s in seeds}
+                if seed_ids:
+                    reached = graph_mod.expand_with_depth(conn, list(seed_ids), hops)
+                    nodes = {r["id"]: r["canonical_name"] for r in graph_mod.nodes_for_ids(
+                        conn, [nid for nid, _ in reached]
+                    )}
+                    steps = [
+                        GraphTraversalStep(
+                            canonical_name=nodes[nid], hop_distance=depth,
+                            is_seed=nid in seed_ids,
+                        )
+                        for nid, depth in reached if nid in nodes
+                    ]
+                    steps.sort(key=lambda s: (s.hop_distance, s.canonical_name))
+                    traversal = tuple(steps)
+            except Exception:
+                log.exception("elastimem: explain() graph traversal failed")
+
+        chunk_hits = [hit for _, hit in chunk_scored]
+        all_hits = sorted(chunk_hits + fact_hits, key=lambda h: h.score, reverse=True)[:k]
+
+        return ExplainResult(
+            query=query, graph_hops=hops,
+            chunk_breakdowns=chunk_breakdowns,
+            fact_breakdowns=tuple(fact_breakdowns),
+            graph_traversal=traversal,
+            hits=tuple(all_hits),
+        )
+    except Exception:
+        log.exception("elastimem: explain() failed")
+        return ExplainResult(
+            query=query, graph_hops=0, chunk_breakdowns=(), fact_breakdowns=(),
+            graph_traversal=(), hits=(),
+        )
 
 
 def episodic_section(

@@ -145,6 +145,107 @@ def test_importance_does_not_override_relevance(tmp_path):
     s.close()
 
 
+def test_graph_nudge_breaks_tie(tmp_path):
+    """Two chunks share equal FTS relevance to the query via the word
+    "device"; only one also mentions an entity reachable from a
+    query-named seed entity via a graph edge. The graph-connected chunk
+    should win the tie. (The graph leg only ever nudges a real FTS/vector
+    hit — see graph_relevance's docstring — so the query must still share
+    real vocabulary with both candidates; graph alone cannot manufacture a
+    hit out of zero relevance.)"""
+    from elastimem import graph
+    from elastimem.governor import Tier
+
+    s = make_store(tmp_path / "g.db", embed=None, tier_override=Tier.FULL)
+    s.record_turn("Tuffy is a device that needs a new battery pack",
+                  "Got it, noting the battery replacement.")
+    s.record_turn("the thermostat is a device that needs new batteries",
+                  "Sounds like an easy fix.")
+    s.drain(timeout=5)
+
+    conn = s._conn
+    jetson_id = graph.upsert_node(conn, "thing", "Jetson", confidence=1.0)
+    tuffy_id = graph.upsert_node(conn, "thing", "Tuffy", confidence=1.0)
+    graph.upsert_edge(conn, tuffy_id, jetson_id, "runs_on", confidence=1.0)
+
+    hits = s.recall("tell me about the device and my Jetson")
+    assert hits
+    tuffy_hits = [h for h in hits if "Tuffy" in h.text]
+    other_hits = [h for h in hits if "thermostat" in h.text]
+    assert tuffy_hits and other_hits
+    assert tuffy_hits[0].score > other_hits[0].score
+    s.close()
+
+
+def test_graph_hops_zero_matches_graph_absent_ranking(tmp_path):
+    """LITE tier (graph_hops=0): ranking must be identical to a store with
+    no graph data at all — the graph leg must not be reachable."""
+    import pytest
+    from elastimem import graph
+    from elastimem.governor import Tier
+
+    s = make_store(tmp_path / "lite.db", embed=None, tier_override=Tier.LITE)
+    seed(s)
+    conn = s._conn
+    a = graph.upsert_node(conn, "thing", "brake")
+    b = graph.upsert_node(conn, "thing", "car")
+    graph.upsert_edge(conn, a, b, "part_of")
+
+    hits_with_graph = [(h.text, h.score) for h in s.recall("brake pads squealing on my car")]
+
+    s2 = make_store(tmp_path / "lite2.db", embed=None, tier_override=Tier.LITE)
+    seed(s2)
+    hits_without_graph = [(h.text, h.score) for h in s2.recall("brake pads squealing on my car")]
+
+    assert [t for t, _ in hits_with_graph] == [t for t, _ in hits_without_graph]
+    for (_, s1), (_, s2_score) in zip(hits_with_graph, hits_without_graph):
+        assert s1 == pytest.approx(s2_score, abs=1e-4)
+    s.close()
+    s2.close()
+
+
+def test_graph_relevance_empty_graph_returns_empty(tmp_path):
+    from elastimem.retrieval import graph_relevance
+
+    s = make_store(tmp_path / "empty.db", embed=None)
+    scores, names = graph_relevance(s, "anything at all", hops=2)
+    assert scores == {}
+    assert names == set()
+    s.close()
+
+
+def test_graph_relevance_hops_zero_short_circuits(tmp_path):
+    from elastimem import graph
+    from elastimem.retrieval import graph_relevance
+
+    s = make_store(tmp_path / "hz.db", embed=None)
+    graph.upsert_node(s._conn, "thing", "Jetson")
+    scores, names = graph_relevance(s, "tell me about Jetson", hops=0)
+    assert scores == {}
+    assert names == set()
+    s.close()
+
+
+def test_graph_relevance_sql_error_degrades_silently(tmp_path, monkeypatch):
+    from elastimem import graph
+    from elastimem.retrieval import graph_relevance
+
+    s = make_store(tmp_path / "err.db", embed=None)
+    graph.upsert_node(s._conn, "thing", "Jetson")
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("simulated failure")
+
+    monkeypatch.setattr(graph, "detect_seed_nodes", _boom)
+    scores, names = graph_relevance(s, "tell me about Jetson", hops=2)
+    assert scores == {}
+    assert names == set()
+    # recall() itself must still work normally despite the graph leg failing
+    hits = s.recall("tell me about Jetson")
+    assert hits == [] or hits
+    s.close()
+
+
 def test_vector_leg_uses_real_similarity_not_just_rank(tmp_path):
     """Regression test: similar_chunks must return real cosine scores, not
     just an ordering — search_chunks needs the magnitude to tell 'strongly

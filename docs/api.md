@@ -86,6 +86,7 @@ but treat it as informational, not something you set.
 | `fact_history(key) -> list[Fact]`                              | full version chain, oldest first           |
 | `forget(key) -> bool`                                          | tombstone the current version              |
 | `recall(query, k=5) -> list[Hit]`                              | search chunks + facts; never raises        |
+| `explain(query, k=5) -> ExplainResult` *(Experimental)*        | same ranking as `recall`, plus every per-leg score (FTS/vector/graph/importance/recency) and the graph traversal path — see [governor.md](governor.md#knowledge-graph); never raises |
 | `add_lesson(text, tag=None)` / `lessons(n=None)`             | procedural memory                          |
 
 ### Sessions

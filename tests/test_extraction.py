@@ -1,0 +1,147 @@
+"""extraction.extract_facts: combined facts+graph parsing, defensiveness,
+backward compatibility with the pre-graph flat-JSON shape."""
+
+import json
+
+from elastimem import ElastimemConfig
+
+
+def _store_fn(store):
+    return lambda k, v, s: store.remember(k, v, source=s)
+
+
+class _CompleteFn:
+    def __init__(self, response: str):
+        self.response = response
+
+    def __call__(self, prompt, *, max_tokens, temperature):
+        return self.response
+
+
+def test_extract_facts_stores_entities_and_relationships(store):
+    from elastimem import extraction
+
+    payload = {
+        "facts": {"favorite_color": "blue"},
+        "entities": [{"name": "Tuffy", "type": "thing"}],
+        "relationships": [{"source": "user", "relation": "builds", "target": "Tuffy"}],
+    }
+    stored = extraction.extract_facts(
+        store._conn, store._config, _CompleteFn(json.dumps(payload)),
+        "user text", "assistant text", _store_fn(store), graph_hops=2,
+    )
+    assert stored == {"favorite_color": "blue"}
+    row = store._conn.execute("SELECT count(*) c FROM graph_edges").fetchone()
+    assert row["c"] == 1
+
+
+def test_extract_facts_graph_hops_zero_skips_graph_storage(store):
+    from elastimem import extraction
+
+    payload = {
+        "facts": {},
+        "entities": [{"name": "Tuffy", "type": "thing"}],
+        "relationships": [{"source": "user", "relation": "builds", "target": "Tuffy"}],
+    }
+    extraction.extract_facts(
+        store._conn, store._config, _CompleteFn(json.dumps(payload)),
+        "user text", "assistant text", _store_fn(store), graph_hops=0,
+    )
+    row = store._conn.execute("SELECT count(*) c FROM graph_nodes").fetchone()
+    assert row["c"] == 0
+
+
+def test_extract_facts_malformed_entities_list_ignored(store):
+    from elastimem import extraction
+
+    payload = {"facts": {"name": "Alex"}, "entities": "not a list", "relationships": 42}
+    stored = extraction.extract_facts(
+        store._conn, store._config, _CompleteFn(json.dumps(payload)),
+        "user text", "assistant text", _store_fn(store), graph_hops=2,
+    )
+    assert stored == {"name": "Alex"}
+    row = store._conn.execute("SELECT count(*) c FROM graph_nodes").fetchone()
+    assert row["c"] == 0
+
+
+def test_extract_facts_entity_missing_name_skipped(store):
+    from elastimem import extraction
+
+    payload = {"facts": {}, "entities": [{"type": "thing"}], "relationships": []}
+    extraction.extract_facts(
+        store._conn, store._config, _CompleteFn(json.dumps(payload)),
+        "user text", "assistant text", _store_fn(store), graph_hops=2,
+    )
+    row = store._conn.execute("SELECT count(*) c FROM graph_nodes").fetchone()
+    assert row["c"] == 0
+
+
+def test_extract_facts_backward_compat_flat_json(store):
+    from elastimem import extraction
+
+    # Old shape: no "facts"/"entities" wrapper at all.
+    payload = {"favorite_color": "blue", "occupation": "designer"}
+    stored = extraction.extract_facts(
+        store._conn, store._config, _CompleteFn(json.dumps(payload)),
+        "user text", "assistant text", _store_fn(store), graph_hops=2,
+    )
+    assert stored == {"favorite_color": "blue", "occupation": "designer"}
+
+
+def test_extract_facts_none_response_unchanged(store):
+    from elastimem import extraction
+
+    stored = extraction.extract_facts(
+        store._conn, store._config, _CompleteFn("NONE"),
+        "user text", "assistant text", _store_fn(store), graph_hops=2,
+    )
+    assert stored == {}
+
+
+def test_extract_facts_malformed_json_never_raises(store):
+    from elastimem import extraction
+
+    stored = extraction.extract_facts(
+        store._conn, store._config, _CompleteFn("not json at all { garbage"),
+        "user text", "assistant text", _store_fn(store), graph_hops=2,
+    )
+    assert stored == {}
+
+
+def test_extract_facts_graph_storage_failure_does_not_break_facts(store, monkeypatch):
+    from elastimem import extraction, graph
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("simulated graph failure")
+
+    monkeypatch.setattr(graph, "store_extraction", _boom)
+    payload = {
+        "facts": {"favorite_color": "blue"},
+        "entities": [{"name": "Tuffy", "type": "thing"}],
+        "relationships": [],
+    }
+    stored = extraction.extract_facts(
+        store._conn, store._config, _CompleteFn(json.dumps(payload)),
+        "user text", "assistant text", _store_fn(store), graph_hops=2,
+    )
+    assert stored == {"favorite_color": "blue"}
+
+
+def test_extract_facts_source_chunk_id_threaded_through(store):
+    from elastimem import extraction
+
+    store.record_turn("I am building a robot called Tuffy", "Cool!")
+    chunk_id = store._conn.execute("SELECT id FROM chunks LIMIT 1").fetchone()["id"]
+
+    payload = {
+        "facts": {},
+        "entities": [{"name": "Tuffy", "type": "thing"}],
+        "relationships": [{"source": "user", "relation": "builds", "target": "Tuffy"}],
+    }
+    extraction.extract_facts(
+        store._conn, store._config, _CompleteFn(json.dumps(payload)),
+        "user text", "assistant text", _store_fn(store), graph_hops=2,
+        source_chunk_id=chunk_id,
+    )
+    row = store._conn.execute("SELECT source_chunk_id FROM graph_edges").fetchone()
+    assert row["source_chunk_id"] == chunk_id
