@@ -71,6 +71,7 @@ callable.
 | method | purpose |
 |---|---|
 | `explain(query, k=5)` | retrieval transparency — per-leg score breakdown and graph traversal path behind a `recall()`-equivalent search |
+| `timeline(query)` | resolve `query` to a fact key and return its full version history, oldest first |
 
 `explain()`'s return type (`ExplainResult` and its nested
 `ChunkScoreBreakdown`/`FactScoreBreakdown`/`GraphTraversalStep`
@@ -79,6 +80,13 @@ shape — field names, added/removed signals — as real usage surfaces what's
 actually useful to expose. The method itself (never raises, mirrors
 `recall()`'s ranking) is expected to stay stable; the breakdown's internal
 shape is what's still settling.
+
+`timeline()`'s return type (`TimelineResult`, `elastimem.retrieval`) is
+new for the same reason: the underlying storage (`Fact.valid_from`/
+`invalidated_at`/`invalidated_by`) is Stable and has been since Phase 1,
+but the query/resolution layer on top (`resolved_by`'s exact-vs-search
+distinction, specifically) is new enough to want real usage before
+committing to its exact shape.
 
 Future additions the team wants public feedback on before committing to
 stability will be exposed under `elastimem.experimental` and may change or

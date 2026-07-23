@@ -84,6 +84,7 @@ but treat it as informational, not something you set.
 | `remember(key, value, source="explicit") -> (changed, reason)` | validated, synchronous, durable fact write |
 | `facts() -> dict[str, str]`                                    | current facts                              |
 | `fact_history(key) -> list[Fact]`                              | full version chain, oldest first           |
+| `timeline(query) -> TimelineResult` *(Experimental)*           | resolve `query` to a fact key (exact key, or a fact search over free text — "what did I do before AI?") and return its full version history; see [governor.md](governor.md#timeline-query) |
 | `forget(key) -> bool`                                          | tombstone the current version              |
 | `recall(query, k=5) -> list[Hit]`                              | search chunks + facts; never raises        |
 | `explain(query, k=5) -> ExplainResult` *(Experimental)*        | same ranking as `recall`, plus every per-leg score (FTS/vector/graph/importance/recency) and the graph traversal path — see [governor.md](governor.md#knowledge-graph); never raises |

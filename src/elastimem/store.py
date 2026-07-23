@@ -552,6 +552,14 @@ class Elastimem:
         """Every version ever stored for ``key`` — the audit chain."""
         return semantic.fact_history(self._conn, key)
 
+    def timeline(self, query: str) -> "retrieval.TimelineResult":
+        """Resolve ``query`` to a fact key (exact key match, or a fact
+        search over free text — e.g. "what did I do before AI?") and
+        return its full version history, oldest first. Never raises."""
+        from . import retrieval
+
+        return retrieval.timeline(self, query)
+
     def forget(self, key: str) -> bool:
         """Invalidate the current version of ``key`` (non-destructive tombstone)."""
         with self._write_lock:

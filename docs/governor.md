@@ -306,6 +306,45 @@ for b in result.chunk_breakdowns:
     print(b.total, "fts=", b.fts, "vector=", b.vector, "graph=", b.graph_nudge)
 ```
 
+## Timeline query
+
+Facts have always been versioned in full (`facts.valid_from`/
+`invalidated_at`/`invalidated_by` — see [schema.md](schema.md); a fact
+update never overwrites in place, it invalidates the old row and inserts a
+new one, chaining the two). `fact_history(key)` has exposed that chain
+since Phase 1. `timeline(query) -> TimelineResult` is the query layer on
+top: no new storage, just resolving a natural-language question to the
+right key.
+
+Resolution is two-step, cheapest first:
+1. **Exact**: `query` normalized as a key (same normalization
+   `remember()`/`forget()` use) matches a key that has ever been stored —
+   `mem.timeline("occupation")`.
+2. **Search**: falls back to the existing fact search
+   (`retrieval.fact_relevance`, the same FTS5/LIKE search that backs
+   `recall()`) and takes the top-scoring fact's key — handles a free-text
+   question like *"what did I do before AI?"* matching the **value** "AI
+   Engineer" stored under the `occupation` key. No new NER or fuzzy-
+   matching logic; this reuses the fact search that already exists.
+
+```python
+mem.remember("occupation", "Student")
+mem.remember("occupation", "Designer")
+mem.remember("occupation", "AI Engineer")
+
+result = mem.timeline("what did I do before AI")
+# result.key == "occupation", result.resolved_by == "search"
+for fact in result.versions:   # oldest first
+    print(fact.value, fact.valid_from)
+```
+
+An unresolvable query (no exact key, no fact search match) returns
+`TimelineResult(key=None, resolved_by="none", versions=())` rather than
+raising — same never-raises contract as every other retrieval-adjacent
+function in this codebase. `forget(key)` tombstones rather than deletes,
+so a forgotten key's timeline still shows its full history, ending in an
+invalidated (but not erased) final version.
+
 ## Degradation matrix
 
 Every capability has a defined floor. **Nothing in this table raises to the

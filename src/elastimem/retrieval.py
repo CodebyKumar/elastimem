@@ -30,6 +30,7 @@ from .config import MemoryProfile
 from .semantic import _days_since
 
 if TYPE_CHECKING:
+    from . import semantic
     from .store import Elastimem
 
 log = logging.getLogger("elastimem")
@@ -532,6 +533,73 @@ def explain(store: "Elastimem", query: str, k: int = 5) -> ExplainResult:
             query=query, graph_hops=0, chunk_breakdowns=(), fact_breakdowns=(),
             graph_traversal=(), hits=(),
         )
+
+
+# --------------------------------------------------------------------------- #
+# timeline — chronological view of one fact's version chain
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class TimelineResult:
+    """One key's full version chain, oldest first — the answer to "what did
+    I do before X?" style questions. Storage already supports this in full
+    (``facts.valid_from``/``invalidated_at``/``invalidated_by`` — see
+    ``semantic.store_fact``); this is a query/formatting layer on top, not
+    new storage.
+    """
+
+    query: str
+    key: str | None            # resolved key, or None if nothing matched
+    resolved_by: str           # 'exact' | 'search' | 'none'
+    versions: tuple["semantic.Fact", ...]   # oldest first, from fact_history
+
+
+def timeline(store: "Elastimem", query: str) -> TimelineResult:
+    """Resolve ``query`` to a fact key and return its full version history.
+
+    Resolution is two-step, cheapest first:
+    1. **Exact**: ``query`` normalized as a key (``guards.normalize_key``)
+       matches a key that has ever been stored — handles the direct case
+       (``timeline("occupation")``).
+    2. **Search**: falls back to the existing fact search
+       (:func:`fact_relevance`, FTS5/LIKE over key+value text) and takes
+       the top-scoring fact's key — handles a free-text question like
+       "what did I do before AI?" matching the *value* "AI Engineer"
+       stored under the ``occupation`` key, without any new NER/matching
+       logic. No fuzzy matching beyond what FTS5 already does.
+
+    Never raises; an unresolvable query returns an empty timeline with
+    ``resolved_by="none"``.
+    """
+    try:
+        from . import guards, semantic
+
+        conn = store._conn
+        normalized = guards.normalize_key(query)
+        if normalized:
+            exact = semantic.fact_history(conn, normalized)
+            if exact:
+                return TimelineResult(
+                    query=query, key=normalized, resolved_by="exact",
+                    versions=tuple(exact),
+                )
+
+        scores = fact_relevance(conn, query, fts=store.fts_enabled)
+        if scores:
+            best_id = max(scores, key=scores.get)
+            row = conn.execute(
+                "SELECT key FROM facts WHERE id=?", (best_id,)
+            ).fetchone()
+            if row is not None:
+                versions = semantic.fact_history(conn, row["key"])
+                if versions:
+                    return TimelineResult(
+                        query=query, key=row["key"], resolved_by="search",
+                        versions=tuple(versions),
+                    )
+    except Exception:
+        log.exception("elastimem: timeline() failed")
+
+    return TimelineResult(query=query, key=None, resolved_by="none", versions=())
 
 
 def episodic_section(
