@@ -205,31 +205,32 @@ def test_graph_nudge_breaks_tie_for_facts(tmp_path):
     s.close()
 
 
-def test_graph_hops_zero_matches_graph_absent_ranking(tmp_path):
-    """LITE tier (graph_hops=0): ranking must be identical to a store with
-    no graph data at all — the graph leg must not be reachable."""
-    import pytest
+def test_lite_tier_graph_is_one_hop_and_can_nudge(tmp_path):
+    """LITE tier (graph_hops=1): the graph leg is reachable (unlike the old
+    graph_hops=0 floor) and can nudge chunk ranking, same mechanism as
+    STANDARD/FULL — just capped at 1 hop instead of 2."""
     from elastimem import graph
     from elastimem.governor import Tier
 
     s = make_store(tmp_path / "lite.db", embed=None, tier_override=Tier.LITE)
-    seed(s)
+    s.record_turn("Tuffy is a device that needs a new battery pack",
+                  "Got it, noting the battery replacement.")
+    s.record_turn("the thermostat is a device that needs new batteries",
+                  "Sounds like an easy fix.")
+    s.drain(timeout=5)
+
     conn = s._conn
-    a = graph.upsert_node(conn, "thing", "brake")
-    b = graph.upsert_node(conn, "thing", "car")
-    graph.upsert_edge(conn, a, b, "part_of")
+    jetson_id = graph.upsert_node(conn, "thing", "Jetson", confidence=1.0)
+    tuffy_id = graph.upsert_node(conn, "thing", "Tuffy", confidence=1.0)
+    graph.upsert_edge(conn, tuffy_id, jetson_id, "runs_on", confidence=1.0)
 
-    hits_with_graph = [(h.text, h.score) for h in s.recall("brake pads squealing on my car")]
-
-    s2 = make_store(tmp_path / "lite2.db", embed=None, tier_override=Tier.LITE)
-    seed(s2)
-    hits_without_graph = [(h.text, h.score) for h in s2.recall("brake pads squealing on my car")]
-
-    assert [t for t, _ in hits_with_graph] == [t for t, _ in hits_without_graph]
-    for (_, s1), (_, s2_score) in zip(hits_with_graph, hits_without_graph):
-        assert s1 == pytest.approx(s2_score, abs=1e-4)
+    hits = s.recall("tell me about the device and my Jetson")
+    assert hits
+    tuffy_hits = [h for h in hits if "Tuffy" in h.text]
+    other_hits = [h for h in hits if "thermostat" in h.text]
+    assert tuffy_hits and other_hits
+    assert tuffy_hits[0].score > other_hits[0].score
     s.close()
-    s2.close()
 
 
 def test_graph_relevance_empty_graph_returns_empty(tmp_path):

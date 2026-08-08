@@ -111,7 +111,10 @@ def test_graph_context_section_populated_on_full_tier(tmp_path):
     s.close()
 
 
-def test_graph_context_section_empty_at_lite_tier(tmp_path):
+def test_graph_context_section_populated_at_lite_tier(tmp_path):
+    """LITE tier now carries a small nonzero episodic budget (graph_hops=1,
+    up from the old 0), so graph context — carved out of the episodic
+    budget — is reachable here too, just smaller than STANDARD/FULL."""
     from elastimem import graph
 
     s = make_store(tmp_path, avail_gib=1.0)
@@ -122,7 +125,8 @@ def test_graph_context_section_empty_at_lite_tier(tmp_path):
     graph.upsert_edge(conn, t, j, "runs_on")
 
     plan = s.build_context("tell me about my Jetson")
-    assert plan.sections[assembly.SECTION_GRAPH_CONTEXT] == ""
+    graph_text = plan.sections[assembly.SECTION_GRAPH_CONTEXT]
+    assert "jetson" in graph_text
     s.close()
 
 

@@ -180,7 +180,7 @@ class ElastimemConfig:
 
     # --- background worker -------------------------------------------------
     worker_max_tokens: int = 96      # cap on every background LLM call
-    batched_every_n_turns: int = 3
+    batched_every_n_turns: int = 2
 
     # --- knowledge graph -----------------------------------------------------
     # Row-count ceilings for graph_nodes/graph_edges. Write-time dedup (a

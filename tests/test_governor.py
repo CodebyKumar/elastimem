@@ -36,10 +36,10 @@ def test_budgets_derive_from_context():
     assert b.facts > b.sessions  # facts get the largest memory share
 
 
-def test_lite_zeroes_episodic_and_boosts_working():
+def test_lite_shrinks_episodic_and_boosts_working():
     full = gov(32, 20, context_tokens=8192)
     lite = gov(4, 2, context_tokens=8192)
-    assert lite.profile.budgets.episodic == 0
+    assert 0 < lite.profile.budgets.episodic < full.profile.budgets.episodic
     assert lite.profile.budgets.working > full.profile.budgets.working
     assert lite.profile.extraction_cadence is Cadence.OFF
     assert lite.profile.embeddings_enabled is False
@@ -48,7 +48,7 @@ def test_lite_zeroes_episodic_and_boosts_working():
 def test_graph_hops_by_tier():
     assert gov(32, 20).profile.graph_hops == 2      # FULL
     assert gov(8, 4).profile.graph_hops == 1        # STANDARD
-    assert gov(4, 2).profile.graph_hops == 0        # LITE
+    assert gov(4, 2).profile.graph_hops == 1        # LITE
 
 
 def test_immediate_downgrade_and_cautious_upgrade():

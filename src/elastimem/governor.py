@@ -282,13 +282,16 @@ class Governor:
         split = dict(cfg.memory_split)
 
         if tier is Tier.LITE:
-            # No episodic injection, half the session summaries; the freed
-            # tokens go back to the working window (immediacy beats recall
-            # on a starved machine).
-            freed = split.pop("episodic") + split["sessions"] / 2
+            # Episodic injection shrinks to a token sliver (just enough to
+            # hold the single top-1 turn episodic_top_k allows at this tier)
+            # rather than zeroing outright, and session summaries halve; the
+            # freed tokens go back to the working window (immediacy beats
+            # recall on a starved machine).
+            episodic_share = split["episodic"]
+            freed = episodic_share * 0.9 + split["sessions"] / 2
             split["sessions"] /= 2
             working += int(memory_pool * freed)
-            split["episodic"] = 0.0
+            split["episodic"] = episodic_share * 0.1
 
         budgets = Budgets(
             working=working,
@@ -313,6 +316,6 @@ class Governor:
                 Tier.STANDARD: ConsolidationLevel.DEDUPE_ONLY,
                 Tier.LITE: ConsolidationLevel.OFF,
             }[tier],
-            episodic_top_k={Tier.FULL: 4, Tier.STANDARD: 3, Tier.LITE: 0}[tier],
-            graph_hops={Tier.FULL: 2, Tier.STANDARD: 1, Tier.LITE: 0}[tier],
+            episodic_top_k={Tier.FULL: 5, Tier.STANDARD: 4, Tier.LITE: 1}[tier],
+            graph_hops={Tier.FULL: 2, Tier.STANDARD: 1, Tier.LITE: 1}[tier],
         )

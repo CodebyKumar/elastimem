@@ -85,14 +85,19 @@ def test_explain_graph_traversal_shows_hop_path(tmp_path):
     s.close()
 
 
-def test_explain_graph_hops_zero_empty_traversal(tmp_path):
+def test_explain_lite_tier_graph_hops_is_one_hop(tmp_path):
     from elastimem import graph
 
     s = make_store(tmp_path / "hz.db", tier_override=Tier.LITE)
-    graph.upsert_node(s._conn, "thing", "Jetson")
+    jetson_id = graph.upsert_node(s._conn, "thing", "Jetson", confidence=1.0)
+    tuffy_id = graph.upsert_node(s._conn, "thing", "Tuffy", confidence=1.0)
+    graph.upsert_edge(s._conn, tuffy_id, jetson_id, "runs_on", confidence=1.0)
+
     result = s.explain("tell me about my Jetson")
-    assert result.graph_hops == 0
-    assert result.graph_traversal == ()
+    assert result.graph_hops == 1
+    names_by_depth = {step.canonical_name: step.hop_distance for step in result.graph_traversal}
+    assert names_by_depth.get("jetson") == 0
+    assert names_by_depth.get("tuffy") == 1
     s.close()
 
 

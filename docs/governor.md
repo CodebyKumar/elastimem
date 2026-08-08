@@ -65,13 +65,18 @@ memory   = 45% of dynamic, split:
              facts 40% · episodic 30% · sessions 15% · lessons 15%
 ```
 
-LITE additionally zeroes the episodic share and halves sessions, returning
-the freed tokens to the working window — on a starved machine, immediate
-coherence beats recall (which remains available through `recall()`).
+LITE additionally shrinks the episodic share to 10% of what it would
+otherwise get (just enough to hold the single top-1 turn `episodic_top_k`
+allows at this tier, rather than zeroing it outright) and halves sessions,
+returning the rest to the working window — on a starved machine, immediate
+coherence still beats recall in general, but a minimal amount of recent
+context and 1-hop graph reach (see "Capability × tier" below) cost nothing
+extra once the LLM/embedder legs are already off.
 
 Worked example (defaults, `n_ctx=4096`, static prompt 1200 tokens):
 dynamic = 1784 → working ≈ 981, facts ≈ 321, episodic ≈ 240, sessions ≈ 120,
-lessons ≈ 120.
+lessons ≈ 120. At LITE: working ≈ 1258, facts ≈ 321, episodic ≈ 24,
+sessions ≈ 60, lessons ≈ 120.
 
 **The 256-token floor is real and gets hit in practice, not just a
 theoretical edge case.** A small local model (`n_ctx=4096`) whose host has a
@@ -125,33 +130,38 @@ also raise the bar for local retrieval, and vice versa.
 | Capability | FULL | STANDARD | LITE |
 |---|---|---|---|
 | `embedder` called (host-supplied OR built-in — see below) | yes | yes | **never** |
-| Episodic injection (`build_context`) | top 4 | top 3 | none (`recall()` only) |
-| LLM fact extraction | background, per turn | batched every 3 turns | off |
+| Episodic injection (`build_context`) | top 5 | top 4 | top 1 (small token sliver; full history still reachable via `recall()`) |
+| LLM fact extraction | background, per turn | batched every 2 turns | off |
 | Rolling summary | LLM | LLM | marker line |
 | Consolidation | full (incl. LLM merge), idle + exit | dedupe + decay, exit | off |
-| Knowledge graph (`graph_hops`) | 2-hop expansion | 1-hop expansion | **off — no graph writes or reads at all** |
+| Knowledge graph (`graph_hops`) | 2-hop expansion; decay + clustering + LLM dedupe/labeling | 1-hop expansion; decay + clustering | 1-hop expansion; decay + clustering (no LLM-gated steps — those need FULL) |
 | Rule capture | always | always | always |
 | Transcript persistence | always | always | always |
 | `remember` / `recall` / `forget` | always | always | always |
 
 **This table is the single most important thing to internalize about
-Elastimem's tier system: LITE is not a slightly-degraded mode, it is
-"local search + explicit facts only."** No LLM call is ever attempted at
+Elastimem's tier system: LITE's floor is "no LLM call, no embedder call —
+ever," not "least capability possible."** No LLM call is ever attempted at
 LITE — not extraction, not rolling summaries, not consolidation merges —
 and no embedder is ever called either, even if one is configured and
-working. A host running on a RAM-constrained machine (common for local-model
-deployments: the model itself, plus an embedding model, plus the app,
-competing for RAM on an 8GB machine can easily land at LITE even though
-each piece individually would run fine alone) will, correctly and silently,
-get:
+working. But operations that are purely local SQLite (a sliver of episodic
+injection, 1-hop graph traversal, graph decay/clustering) are not gated by
+that guarantee and do run at LITE, unlike the LLM/embedder-backed
+capabilities above them. A host running on a RAM-constrained machine
+(common for local-model deployments: the model itself, plus an embedding
+model, plus the app, competing for RAM on an 8GB machine can easily land at
+LITE even though each piece individually would run fine alone) will,
+correctly and silently, get:
 - Rule-based fact capture only (`rules.py`'s ~10 regexes) — genuinely
   hardcoded, will never learn a new phrasing on its own. See "Known
   limitations" below.
 - FTS5 keyword search only for `recall()`/`memory_search` — no semantic/
   paraphrase matching, regardless of whether the built-in or a host
   embedder is configured.
-- No background summarization — sessions get a title-only floor (first 80
-  chars of the first user message), no LLM-condensed 1-2 sentence summary.
+- No background summarization — sessions fall back to their title-only
+  floor (first 80 chars of the first user message, the same default every
+  tier uses absent an LLM-generated summary) with no LLM-condensed 1-2
+  sentence summary layered on top.
 - No consolidation — contradictory fact updates (e.g. "I live in Austin"
   then weeks later "I live in Denver") are versioned correctly (the old
   value is never lost, see `schema.md`) but never LLM-merged into a single
@@ -234,13 +244,20 @@ retrieval signal, not a separate store or a separate retrieval path:
 score nudge when a hit's chunk or fact also mentions an entity reachable
 from the query via the graph.
 
-`graph_hops` (LITE=0, STANDARD=1, FULL=2, from the table above) bounds a
-`WITH RECURSIVE` SQL traversal — no graph library. At LITE, `graph_hops`
-is 0 and the graph leg is never even queried: no seed-entity detection, no
-traversal, no writes to `graph_nodes`/`graph_edges` during extraction
-either (see `extraction.extract_facts`'s `graph_hops` gate). This mirrors
-the embedder row above — an entire capability compiled out at the
-resource-constrained tier, not just quietly weakened.
+`graph_hops` (LITE=1, STANDARD=1, FULL=2, from the table above) bounds a
+`WITH RECURSIVE` SQL traversal — no graph library. Read/traversal at LITE
+is real: seed-entity detection and the 1-hop expansion both run, the same
+as STANDARD.
+
+**Writes are a separate story.** New nodes/edges are only ever created
+inside `extraction.extract_facts`'s per-turn LLM completion (see its
+`graph_hops` gate) — the same completion that produces facts. That
+completion never runs at LITE (no LLM call, ever), so **LITE traverses
+whatever graph already exists but never grows it.** In practice this means
+a store that has only ever run at LITE has an empty graph and the traversal
+finds nothing; a store that spent time at STANDARD/FULL before dropping to
+LITE (RAM pressure, `report_pressure()`, etc.) keeps querying the graph it
+already built, just without adding to it until the tier recovers.
 
 The nudge is deliberately small and self-relative rather than a fixed
 constant: it can never exceed 15% of a query's own top FTS/vector
@@ -316,11 +333,12 @@ without touching the existing four, their order, or their behavior, and
 without adding a new top-level `Budgets` field (which would touch the
 Stable `memory_split` contract). Its budget is instead a fixed share
 (`assembly.GRAPH_CONTEXT_SHARE`, 25%) carved out of the existing episodic
-budget — which means it inherits episodic's tier gating for free: since
-`budgets.episodic` is already 0 at LITE tier (the same tier `graph_hops`
-is 0), graph context is correctly empty there with no separate gate
-needed. Never raises; degrades to an empty section like every other piece
-of retrieval.
+budget — which means it inherits episodic's tier gating for free, scaling
+down automatically at LITE tier's much smaller episodic allocation without
+a separate gate. It renders empty whenever the graph has nothing to offer
+for the query (including a LITE store whose graph was never populated in
+the first place, see "Knowledge graph" above) — never raises; degrades to
+an empty section like every other piece of retrieval.
 
 ### `explain(query, k=5) -> ExplainResult`
 
