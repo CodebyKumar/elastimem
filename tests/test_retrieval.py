@@ -177,6 +177,34 @@ def test_graph_nudge_breaks_tie(tmp_path):
     s.close()
 
 
+def test_graph_nudge_breaks_tie_for_facts(tmp_path):
+    """Same as test_graph_nudge_breaks_tie, but for facts returned through
+    recall() (search_all's fact leg, retrieval.py's search_all graph_nudge
+    branch) rather than chunks — a separate code path that reuses
+    graph_relevance's expanded names but applies the nudge to fact rows
+    instead of chunk rows."""
+    from elastimem import graph
+    from elastimem.governor import Tier
+
+    s = make_store(tmp_path / "gf.db", embed=None, tier_override=Tier.FULL)
+    s.remember("device_one", "Tuffy is a device that needs a new battery pack")
+    s.remember("device_two", "the thermostat is a device that needs new batteries")
+
+    conn = s._conn
+    jetson_id = graph.upsert_node(conn, "thing", "Jetson", confidence=1.0)
+    tuffy_id = graph.upsert_node(conn, "thing", "Tuffy", confidence=1.0)
+    graph.upsert_edge(conn, tuffy_id, jetson_id, "runs_on", confidence=1.0)
+
+    hits = s.recall("tell me about the device and my Jetson")
+    fact_hits = [h for h in hits if h.kind == "fact"]
+    assert fact_hits
+    tuffy_facts = [h for h in fact_hits if "Tuffy" in h.text]
+    other_facts = [h for h in fact_hits if "thermostat" in h.text]
+    assert tuffy_facts and other_facts
+    assert tuffy_facts[0].score > other_facts[0].score
+    s.close()
+
+
 def test_graph_hops_zero_matches_graph_absent_ranking(tmp_path):
     """LITE tier (graph_hops=0): ranking must be identical to a store with
     no graph data at all — the graph leg must not be reachable."""

@@ -104,6 +104,28 @@ If you don't pass an embedder, Elastimem activates its own small built-in
 one automatically (see [governor.md](governor.md)) — semantic recall works
 out of the box, no setup required.
 
+## The knowledge graph (with an LLM configured)
+
+With `llm=` set, `record_turn` also extracts entities and relationships in
+the same background pass that captures facts — no extra model call, no NER
+library. They connect memories that share no vocabulary:
+
+```python
+mem.record_turn("I'm building a robot called Tuffy that runs on a Jetson",
+                 "Sounds like a fun project!")
+mem.end_session()   # graph maintenance runs here: decay, dedup, clustering
+
+hits = mem.recall("what do I know about my Jetson")   # finds the Tuffy turn too
+
+for cluster in mem.clusters():        # entities auto-grouped into topics
+    print(cluster["label"], cluster["members"])
+```
+
+This is one more retrieval signal, not a separate database — off entirely
+at LITE tier, deeper at FULL. See [governor.md](governor.md#knowledge-graph)
+for the full design, and [api.md](api.md) for `explain()`/`timeline()`, the
+two Experimental query methods built on top of it.
+
 ## Where to go next
 
 - [installation.md](installation.md) — optional extras, supported Python versions

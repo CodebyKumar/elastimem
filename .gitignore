@@ -5,3 +5,7 @@ dist/
 *.egg-info/
 .venv/
 uv.lock
+blog.md
+newwork.md
+.DS_Store
+.coverage

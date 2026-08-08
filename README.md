@@ -137,7 +137,7 @@ graph expansion at FULL tier, 1-hop at STANDARD, off entirely at LITE (zero
 extra queries, zero extra writes). Full design and the reasoning behind it:
 [governor.md's Knowledge graph section](docs/governor.md#knowledge-graph).
 
-## The four memory layers
+## The five memory layers
 
 | Layer                | What it holds                                                  | Where                                       |
 | -------------------- | -------------------------------------------------------------- | ------------------------------------------- |
