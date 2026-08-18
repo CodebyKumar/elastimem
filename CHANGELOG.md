@@ -1,14 +1,76 @@
 # Changelog
 
 All notable changes to Elastimem are documented here. Format loosely follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning follows
-[PEP 440](https://peps.python.org/pep-0440/) pre-release identifiers while
-in alpha (`0.1.0a1`, `0.1.0a2`, ... → `0.1.0b1` → `0.1.0`), then the policy
-in [docs/api_stability.md](docs/api_stability.md): additive changes to the
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/). As of `0.2.0`
+Elastimem is out of pre-release and versioning follows the policy in
+[docs/api_stability.md](docs/api_stability.md): additive changes to the
 Stable surface bump the minor version, breaking changes bump the major
 version.
 
 ## [Unreleased]
+
+## [0.2.0] - 2026-08-18
+
+First non-pre-release version. The alpha marker is dropped: the Stable
+surface (`open`/`remember`/`recall`/`record_turn`/`build_context` — see
+[docs/api_stability.md](docs/api_stability.md)) has settled and now moves
+under the documented versioning policy rather than the alpha ladder.
+
+### Changed
+- **LITE tier is substantially more capable**, without raising its resource
+  floor. The tier previously conflated "this machine is short on RAM" with
+  "turn everything off", including several capabilities that cost nothing
+  but local SQLite work. Each of the following is independent of the
+  others, and none of them adds an LLM call or a model load at LITE:
+  - **Consolidation runs at LITE** (`DEDUPE_ONLY`, was `OFF`). At this
+    level consolidation is entirely local SQLite — fact decay/archival,
+    quarantine trimming, graph decay/archival, cluster recompute — with the
+    LLM merge steps still gated on FULL. Previously a LITE store was the
+    one store that never pruned anything and grew monotonically, and graph
+    maintenance (which lives inside the same sweep) never ran there either,
+    contradicting what `docs/governor.md` already documented.
+  - **Vector recall works at LITE over already-embedded chunks.** The old
+    single `embeddings_enabled` gate covered both indexing new chunks and
+    scoring existing ones; these have very different costs and are now
+    separate. `embeddings_enabled` still governs indexing (the sustained
+    per-chunk cost, still off at LITE); new `vector_recall_enabled` and
+    `embedder_load_allowed` govern the read path. LITE may use an embedder
+    that is already resident — a host-supplied `embed_fn` always is, since
+    it lives in the host's process — but never triggers a first load of
+    the built-in ~130MB model.
+  - **Extractive rolling summaries at LITE** via the new
+    `MemoryProfile.rolling_summary_mode` (`LLM`/`EXTRACTIVE`/`MARKER`).
+    LITE now condenses evicted turns by selecting from text already in the
+    database instead of emitting a bare `[3 earlier turn(s) omitted]`
+    marker. No model call, bounded to the sessions budget so it cannot grow
+    without limit.
+  - **Larger episodic footprint at LITE**: `episodic_top_k` 1 → 3, and the
+    LITE episodic/sessions token shares raised (10% → 45% of normal for
+    episodic, 50% → 75% for sessions). This is a token-split decision, not
+    a resource one; the old split left episodic with single-digit token
+    budgets on a typical 4K-context host.
+- `MemoryProfile.rolling_summary_enabled` is now a derived property rather
+  than a field. It keeps its exact original meaning ("does this cost an LLM
+  call?"), so hosts reading it need no change.
+
+### Added
+- `ElastimemConfig.lite_llm_extraction` (default `False`) — opt in to LLM
+  fact extraction at LITE, deferred to session end (`Cadence.SESSION_END`,
+  previously defined but assigned to no tier). Jobs are held by the worker
+  until the session closes, so they never compete with a live foreground
+  generation. The default preserves LITE's documented floor: no LLM call is
+  ever attempted at LITE unless the host asks for one.
+- `MemoryProfile.vector_recall_enabled`, `MemoryProfile.embedder_load_allowed`,
+  `MemoryProfile.rolling_summary_mode`; `RollingSummaryMode` exported from
+  the package root.
+- `extraction.extractive_rolling_summary()` and
+  `embeddings.embedder_resident()`.
+
+### Fixed
+- `docs/architecture.md` and `docs/schema.md` still documented
+  `graph_hops` as `LITE=0`; it has been 1 since the graph work landed.
+
+### Added (knowledge graph, previously unreleased)
 
 ### Added
 - **Embedded Semantic Knowledge Graph (ESKG)**: entities and relationships
@@ -16,8 +78,8 @@ version.
   (`extraction.py`) — no second model call, no NER library — and stored as
   plain SQLite tables (`graph_nodes`/`graph_edges`) in the same store file.
   Multi-hop expansion is a `WITH RECURSIVE` SQL query, gated by the Memory
-  Governor (`MemoryProfile.graph_hops`: LITE=0, STANDARD=1, FULL=2 — off
-  entirely at LITE, zero extra reads or writes). Folded into `recall()` as
+  Governor (`MemoryProfile.graph_hops`: LITE=1, STANDARD=1, FULL=2).
+  Folded into `recall()` as
   a confidence-weighted, query-relative additive score nudge (never a
   fixed constant, never able to override real FTS/vector relevance) — see
   [docs/governor.md](docs/governor.md#knowledge-graph).
@@ -54,7 +116,7 @@ version.
   `cluster_id`/`cluster_label` columns added in v3). Existing v1/v2 stores
   migrate automatically and losslessly on open.
 
-### Fixed
+### Fixed (knowledge graph, previously unreleased)
 - `":memory:"` stores silently dropped every write made by the background
   worker thread (LLM extraction, embedding, consolidation) — `sqlite3`
   gives each new connection to `":memory:"` its own separate, empty
@@ -132,5 +194,6 @@ from this repository, see [docs/installation.md](docs/installation.md).
   and silently did nothing useful for a `pip install`ed user copying an
   example into their own project.
 
-[Unreleased]: https://github.com/CodebyKumar/elastimem/compare/v0.1.0a1...HEAD
+[Unreleased]: https://github.com/CodebyKumar/elastimem/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/CodebyKumar/elastimem/compare/v0.1.0a1...v0.2.0
 [0.1.0a1]: https://github.com/CodebyKumar/elastimem/tree/v0.1.0a1

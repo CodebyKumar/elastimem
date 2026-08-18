@@ -35,6 +35,7 @@ from .config import (
     ConsolidationLevel,
     ElastimemConfig,
     MemoryProfile,
+    RollingSummaryMode,
     Tier,
 )
 
@@ -51,6 +52,11 @@ _PRESSURE_AVAILABLE = int(1.2 * GIB)   # below this, downgrade immediately
 # additional reports within the window are coalesced into that same
 # downgrade rather than each dropping the tier again.
 _PRESSURE_REPORT_COOLDOWN_SECONDS = 30.0
+
+# Fraction of the normal episodic/sessions token share that LITE keeps (the
+# remainder is handed to the working window). See _build_profile.
+LITE_EPISODIC_SHARE = 0.45
+LITE_SESSIONS_SHARE = 0.75
 
 
 def _tier_thresholds_bytes(cfg: ElastimemConfig) -> dict[Tier, tuple[int, int]]:
@@ -282,16 +288,26 @@ class Governor:
         split = dict(cfg.memory_split)
 
         if tier is Tier.LITE:
-            # Episodic injection shrinks to a token sliver (just enough to
-            # hold the single top-1 turn episodic_top_k allows at this tier)
-            # rather than zeroing outright, and session summaries halve; the
-            # freed tokens go back to the working window (immediacy beats
-            # recall on a starved machine).
+            # Episodic injection and session summaries are trimmed, and the
+            # freed tokens go back to the working window - immediacy still
+            # beats recall on a starved machine. But this is a TOKEN-split
+            # decision, not a resource one: reading a few more rows out of
+            # SQLite costs a starved machine nothing, and the old split
+            # (episodic at 10% of normal, sessions halved) left episodic
+            # with single-digit token budgets on a typical 4K-context host
+            # - not "a small amount of recall" but effectively none, which
+            # is what made LITE feel broken rather than merely reduced.
+            # LITE_EPISODIC_SHARE/LITE_SESSIONS_SHARE keep a real, usable
+            # amount of both while still handing the majority back.
             episodic_share = split["episodic"]
-            freed = episodic_share * 0.9 + split["sessions"] / 2
-            split["sessions"] /= 2
+            sessions_share = split["sessions"]
+            freed = (
+                episodic_share * (1.0 - LITE_EPISODIC_SHARE)
+                + sessions_share * (1.0 - LITE_SESSIONS_SHARE)
+            )
+            split["episodic"] = episodic_share * LITE_EPISODIC_SHARE
+            split["sessions"] = sessions_share * LITE_SESSIONS_SHARE
             working += int(memory_pool * freed)
-            split["episodic"] = episodic_share * 0.1
 
         budgets = Budgets(
             working=working,
@@ -300,22 +316,51 @@ class Governor:
             sessions=int(memory_pool * split["sessions"]),
             lessons=int(memory_pool * split["lessons"]),
         )
+        # LITE only reaches for the LLM when the host explicitly opts in,
+        # and even then only at session end, where nothing competes with a
+        # live foreground generation. Default stays off, so LITE's
+        # "no LLM call, ever" floor holds unless asked otherwise.
+        lite_llm = tier is Tier.LITE and cfg.lite_llm_extraction
+
         return MemoryProfile(
             tier=tier,
             budgets=budgets,
+            # Indexing NEW chunks is the sustained embedding cost; that is
+            # what LITE gives up. Scoring chunks that are already embedded
+            # is a separate decision - see vector_recall_enabled.
             embeddings_enabled=tier is not Tier.LITE,
-            llm_extraction_enabled=tier is not Tier.LITE,
+            llm_extraction_enabled=tier is not Tier.LITE or lite_llm,
             extraction_cadence={
                 Tier.FULL: Cadence.PER_TURN,
                 Tier.STANDARD: Cadence.BATCHED,
-                Tier.LITE: Cadence.OFF,
+                Tier.LITE: Cadence.SESSION_END if lite_llm else Cadence.OFF,
             }[tier],
-            rolling_summary_enabled=tier is not Tier.LITE,
+            rolling_summary_mode={
+                Tier.FULL: RollingSummaryMode.LLM,
+                Tier.STANDARD: RollingSummaryMode.LLM,
+                # Not MARKER: condensing evicted turns extractively is pure
+                # string work over text already in the DB, so a starved
+                # machine can have real content instead of a placeholder.
+                Tier.LITE: RollingSummaryMode.EXTRACTIVE,
+            }[tier],
+            # Every tier may score already-embedded chunks. The RAM cost
+            # sits in loading a model, not in a cosine loop, and that cost
+            # is gated by embedder_load_allowed below.
+            vector_recall_enabled=True,
+            embedder_load_allowed=tier is not Tier.LITE,
             consolidation_level={
                 Tier.FULL: ConsolidationLevel.FULL,
                 Tier.STANDARD: ConsolidationLevel.DEDUPE_ONLY,
-                Tier.LITE: ConsolidationLevel.OFF,
+                # DEDUPE_ONLY, not OFF: at this level consolidation is 100%
+                # local SQLite (fact decay/archival, quarantine trimming,
+                # graph decay/archival, cluster recompute) with the LLM
+                # merge steps gated separately on FULL. Leaving it OFF meant
+                # a LITE store never pruned anything and grew monotonically
+                # - the opposite of what a RAM-starved host wants - and it
+                # also silently disabled graph maintenance, which lives
+                # inside the same sweep.
+                Tier.LITE: ConsolidationLevel.DEDUPE_ONLY,
             }[tier],
-            episodic_top_k={Tier.FULL: 5, Tier.STANDARD: 4, Tier.LITE: 1}[tier],
+            episodic_top_k={Tier.FULL: 5, Tier.STANDARD: 4, Tier.LITE: 3}[tier],
             graph_hops={Tier.FULL: 2, Tier.STANDARD: 1, Tier.LITE: 1}[tier],
         )

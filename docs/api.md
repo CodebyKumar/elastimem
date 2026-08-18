@@ -119,21 +119,35 @@ but treat it as informational, not something you set.
   [governor.md](governor.md#graph-context-in-build_context)),
   `rolling_summary: str | None`, `keep_last_n_turns: int`,
   `profile: MemoryProfile`, `render() -> str`.
-- **`MemoryProfile`** — `tier`, `budgets` (`working/facts/episodic/sessions/ lessons`, tokens), `embeddings_enabled`, `llm_extraction_enabled`,
-  `extraction_cadence`, `rolling_summary_enabled`, `consolidation_level`,
-  `episodic_top_k`, `graph_hops`. Note: `embeddings_enabled` reflects the GOVERNOR's
-  tier-based permission only (`False` at LITE, `True` otherwise) — it does
-  NOT mean an embedder is actually configured and working. Check
+- **`MemoryProfile`** — `tier`, `budgets` (`working/facts/episodic/sessions/ lessons`, tokens), `embeddings_enabled`, `vector_recall_enabled`,
+  `embedder_load_allowed`, `llm_extraction_enabled`, `extraction_cadence`,
+  `rolling_summary_mode`, `rolling_summary_enabled` (derived),
+  `consolidation_level`, `episodic_top_k`, `graph_hops`.
+
+  The three embedding flags are separate on purpose, because indexing and
+  querying have very different costs (see
+  [governor.md](governor.md#vector-recall-vs-embedding-two-decisions-not-one)):
+  `embeddings_enabled` permits embedding **newly recorded chunks** (`False`
+  at LITE); `vector_recall_enabled` permits the **vector leg during
+  retrieval** (`True` at every tier); `embedder_load_allowed` permits
+  **triggering a first load** of the built-in model (`False` at LITE). All
+  three reflect the GOVERNOR's tier-based permission only — none of them
+  means an embedder is actually configured and working. Check
   `store.embed_fn is not None` separately if you need to know whether
-  vector search is actually possible right now (both conditions must hold
-  for the vector leg to run).
+  vector search is actually possible right now.
+
+  `rolling_summary_mode` is a `RollingSummaryMode` (`LLM`, `EXTRACTIVE`,
+  `MARKER`). `rolling_summary_enabled` remains available as a derived
+  property with its original meaning — `True` only for `LLM`, i.e. "will
+  this cost a model call?" — so existing host code needs no change.
 - **`Hit`** (from `elastimem.retrieval`) — `kind` (`chunk|fact`), `text`,
   `date`, `score`, `session_id`.
 - **`Fact`** — `key`, `value`, `category`, `source`, `importance`,
   `valid_from`, `invalidated_at`, `archived`.
 - **`ElastimemConfig`** — see docstrings in `elastimem/config.py`; notable fields:
   `context_tokens`, `static_prompt_tokens`, `reserved_keys`, `profile_keys`,
-  `chunk_target_tokens`, `worker_max_tokens`, `tier_override`,
+  `chunk_target_tokens`, `worker_max_tokens`, `lite_llm_extraction`,
+  `tier_override`,
   `min_query_words` (gates LLM extraction, default 4),
   `min_retrieval_query_words` (gates local FTS5/vector retrieval, default 1
   — deliberately much lower than `min_query_words` since retrieval is free

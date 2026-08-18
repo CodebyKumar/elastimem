@@ -97,6 +97,30 @@ def embed_pending(store: "Elastimem", limit: int = 200) -> int:
     return embed_chunks(store, [r["id"] for r in rows]) if rows else 0
 
 
+def embedder_resident(store: "Elastimem") -> bool:
+    """True when calling ``store.embed_fn`` costs no new resident memory.
+
+    Two cases. A host-supplied ``embed_fn`` is always resident: it lives in
+    the host's own process and was loaded before Elastimem ever saw it, so
+    declining to call it frees nothing - it only discards recall quality.
+    Elastimem's built-in embedder is resident only once it has actually
+    loaded, which ``default_embedder.is_available()`` reports WITHOUT
+    triggering a load (important: probing must never be the thing that
+    causes the ~130MB allocation this check exists to avoid).
+
+    ``embed_query_fn`` is the discriminator - store.py sets it only when it
+    wires in the built-in, the same signal ``embed_chunks`` already uses for
+    its model label.
+    """
+    if store.embed_fn is None:
+        return False
+    if store.embed_query_fn is None:
+        return True                       # host-supplied: already in memory
+    from . import default_embedder
+
+    return default_embedder.is_available()
+
+
 def similar_chunks(store: "Elastimem", query: str, limit: int = 20) -> list[tuple[int, float]]:
     """(chunk_id, cosine_similarity) pairs most similar to the query, best
     first. The raw score (not just rank) matters to the caller: retrieval
@@ -109,8 +133,20 @@ def similar_chunks(store: "Elastimem", query: str, limit: int = 20) -> list[tupl
     """
     if store.embed_fn is None or getattr(store, "_embed_failed", False):
         raise RuntimeError("no embedder available")
-    if not store.profile.embeddings_enabled:
-        raise RuntimeError("embeddings disabled by governor tier")
+    profile = store.profile
+    if not profile.vector_recall_enabled:
+        raise RuntimeError("vector recall disabled by governor tier")
+    # The read path is gated on whether a model would have to be LOADED, not
+    # on embeddings_enabled (which governs indexing new chunks). Scoring
+    # vectors that already exist costs one query encode plus a cosine loop;
+    # throwing that away on a tier that already paid to compute them buys
+    # the machine nothing. What genuinely costs RAM is materializing a
+    # ~130MB model that isn't resident yet, so that - and only that - is
+    # what LITE refuses.
+    if not profile.embedder_load_allowed and not embedder_resident(store):
+        raise RuntimeError(
+            "embedder not resident and this tier may not load one"
+        )
 
     try:
         # Some embedding models (e.g. the built-in bge-small default) are

@@ -26,6 +26,7 @@ from .config import (
     ConsolidationLevel,
     ElastimemConfig,
     MemoryProfile,
+    RollingSummaryMode,
     Tier,
 )
 from .semantic import Fact
@@ -57,6 +58,7 @@ __all__ = [
     "Tier",
     "Cadence",
     "ConsolidationLevel",
+    "RollingSummaryMode",
     "Fact",
     "__version__",
 ]

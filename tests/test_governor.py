@@ -2,7 +2,14 @@
 
 import pytest
 
-from elastimem import Elastimem, ElastimemConfig, Tier, Cadence
+from elastimem import (
+    Cadence,
+    ConsolidationLevel,
+    Elastimem,
+    ElastimemConfig,
+    RollingSummaryMode,
+    Tier,
+)
 from elastimem.governor import Governor, GIB, probe_ram
 
 
@@ -43,6 +50,61 @@ def test_lite_shrinks_episodic_and_boosts_working():
     assert lite.profile.budgets.working > full.profile.budgets.working
     assert lite.profile.extraction_cadence is Cadence.OFF
     assert lite.profile.embeddings_enabled is False
+
+
+def test_lite_consolidation_is_dedupe_only_not_off():
+    """DEDUPE_ONLY is 100% local SQLite (fact decay/archival, quarantine
+    trimming, graph decay, cluster recompute) — the LLM merge steps are
+    gated separately on FULL. Leaving LITE at OFF meant a starved machine
+    was the one machine that never pruned anything."""
+    lite = gov(4, 2).profile
+    assert lite.consolidation_level is ConsolidationLevel.DEDUPE_ONLY
+    assert gov(8, 4).profile.consolidation_level is ConsolidationLevel.DEDUPE_ONLY
+    assert gov(32, 20).profile.consolidation_level is ConsolidationLevel.FULL
+
+
+def test_lite_rolling_summary_is_extractive_but_not_an_llm_call():
+    lite = gov(4, 2).profile
+    assert lite.rolling_summary_mode is RollingSummaryMode.EXTRACTIVE
+    # The Stable flag keeps its original meaning: "does this cost a model
+    # call?" Extractive summarization does not.
+    assert lite.rolling_summary_enabled is False
+    for prof in (gov(8, 4).profile, gov(32, 20).profile):
+        assert prof.rolling_summary_mode is RollingSummaryMode.LLM
+        assert prof.rolling_summary_enabled is True
+
+
+def test_lite_separates_indexing_from_vector_recall():
+    lite = gov(4, 2).profile
+    assert lite.embeddings_enabled is False      # no indexing of new chunks
+    assert lite.vector_recall_enabled is True    # existing vectors still score
+    assert lite.embedder_load_allowed is False   # but never load a model
+    full = gov(32, 20).profile
+    assert (full.embeddings_enabled, full.embedder_load_allowed) == (True, True)
+
+
+def test_lite_episodic_top_k_and_budget_are_usable():
+    lite = gov(4, 2, context_tokens=8192).profile
+    full = gov(32, 20, context_tokens=8192).profile
+    assert lite.episodic_top_k == 3
+    # Reduced relative to FULL, but a real budget rather than a sliver that
+    # rounds to single-digit tokens on a typical host.
+    assert 0 < lite.budgets.episodic < full.budgets.episodic
+    assert lite.budgets.episodic >= full.budgets.episodic * 0.4
+    assert lite.budgets.sessions >= full.budgets.sessions * 0.7
+
+
+def test_lite_llm_extraction_is_opt_in_and_defers_to_session_end():
+    default = gov(4, 2).profile
+    assert default.extraction_cadence is Cadence.OFF
+    assert default.llm_extraction_enabled is False
+
+    opted_in = gov(4, 2, lite_llm_extraction=True).profile
+    assert opted_in.extraction_cadence is Cadence.SESSION_END
+    assert opted_in.llm_extraction_enabled is True
+    # The opt-in is LITE-only; it must not perturb the other tiers.
+    assert gov(32, 20, lite_llm_extraction=True).profile.extraction_cadence \
+        is Cadence.PER_TURN
 
 
 def test_graph_hops_by_tier():

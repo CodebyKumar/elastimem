@@ -17,7 +17,12 @@ import contextlib
 
 from . import assembly, episodic, extraction, procedural, rules, semantic
 from .assembly import ContextPlan
-from .config import ConsolidationLevel, ElastimemConfig, MemoryProfile
+from .config import (
+    ConsolidationLevel,
+    ElastimemConfig,
+    MemoryProfile,
+    RollingSummaryMode,
+)
 from .db import open_store, connect
 from .governor import Governor
 from .worker import Job, Worker
@@ -399,20 +404,39 @@ class Elastimem:
         if not turns:
             return
         profile = self._governor.profile
-        if profile.rolling_summary_enabled and self.complete_fn is not None:
+        mode = profile.rolling_summary_mode
+        if mode is RollingSummaryMode.LLM and self.complete_fn is not None:
             self._worker.submit(Job(
                 "rolling_summary", needs_llm=True, payload={"turns": turns},
             ))
-        else:
-            # Degradation floor: a marker line, so the model knows history
-            # exists and recall() can retrieve it.
+            return
+        if mode is RollingSummaryMode.EXTRACTIVE:
+            # No model call: select from text already persisted. Done inline
+            # rather than on the worker because it is pure string work on a
+            # handful of turns - queueing it would cost more than running it.
+            # _rolling_lock is a plain (non-reentrant) Lock, so the whole
+            # read-compute-write is done inside ONE acquisition and the
+            # marker fallback below is reached only after releasing it.
             with self._rolling_lock:
-                self._rolling = (
-                    f"[{len(turns)} earlier turn(s) omitted — memory search can"
-                    " recall them]"
-                    if self._rolling is None
-                    else self._rolling + f" [+{len(turns)} more turn(s) omitted]"
+                summary = extraction.extractive_rolling_summary(
+                    self._rolling, turns, profile.budgets.sessions,
+                    tokenizer_fn=self.tokenizer_fn,
                 )
+                if summary:
+                    self._rolling = summary
+            if summary:
+                return
+            # Nothing usable came out (e.g. every evicted turn was empty or
+            # the sessions budget rounded to zero) - fall back to the marker.
+        # Degradation floor: a marker line, so the model knows history
+        # exists and recall() can retrieve it.
+        with self._rolling_lock:
+            self._rolling = (
+                f"[{len(turns)} earlier turn(s) omitted — memory search can"
+                " recall them]"
+                if self._rolling is None
+                else self._rolling + f" [+{len(turns)} more turn(s) omitted]"
+            )
 
     def drain(self, timeout: float = 5.0) -> bool:
         """Finish queued background work (call before unloading the model)."""

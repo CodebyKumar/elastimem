@@ -68,13 +68,23 @@ callable.
 
 `ContextPlan.sections` and `MemoryProfile` gained new keys/fields
 (`sections["graph_context"]`, `MemoryProfile.graph_hops`) as part of the
-knowledge-graph work — additive per the semantic-versioning promise above:
-existing code that reads specific keys/fields is unaffected, but code that
-asserts an *exact* set of `sections` keys or does positional
-`MemoryProfile(...)` construction should account for the new members. (A
-grep of this codebase at the time these fields were added found no
-positional `MemoryProfile(...)` construction outside `governor.py` itself,
-which always constructs by keyword.)
+knowledge-graph work, and `MemoryProfile` gained
+`vector_recall_enabled`/`embedder_load_allowed`/`rolling_summary_mode` in
+0.2.0 — additive per the semantic-versioning promise above: existing code
+that reads specific keys/fields is unaffected, but code that asserts an
+*exact* set of `sections` keys or does positional `MemoryProfile(...)`
+construction should account for the new members. (A grep of this codebase
+at the time these fields were added found no positional
+`MemoryProfile(...)` construction outside `governor.py` itself, which
+always constructs by keyword.)
+
+One near-exception in 0.2.0: `MemoryProfile.rolling_summary_enabled`
+changed from a plain field to a **derived property**. Reading it is
+unaffected and its meaning is unchanged ("does the rolling summary cost a
+model call?"), which covers every documented use. Only code that passed it
+as a keyword to `MemoryProfile(...)` — construction Elastimem does not
+support outside the governor — would need to pass `rolling_summary_mode`
+instead.
 
 ## Experimental
 

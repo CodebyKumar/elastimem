@@ -47,6 +47,22 @@ class ConsolidationLevel(str, enum.Enum):
     OFF = "off"                  # exact dedupe at exit only
 
 
+class RollingSummaryMode(str, enum.Enum):
+    """How evicted turns are condensed into the rolling summary.
+
+    Three modes, because the middle one used not to exist: a tier either
+    paid for a model call or got nothing but a marker line. EXTRACTIVE sits
+    between them - it is pure Python string work over text Elastimem has
+    already persisted, so it costs no model call and no embedder, yet it
+    keeps real content in front of the model instead of a bare
+    "[3 earlier turn(s) omitted]" placeholder.
+    """
+
+    LLM = "llm"                  # condense with complete_fn (FULL/STANDARD)
+    EXTRACTIVE = "extractive"    # first clause of each evicted user turn (LITE)
+    MARKER = "marker"            # "[N earlier turn(s) omitted]" only
+
+
 @dataclass(frozen=True)
 class Budgets:
     """Per-turn token budgets for each injected prompt section."""
@@ -68,14 +84,44 @@ class MemoryProfile:
 
     tier: Tier
     budgets: Budgets
+    # Write path: may the background worker EMBED newly recorded chunks?
+    # This is the sustained cost (one encode per chunk, forever), so it is
+    # the first thing a starved machine gives up.
     embeddings_enabled: bool
     llm_extraction_enabled: bool
     extraction_cadence: Cadence
-    rolling_summary_enabled: bool
     consolidation_level: ConsolidationLevel
     episodic_top_k: int
     window_min_turns: int = 2
     graph_hops: int = 0
+    # Read path: may retrieval run its vector leg over chunks that are
+    # ALREADY embedded? Deliberately separate from embeddings_enabled -
+    # scoring existing vectors is one query encode plus a cosine loop, a
+    # very different cost from indexing every new chunk, and there is no
+    # reason a machine that already paid for the vectors should throw them
+    # away. See embedder_load_allowed for the part that does cost RAM.
+    vector_recall_enabled: bool = True
+    # May Elastimem trigger a FIRST load of the built-in embedding model
+    # (~130MB resident, plus a one-time download)? False at LITE: that load
+    # is the only genuinely RAM-expensive part of the embedding path, so
+    # LITE may use an embedder that is already resident but must never
+    # cause one to appear. A host-supplied embed_fn is always considered
+    # resident - it lives in the host's process and was loaded before
+    # Elastimem ever saw it, so declining to call it saves nothing.
+    embedder_load_allowed: bool = True
+    rolling_summary_mode: RollingSummaryMode = RollingSummaryMode.LLM
+
+    @property
+    def rolling_summary_enabled(self) -> bool:
+        """True when the rolling summary is produced by a model call.
+
+        Kept as a property (it used to be a plain field) so the Stable
+        surface - hosts and `store.report_evictions` both read it - keeps
+        meaning exactly what it always meant: "will this cost an LLM call?"
+        EXTRACTIVE is not a model call, so it reads False here, same as
+        MARKER did before it existed.
+        """
+        return self.rolling_summary_mode is RollingSummaryMode.LLM
 
 
 # Default allowlist of keys that belong to the stable user profile (always
@@ -181,6 +227,17 @@ class ElastimemConfig:
     # --- background worker -------------------------------------------------
     worker_max_tokens: int = 96      # cap on every background LLM call
     batched_every_n_turns: int = 2
+    # Opt-in: allow LLM fact extraction at LITE tier, deferred to session
+    # end (Cadence.SESSION_END) rather than running per turn or in batches.
+    # Default False, which preserves LITE's documented floor: no LLM call is
+    # ever attempted at LITE unless the host explicitly asks for one. Set
+    # True when you know the machine can afford a short burst of capped
+    # (worker_max_tokens) calls at session close - e.g. a host whose model
+    # is unloaded between sessions, or one that classifies as LITE only
+    # because of other processes rather than a genuinely small machine.
+    # Extraction jobs are held by the worker until end_session()/drain(),
+    # so they never compete with a live foreground generation.
+    lite_llm_extraction: bool = False
 
     # --- knowledge graph -----------------------------------------------------
     # Row-count ceilings for graph_nodes/graph_edges. Write-time dedup (a

@@ -52,8 +52,8 @@ for that world:
   about "my Jetson" can surface a memory that only mentions "Tuffy" — because
   the graph knows Tuffy runs on the Jetson — even though the two share no
   vocabulary. This is one more retrieval signal, not a separate database;
-  the Memory Governor gates it exactly like everything else (off at LITE
-  tier, deeper at FULL).
+  the Memory Governor gates it exactly like everything else (1-hop at LITE
+  and STANDARD, deeper at FULL).
 
 ## Quickstart
 
@@ -133,8 +133,10 @@ mem.timeline("what did I do before AI")   # -> Student -> AI Engineer
 ```
 
 Depth adapts with the Memory Governor exactly like everything else — 2-hop
-graph expansion at FULL tier, 1-hop at STANDARD, off entirely at LITE (zero
-extra queries, zero extra writes). Full design and the reasoning behind it:
+graph expansion at FULL tier, 1-hop at STANDARD and LITE (traversal is a
+bounded SQL query over capped tables, so the first hop costs a starved
+machine nothing; only the unbounded second hop needs FULL). Full design and
+the reasoning behind it:
 [governor.md's Knowledge graph section](docs/governor.md#knowledge-graph).
 
 ## The five memory layers
@@ -154,13 +156,23 @@ and derives token budgets from your model's context size:
 
 | Capability                | FULL (≥16 GB)       | STANDARD (≥8 GB)     | LITE               |
 | ------------------------- | -------------------- | --------------------- | ------------------ |
-| Embeddings used           | yes                  | yes, if provided      | never              |
-| Episodic injection        | hybrid, top 4        | FTS5, top 3           | `recall()` only  |
+| Indexing new chunks       | yes                  | yes                   | never              |
+| Vector leg when searching | yes                  | yes                   | yes, over already-indexed chunks, if the embedder is already resident |
+| Episodic injection        | hybrid, top 5        | hybrid, top 4         | top 3              |
 | Working window            | ~8–10 turns         | ~5–6 turns           | 2 turns + newest   |
-| Rolling summary           | LLM, every eviction  | LLM, every 2nd batch  | placeholder marker |
-| LLM fact extraction       | background, per turn | batched every 3 turns | off (rules only)   |
-| Knowledge graph           | 2-hop expansion       | 1-hop expansion        | off — no graph reads or writes |
+| Rolling summary           | LLM, every eviction  | LLM, every eviction   | extractive, no model call |
+| LLM fact extraction       | background, per turn | batched every 2 turns | off by default (`lite_llm_extraction` opts in, deferred to session end) |
+| Consolidation             | full, incl. LLM merge | dedupe + decay        | dedupe + decay     |
+| Knowledge graph           | 2-hop expansion       | 1-hop expansion        | 1-hop expansion    |
 | Rule capture, transcripts | always               | always                | always             |
+
+LITE's floor is **"spend no new resources," not "least capability
+possible."** It makes no LLM call, loads no model, and pays no sustained
+per-chunk cost — but anything that is just local SQLite (consolidation,
+graph traversal, extractive summarization, scoring vectors that already
+exist) runs there too. Those decisions are independent of each other, which
+is exactly why they can be made separately. See
+[docs/governor.md](docs/governor.md#capability-tier).
 
 Full spec: [docs/governor.md](docs/governor.md). Architecture and rationale:
 [docs/architecture.md](docs/architecture.md). Integration guides (llama.cpp,
@@ -168,11 +180,13 @@ OpenAI-compatible, no-LLM): [docs/integrations.md](docs/integrations.md).
 
 ## Status
 
-Pre-release alpha (0.1.0a1). The core API (`open`, `remember`, `recall`,
-`record_turn`, `build_context`, see [docs/api_stability.md](docs/api_stability.md)
-for the exact Stable surface) is expected to stay stable; internal
-implementation details and advanced features may still evolve based on
-feedback from early adopters. The knowledge-graph query surface
+Beta (0.2.0), out of pre-release. The core API (`open`, `remember`,
+`recall`, `record_turn`, `build_context`, see
+[docs/api_stability.md](docs/api_stability.md) for the exact Stable surface)
+has settled and now moves under the documented versioning policy: additive
+changes bump the minor version, breaking changes bump the major version.
+Internal implementation details and advanced features may still evolve
+based on feedback. The knowledge-graph query surface
 (`explain()`, `timeline()`, `clusters()`) is marked **Experimental** —
 the underlying storage is stable, but their exact return shapes may still
 change based on real usage. See [CHANGELOG.md](CHANGELOG.md) for release

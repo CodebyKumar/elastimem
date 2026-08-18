@@ -162,6 +162,66 @@ def rolling_summary(
     )
 
 
+def extractive_rolling_summary(
+    previous_summary: str | None,
+    evicted_turns: list[tuple[str, str]],
+    budget_tokens: int,
+    tokenizer_fn=None,
+) -> str:
+    """Fold evicted turns into the rolling summary WITHOUT a model call.
+
+    The LITE-tier counterpart to :func:`rolling_summary`. Where that one
+    asks a model to condense, this one selects: it keeps the leading clause
+    of each evicted *user* turn (what the user asked for is what later turns
+    refer back to; the assistant's reply is usually recoverable from it) and
+    fits the result to ``budget_tokens``.
+
+    This exists because the alternative at LITE was a bare
+    "[3 earlier turn(s) omitted]" marker - technically honest, but it tells
+    the model nothing, so a starved machine lost the thread of its own
+    conversation. Selecting text that is already sitting in the database
+    costs no model call, no embedder, and no measurable memory, so there is
+    no reason for LITE to prefer the placeholder.
+
+    Returns '' when nothing usable was extracted, so the caller can fall
+    back to the marker line rather than injecting an empty section.
+    """
+    from . import assembly
+
+    lines: list[str] = []
+    if previous_summary:
+        lines.append(previous_summary)
+    seen = {line.lower() for line in lines}
+    for user_text, _assistant_text in evicted_turns:
+        clause = _leading_clause(user_text)
+        if not clause or clause.lower() in seen:
+            continue
+        seen.add(clause.lower())
+        lines.append(f"- {clause}")
+    if not lines:
+        return ""
+    # fit_lines keeps a greedy PREFIX, so feed it newest-first to make the
+    # budget bite the oldest content, then restore chronological order for
+    # rendering. Under a tight budget the summary therefore keeps the turns
+    # the next turn is most likely to refer back to, and the accumulated
+    # previous_summary (oldest, at the front) ages out first - which is also
+    # what bounds this string's growth across many evictions.
+    kept = assembly.fit_lines(list(reversed(lines)), budget_tokens, tokenizer_fn)
+    return "\n".join(reversed(kept))
+
+
+def _leading_clause(text: str, max_chars: int = 120) -> str:
+    """First sentence/clause of ``text``, collapsed to one line."""
+    collapsed = " ".join(text.split())
+    if not collapsed:
+        return ""
+    for stop in (". ", "? ", "! ", "\n"):
+        idx = collapsed.find(stop)
+        if 0 < idx <= max_chars:
+            return collapsed[: idx + 1].strip()
+    return collapsed[:max_chars].strip()
+
+
 def session_summary(
     complete_fn: CompleteFn, config: ElastimemConfig, user_turns: list[str]
 ) -> str:

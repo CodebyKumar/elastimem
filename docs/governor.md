@@ -65,18 +65,24 @@ memory   = 45% of dynamic, split:
              facts 40% · episodic 30% · sessions 15% · lessons 15%
 ```
 
-LITE additionally shrinks the episodic share to 10% of what it would
-otherwise get (just enough to hold the single top-1 turn `episodic_top_k`
-allows at this tier, rather than zeroing it outright) and halves sessions,
-returning the rest to the working window — on a starved machine, immediate
-coherence still beats recall in general, but a minimal amount of recent
-context and 1-hop graph reach (see "Capability × tier" below) cost nothing
-extra once the LLM/embedder legs are already off.
+LITE additionally keeps only `LITE_EPISODIC_SHARE` (45%) of the episodic
+share and `LITE_SESSIONS_SHARE` (75%) of the sessions share, returning the
+rest to the working window — on a starved machine, immediate coherence
+still beats recall in general.
+
+These fractions were 10% and 50% before 0.2.0, which was too aggressive:
+on a typical 4K-context host with a real system prompt, 10% of the episodic
+share rounds down to a handful of tokens, so `fit_lines()` kept zero or one
+line and episodic injection was effectively absent rather than merely
+reduced. Note this is a **token-split** decision, not a resource one —
+reading three rows out of SQLite instead of one costs a RAM-starved machine
+nothing, so there is no reason to starve the section beyond what the
+context window actually forces.
 
 Worked example (defaults, `n_ctx=4096`, static prompt 1200 tokens):
 dynamic = 1784 → working ≈ 981, facts ≈ 321, episodic ≈ 240, sessions ≈ 120,
-lessons ≈ 120. At LITE: working ≈ 1258, facts ≈ 321, episodic ≈ 24,
-sessions ≈ 60, lessons ≈ 120.
+lessons ≈ 120. At LITE: working ≈ 1143, facts ≈ 321, episodic ≈ 108,
+sessions ≈ 90, lessons ≈ 120.
 
 **The 256-token floor is real and gets hit in practice, not just a
 theoretical edge case.** A small local model (`n_ctx=4096`) whose host has a
@@ -129,35 +135,103 @@ also raise the bar for local retrieval, and vice versa.
 
 | Capability | FULL | STANDARD | LITE |
 |---|---|---|---|
-| `embedder` called (host-supplied OR built-in — see below) | yes | yes | **never** |
-| Episodic injection (`build_context`) | top 5 | top 4 | top 1 (small token sliver; full history still reachable via `recall()`) |
-| LLM fact extraction | background, per turn | batched every 2 turns | off |
-| Rolling summary | LLM | LLM | marker line |
-| Consolidation | full (incl. LLM merge), idle + exit | dedupe + decay, exit | off |
+| Indexing new chunks (`embeddings_enabled`) | yes | yes | **never** |
+| Vector leg at query time (`vector_recall_enabled`) | yes | yes | yes, **but only over already-embedded chunks and only with an embedder that is already resident** — see below |
+| Loading the built-in embedder (`embedder_load_allowed`) | yes | yes | **never** |
+| Episodic injection (`build_context`) | top 5 | top 4 | top 3 |
+| LLM fact extraction | background, per turn | batched every 2 turns | off (opt in with `lite_llm_extraction`, then deferred to session end) |
+| Rolling summary (`rolling_summary_mode`) | LLM | LLM | extractive (no model call); marker line only if nothing usable |
+| Consolidation | full (incl. LLM merge), idle + exit | dedupe + decay, exit | dedupe + decay, exit |
 | Knowledge graph (`graph_hops`) | 2-hop expansion; decay + clustering + LLM dedupe/labeling | 1-hop expansion; decay + clustering | 1-hop expansion; decay + clustering (no LLM-gated steps — those need FULL) |
 | Rule capture | always | always | always |
 | Transcript persistence | always | always | always |
 | `remember` / `recall` / `forget` | always | always | always |
 
-**This table is the single most important thing to internalize about
-Elastimem's tier system: LITE's floor is "no LLM call, no embedder call —
-ever," not "least capability possible."** No LLM call is ever attempted at
-LITE — not extraction, not rolling summaries, not consolidation merges —
-and no embedder is ever called either, even if one is configured and
-working. But operations that are purely local SQLite (a sliver of episodic
-injection, 1-hop graph traversal, graph decay/clustering) are not gated by
-that guarantee and do run at LITE, unlike the LLM/embedder-backed
-capabilities above them. A host running on a RAM-constrained machine
-(common for local-model deployments: the model itself, plus an embedding
-model, plus the app, competing for RAM on an 8GB machine can easily land at
-LITE even though each piece individually would run fine alone) will,
-correctly and silently, get:
-- Rule-based fact capture only (`rules.py`'s ~10 regexes) — genuinely
+**The single most important thing to internalize about the tier system:
+LITE's floor is "spend no new resources," not "least capability possible."**
+Concretely, LITE refuses exactly three things by default:
+
+1. **No LLM call.** Not extraction, not rolling summaries, not
+   consolidation merges. (`lite_llm_extraction` is the one opt-in — see
+   below.)
+2. **No model load.** Elastimem will not materialize the built-in
+   embedder's ~130MB of weights at LITE.
+3. **No sustained per-item cost.** New chunks are not embedded, because
+   that is one encode per chunk forever, not a one-off.
+
+Everything else is fair game, and this is where LITE changed in 0.2.0. The
+tier used to be defined by what it turned *off*, which swept in several
+capabilities that are pure local SQLite and therefore cost a starved
+machine nothing. Each of these is independent of the others — that is the
+whole reason they can be decided separately:
+
+- **Consolidation runs** (`DEDUPE_ONLY`). Fact decay/archival, quarantine
+  trimming, graph decay/archival, cluster recompute: all SQL, no model.
+  Leaving this `OFF` meant a LITE store was the one store that never
+  pruned anything and grew without bound — the opposite of what a
+  RAM-constrained host wants. It also silently disabled graph maintenance,
+  which lives inside the same sweep.
+- **The vector leg still runs at query time**, provided the vectors already
+  exist and the embedder is already resident. This is the subtle one, so
+  it gets its own section below.
+- **Rolling summaries are extractive.** Condensing evicted turns by
+  selecting from text already in the database is string manipulation, not
+  inference. LITE gets real content instead of `[3 earlier turn(s)
+  omitted]`.
+- **Episodic injection is top 3, not top 1**, with a real token share.
+  Reading three rows instead of one costs a starved machine nothing; this
+  is a token-budget tradeoff, not a resource one, and the old share left
+  episodic with single-digit token budgets on a typical 4K-context host.
+
+What a LITE host still genuinely gives up:
+- Fact capture is rule-based only (`rules.py`'s ~10 regexes) — genuinely
   hardcoded, will never learn a new phrasing on its own. See "Known
   limitations" below.
-- FTS5 keyword search only for `recall()`/`memory_search` — no semantic/
-  paraphrase matching, regardless of whether the built-in or a host
-  embedder is configured.
+- No *new* content becomes semantically searchable, since new chunks go
+  unembedded. Chunks embedded during an earlier STANDARD/FULL stretch stay
+  searchable.
+- No LLM contradiction-merge, duplicate-entity merge, or cluster labeling.
+
+### Vector recall vs. embedding: two decisions, not one
+
+Before 0.2.0 a single `embeddings_enabled` flag covered both "index new
+chunks" and "score existing ones." Those have very different costs, so
+they are now separate flags:
+
+| Flag | Governs | LITE |
+|---|---|---|
+| `embeddings_enabled` | embedding newly recorded chunks (one encode per chunk, forever) | `False` |
+| `vector_recall_enabled` | running the vector leg during retrieval at all | `True` |
+| `embedder_load_allowed` | triggering a *first* load of the built-in model | `False` |
+
+The reasoning: a **host-supplied `embed_fn` is always already resident** —
+it lives in the host's own process and was loaded before Elastimem ever saw
+it. Refusing to call it at LITE frees exactly zero bytes; it only throws
+away recall quality. Likewise, cosine-scoring vectors that are already
+sitting in the database costs one query encode and a loop. What actually
+costs RAM is materializing a model that isn't loaded yet, and that is what
+`embedder_load_allowed` blocks.
+
+So a machine that ran at STANDARD, embedded its history, and then dipped to
+LITE keeps semantic recall over everything it already indexed, instead of
+falling off a cliff to keyword-only. A machine that has been at LITE since
+startup with no host embedder gets FTS5 keyword search, exactly as before —
+`embeddings.embedder_resident()` reports the built-in's load state *without
+triggering a load*, since probing must not be the thing that allocates.
+
+### Opting LITE into LLM extraction
+
+`ElastimemConfig.lite_llm_extraction` (default `False`) lets a host allow
+fact extraction at LITE. When enabled, LITE's cadence becomes
+`Cadence.SESSION_END`: extraction jobs are held by the worker and released
+on `end_session()`/`drain()`, so they never compete with a live foreground
+generation, and each is still capped at `worker_max_tokens`.
+
+Leave it off unless you know the machine can afford it. It is useful when a
+host classifies as LITE because of *other* processes rather than a
+genuinely small machine, or when the model is unloaded between sessions
+anyway. The default keeps rule 1 above intact: no LLM call is ever
+attempted at LITE unless you ask for one.
 - No background summarization — sessions fall back to their title-only
   floor (first 80 chars of the first user message, the same default every
   tier uses absent an LLM-generated summary) with no LLM-condensed 1-2
@@ -194,7 +268,10 @@ spellings), the store activates its own built-in embedder
   (which only happens via the background worker's `"embed"` job, itself
   gated on `profile.embeddings_enabled`, i.e. never at LITE tier). This
   means construction never blocks on network access, and a host on a
-  machine that starts at LITE tier may never trigger the download at all.
+  machine that starts at LITE tier never triggers the download at all —
+  `embedder_load_allowed` is `False` there, so even the retrieval path,
+  which may otherwise use an already-resident embedder at LITE, will not
+  cause a first load.
 - **First use downloads ~130MB** from Hugging Face Hub, cached under
   `fastembed`'s own platform cache directory afterward (subsequent runs on
   the same machine reuse the cache — no repeat download). This download
@@ -252,8 +329,9 @@ as STANDARD.
 **Writes are a separate story.** New nodes/edges are only ever created
 inside `extraction.extract_facts`'s per-turn LLM completion (see its
 `graph_hops` gate) — the same completion that produces facts. That
-completion never runs at LITE (no LLM call, ever), so **LITE traverses
-whatever graph already exists but never grows it.** In practice this means
+completion does not run at LITE by default (see `lite_llm_extraction` for
+the opt-in), so **LITE traverses whatever graph already exists but does not
+normally grow it.** In practice this means
 a store that has only ever run at LITE has an empty graph and the traversal
 finds nothing; a store that spent time at STANDARD/FULL before dropping to
 LITE (RAM pressure, `report_pressure()`, etc.) keeps querying the graph it
@@ -278,8 +356,10 @@ row caps (`graph_node_cap`/`graph_edge_cap`) are the *floor* — they stop
 unbounded growth but don't improve graph quality over time. Real upkeep
 piggybacks on the same `consolidate` job that already handles fact decay
 and quarantine trimming (`extraction.consolidate`), triggered the same way
-(idle sweep or session end on FULL tier, exit-only dedupe on STANDARD, off
-at LITE) — no new job kind, no new scheduling.
+(idle sweep or session end on FULL tier, exit-only dedupe on STANDARD and
+LITE) — no new job kind, no new scheduling. Graph upkeep therefore runs at
+LITE too, as of 0.2.0: it is all local SQLite, and the LLM-gated steps
+(duplicate-entity merge, cluster labeling) are gated separately on FULL.
 
 - **Decay/archival** (`graph.apply_decay`, runs whenever consolidation
   runs, any tier above OFF): a node/edge's confidence decays
@@ -412,7 +492,7 @@ host.**
 | `embedder` raises (host-supplied OR built-in) | vector leg disabled for the session (logged once), FTS5-only | — |
 | Built-in embedder extra not installed / first download fails | same as "embedder raises" above — FTS5-only, logged once | — |
 | `llm` absent or raises | regex rule capture | explicit `remember` only |
-| Rolling summary | `[k earlier turn(s) omitted — memory search can recall them]` | plain eviction |
+| Rolling summary | extractive selection from evicted turns (no model call) | `[k earlier turn(s) omitted — memory search can recall them]` |
 | Session summary | — | title = first user message (80 chars) |
 | Corrupt DB file | renamed `<path>.corrupt-<ts>`, fresh store created, warning logged | — |
 | RAM probe fails | assume 8 GiB total / 4 GiB available (STANDARD-ish) | — |
@@ -436,9 +516,10 @@ one, update this list.
    typo-tolerant matching (e.g. "you can **all** me kumar" for "call me
    kumar") — the false-positive risk of loosening these patterns outweighs
    the recall benefit for a zero-cost regex layer. Real coverage of
-   "everything else" is the LLM extraction pass, which is **only available
-   at STANDARD/FULL tier** (see the tier table above) — a host running at
-   LITE gets rules-only capture, permanently, until the tier recovers.
+   "everything else" is the LLM extraction pass, which at LITE is **off by
+   default** (see the tier table above) — a host running at LITE gets
+   rules-only capture until the tier recovers, or until it opts in via
+   `lite_llm_extraction`, which defers extraction to session end.
 2. **The chars/4 token-estimation proxy is not exact.** Every budget
    computation in the governor, and every `fit_lines()` truncation decision,
    uses `len(text)//4` unless the host supplies `tokenizer_fn`. This is a

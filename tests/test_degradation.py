@@ -7,7 +7,9 @@ from elastimem import Elastimem, ElastimemConfig, Tier
 from elastimem.governor import GIB
 
 
-def test_lite_tier_never_calls_embed_fn(tmp_path):
+def test_lite_tier_never_indexes_new_chunks(tmp_path):
+    """LITE gives up the *sustained* embedding cost: one encode per chunk,
+    forever. Recording turns must never enqueue an embed job here."""
     calls = []
 
     def spy_embed(texts):
@@ -17,10 +19,86 @@ def test_lite_tier_never_calls_embed_fn(tmp_path):
     s = Elastimem(str(tmp_path / "l.db"), embed_fn=spy_embed,
                probe_fn=lambda: (4 * GIB, 2 * GIB))
     assert s.profile.tier is Tier.LITE
+    assert s.profile.embeddings_enabled is False
     s.record_turn("my car needs brake pads replaced soon", "Noted!")
     s.drain(timeout=2)
-    s.recall("what about my car brakes")
     assert calls == []
+    row = s._conn.execute(
+        "SELECT COUNT(*) c FROM chunks WHERE embedding IS NOT NULL"
+    ).fetchone()
+    assert row["c"] == 0
+    s.close()
+
+
+def test_lite_tier_scores_existing_vectors_with_a_resident_embedder(tmp_path):
+    """A host-supplied embed_fn already lives in the host's process, so
+    refusing to call it at LITE frees nothing and only discards recall
+    quality. LITE therefore still runs the vector leg at query time — it
+    just never indexes new chunks (see the test above)."""
+    calls = []
+
+    def spy_embed(texts):
+        calls.append(texts)
+        return [[0.0] * 8 for _ in texts]
+
+    path = tmp_path / "warm.db"
+    # Record and index at STANDARD, so real vectors exist on disk.
+    s = Elastimem(str(path), embed_fn=spy_embed,
+                  probe_fn=lambda: (8 * GIB, 4 * GIB))
+    assert s.profile.tier is Tier.STANDARD
+    s.record_turn("my car needs brake pads replaced soon", "Noted!")
+    s.drain(timeout=2)
+    s.close()
+    assert calls, "STANDARD should have embedded the chunk"
+    calls.clear()
+
+    # Reopen the same store on a starved machine.
+    s2 = Elastimem(str(path), embed_fn=spy_embed,
+                   probe_fn=lambda: (4 * GIB, 2 * GIB))
+    assert s2.profile.tier is Tier.LITE
+    assert s2.profile.vector_recall_enabled is True
+    assert s2.profile.embedder_load_allowed is False
+    s2.recall("what about my car brakes")
+    assert calls == [["what about my car brakes"]]      # query side only
+    s2.close()
+
+
+def test_lite_tier_never_loads_the_builtin_embedder(tmp_path, monkeypatch):
+    """The one genuinely RAM-expensive part of the embedding path is
+    materializing the ~130MB built-in model. LITE must never trigger that,
+    even though it will happily use one that is already loaded.
+
+    default_embedder caches the model in a MODULE-level global, so whether
+    it is resident depends on what else ran in this process first. Pin it
+    to 'not loaded' explicitly rather than letting test order decide.
+    """
+    from elastimem import default_embedder, embeddings
+
+    monkeypatch.setattr(default_embedder, "_model", None)
+
+    s = Elastimem(str(tmp_path / "b.db"), probe_fn=lambda: (4 * GIB, 2 * GIB))
+    assert s.profile.tier is Tier.LITE
+    # Built-in wired in (embed_query_fn set), but not loaded => not resident.
+    assert s.embed_query_fn is not None
+    assert embeddings.embedder_resident(s) is False
+    s.record_turn("my car needs brake pads replaced soon", "Noted!")
+    s.drain(timeout=2)
+    assert s.recall("what about my car brakes") is not None   # FTS still works
+    # Still not resident: nothing in the LITE path may have loaded it.
+    assert default_embedder._model is None
+    s.close()
+
+
+def test_builtin_embedder_residency_tracks_the_module_global(monkeypatch, tmp_path):
+    """embedder_resident() must report the built-in's real load state
+    WITHOUT triggering a load — probing is exactly what must not allocate."""
+    from elastimem import default_embedder, embeddings
+
+    s = Elastimem(str(tmp_path / "res.db"), probe_fn=lambda: (4 * GIB, 2 * GIB))
+    monkeypatch.setattr(default_embedder, "_model", None)
+    assert embeddings.embedder_resident(s) is False
+    monkeypatch.setattr(default_embedder, "_model", object())   # pretend loaded
+    assert embeddings.embedder_resident(s) is True
     s.close()
 
 
@@ -279,4 +357,118 @@ def test_build_context_never_raises(tmp_path):
     for weird in ["", "hi", '"; DROP TABLE chunks; --', "🦆" * 500, "a " * 3000]:
         plan = s.build_context(weird)
         assert plan.profile is not None
+    s.close()
+
+
+def test_lite_rolling_summary_keeps_real_content_not_a_marker(tmp_path):
+    """LITE has no LLM, but condensing evicted turns extractively is pure
+    string work over rows already in the DB — so it keeps actual content
+    instead of the old '[N earlier turn(s) omitted]' placeholder."""
+    s = Elastimem(str(tmp_path / "r.db"), probe_fn=lambda: (4 * GIB, 2 * GIB),
+                  context_tokens=8192)
+    assert s.profile.tier is Tier.LITE
+    s.report_evictions([
+        ("I want to rebuild the deck out of cedar. What size joists?",
+         "Use 2x8 joists at 16 inches on center."),
+        ("Also the railing has to meet code.", "Most codes want 36 inches."),
+    ])
+    plan = s.build_context("back to the deck")
+    assert plan.rolling_summary is not None
+    assert "omitted" not in plan.rolling_summary
+    assert "cedar" in plan.rolling_summary
+    assert "railing" in plan.rolling_summary
+    s.close()
+
+
+def test_lite_rolling_summary_falls_back_to_marker_when_nothing_usable(tmp_path):
+    s = Elastimem(str(tmp_path / "r2.db"), probe_fn=lambda: (4 * GIB, 2 * GIB))
+    s.report_evictions([("   ", "   ")])
+    assert "omitted" in s.build_context("hello").rolling_summary
+    s.close()
+
+
+def test_lite_rolling_summary_stays_within_budget_across_many_evictions(tmp_path):
+    """The extractive summary accumulates, so it must be bounded — the
+    oldest content ages out rather than the string growing forever."""
+    s = Elastimem(str(tmp_path / "r3.db"), probe_fn=lambda: (4 * GIB, 2 * GIB),
+                  context_tokens=4096)
+    budget = s.profile.budgets.sessions
+    for i in range(40):
+        s.report_evictions([(f"question number {i} about roofing shingles", "sure")])
+    summary = s.build_context("roofing").rolling_summary
+    assert len(summary) // 4 <= budget
+    assert "question number 39" in summary      # newest survives
+    assert "question number 0 " not in summary  # oldest aged out
+    s.close()
+
+
+def test_lite_consolidation_prunes_instead_of_growing_forever(tmp_path):
+    """LITE now runs DEDUPE_ONLY consolidation at session end: pure SQLite
+    decay/archival with no LLM call. Previously it was OFF, so a LITE store
+    was the one store that never pruned anything."""
+    from elastimem import graph
+
+    s = Elastimem(str(tmp_path / "c.db"), probe_fn=lambda: (4 * GIB, 2 * GIB))
+    assert s.profile.tier is Tier.LITE
+    conn = s._conn
+    node_id = graph.upsert_node(conn, "thing", "AbandonedTopic")
+    with s._write_lock:
+        # Backdate far past the decay half-life so it lands under the
+        # archive threshold on the next sweep.
+        conn.execute(
+            "UPDATE graph_nodes SET updated_at = datetime('now', '-400 days')"
+            " WHERE id=?", (node_id,)
+        )
+        conn.commit()
+    s.record_turn("hello there friend", "hi")
+    s.end_session()
+    remaining = conn.execute(
+        "SELECT COUNT(*) c FROM graph_nodes WHERE id=?", (node_id,)
+    ).fetchone()["c"]
+    assert remaining == 0, "LITE consolidation should have decayed this node"
+    s.close()
+
+
+def test_lite_makes_no_llm_call_by_default(tmp_path):
+    """The floor LITE still guarantees unless a host opts in."""
+    calls = []
+
+    def spy_llm(prompt, **kw):
+        calls.append(prompt)
+        return "something"
+
+    s = Elastimem(str(tmp_path / "n.db"), llm=spy_llm,
+                  probe_fn=lambda: (4 * GIB, 2 * GIB))
+    assert s.profile.tier is Tier.LITE
+    s.record_turn("my name is Ravi and I work at a hospital in Mysore", "Noted!")
+    s.report_evictions([("something earlier about work", "ok")])
+    s.end_session()
+    s.drain(timeout=2)
+    assert calls == []
+    s.close()
+
+
+def test_lite_llm_extraction_opt_in_defers_every_call_to_session_end(tmp_path):
+    """With the opt-in, LITE may use the model — but only at session close,
+    where nothing competes with a live foreground generation."""
+    calls = []
+
+    def spy_llm(prompt, **kw):
+        calls.append(prompt)
+        return '{"facts": {"occupation": "nurse"}}'
+
+    s = Elastimem(str(tmp_path / "o.db"), llm=spy_llm, lite_llm_extraction=True,
+                  probe_fn=lambda: (4 * GIB, 2 * GIB))
+    assert s.profile.tier is Tier.LITE
+    s.record_turn("my name is Ravi and I work as a nurse in Mysore", "Noted!")
+    # SESSION_END jobs are held in the worker's batch, never queued, so this
+    # is a deterministic check with no sleep needed. (Note drain() DOES
+    # flush them on purpose — a host draining before unloading its model
+    # must not lose held work — so this deliberately does not drain here.)
+    assert calls == [], "extraction must be held until the session ends"
+    assert s._worker.pending() == 1
+    s.end_session()
+    s.drain(timeout=2)
+    assert calls, "session end should have flushed the held extraction"
+    assert s.facts().get("occupation") == "nurse"
     s.close()

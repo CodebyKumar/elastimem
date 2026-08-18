@@ -19,9 +19,12 @@ via `fastembed`, not a hashing trick — see
 for the full story). This means semantic/paraphrase recall works out of the
 box with zero setup, as long as:
 1. the optional extra is installed (`pip install elastimem[embed]`), and
-2. the store's tier is STANDARD or FULL (embeddings are never called at
-   LITE, regardless of whether an embedder is configured — see
-   [governor.md](governor.md#capability-tier)).
+2. the store's tier is STANDARD or FULL, which is where new chunks get
+   embedded. At LITE, Elastimem never indexes new chunks and never loads
+   the built-in model — but it will still run the vector leg at query time
+   over chunks that are *already* embedded, using an embedder that is
+   already resident (a host-supplied `embed_fn` always is). See
+   [governor.md](governor.md#vector-recall-vs-embedding-two-decisions-not-one).
 
 If you genuinely want FTS5-only behavior (no embeddings, ever, regardless
 of what's installed), set `disable_builtin_embedder=True` — see below.
@@ -162,8 +165,9 @@ Two natural tool bindings:
 - `remember(key, value)` → `mem.remember(key, value)[1]` (returns the reason
   string — "stored", "reserved key…", etc.)
 - `memory_search(query)` → format `mem.recall(query)` hits as
-  `- [date] text` lines. Works in every tier; this is LITE's only episodic
-  access, so always register it.
+  `- [date] text` lines. Works in every tier, and reaches the full history
+  rather than just what fits in the prompt budget — so it matters most at
+  LITE, where injection is smallest. Always register it.
 
 ## Host checklist
 

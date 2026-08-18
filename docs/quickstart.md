@@ -121,8 +121,8 @@ for cluster in mem.clusters():        # entities auto-grouped into topics
     print(cluster["label"], cluster["members"])
 ```
 
-This is one more retrieval signal, not a separate database — off entirely
-at LITE tier, deeper at FULL. See [governor.md](governor.md#knowledge-graph)
+This is one more retrieval signal, not a separate database — 1-hop at LITE
+and STANDARD, 2-hop at FULL. See [governor.md](governor.md#knowledge-graph)
 for the full design, and [api.md](api.md) for `explain()`/`timeline()`, the
 two Experimental query methods built on top of it.
 

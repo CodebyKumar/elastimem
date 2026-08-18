@@ -73,7 +73,7 @@ misbehavior is inspectable.
 
 ### `graph_nodes` — embedded semantic knowledge graph (entities)
 Extracted alongside facts by the same LLM completion (`extraction.py`),
-gated by `MemoryProfile.graph_hops` (LITE=0, STANDARD=1, FULL=2 — see
+gated by `MemoryProfile.graph_hops` (LITE=1, STANDARD=1, FULL=2 — see
 `governor.py`). One more retrieval signal inside the existing hybrid
 pipeline, not a separate store.
 

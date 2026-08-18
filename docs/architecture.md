@@ -175,9 +175,12 @@ a hit out of a query with zero real FTS/vector relevance to begin with.
 **Maintenance** piggybacks on the existing `consolidate` job (no new job
 kind, no new scheduler) — see "Consolidation" below.
 
-**Governor gating** (`MemoryProfile.graph_hops`): LITE=0 (the graph leg is
-never even queried — zero extra reads, zero extra writes, same "compiled
-out" treatment the embedder gets at LITE), STANDARD=1, FULL=2 hops.
+**Governor gating** (`MemoryProfile.graph_hops`): LITE=1, STANDARD=1,
+FULL=2 hops. The graph leg is reachable at every tier — traversal is a
+bounded `WITH RECURSIVE` query over tables that row-count caps already
+bound, so it costs a starved machine nothing beyond a local SQLite read.
+Only the second hop, whose fan-out is not bounded per query, is reserved
+for FULL.
 
 **`explain(query)`** (Experimental) and **`clusters()`** (Experimental)
 expose this machinery directly for debugging/UI: `explain` returns the
