@@ -178,6 +178,16 @@ Full spec: [docs/governor.md](docs/governor.md). Architecture and rationale:
 [docs/architecture.md](docs/architecture.md). Integration guides (llama.cpp,
 OpenAI-compatible, no-LLM): [docs/integrations.md](docs/integrations.md).
 
+## Integrating with a coding agent
+
+Using Claude Code, Cursor, or another coding agent to add Elastimem to your
+project? Hand it
+[docs/agent_integration_prompt.md](docs/agent_integration_prompt.md) — a
+single self-contained document with the complete feature list, every config
+knob, the five host obligations, version-by-version upgrade steps, and the
+anti-patterns integrations usually hit. It is written to be pasted straight
+into an agent's context.
+
 ## Status
 
 Beta (0.2.0), out of pre-release. The core API (`open`, `remember`,

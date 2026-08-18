@@ -9,6 +9,15 @@ version.
 
 ## [Unreleased]
 
+### Added
+- `docs/agent_integration_prompt.md` — a single self-contained document
+  aimed at coding agents (Claude Code, Cursor, SDK agents) asked to
+  integrate Elastimem or upgrade an existing integration. Complete
+  capability list, full `ElastimemConfig` reference with defaults, the five
+  host obligations, per-version upgrade steps, common anti-patterns, and a
+  runnable verification script. `CONTRIBUTING.md` now requires updating it
+  in the same PR as any user-visible change.
+
 ## [0.2.0] - 2026-08-18
 
 First non-pre-release version. The alpha marker is dropped: the Stable

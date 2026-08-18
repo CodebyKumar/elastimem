@@ -62,6 +62,16 @@ incidental coverage.
 - **Update relevant docs in the same PR.** Elastimem's docs describe actual
   behavior, not aspiration — a PR that changes behavior without touching
   the doc that describes it will be asked to include the doc update.
+- **Update
+  [docs/agent_integration_prompt.md](docs/agent_integration_prompt.md) for
+  ANY user-visible change.** This one is easy to forget because it is not
+  the doc you were editing. It is the single artifact downstream coding
+  agents are handed to discover what Elastimem can do, so when it drifts,
+  every integration built from it silently misses the feature you just
+  added. Its final section lists exactly which part to update for which
+  kind of change. New public method or signature, new config field, new
+  `MemoryProfile` field, changed per-tier behavior, or a version bump: all
+  of them require an edit there.
 
 ## Code style
 

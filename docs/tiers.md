@@ -10,14 +10,15 @@ Check `mem.profile.tier` before assuming a task is misbehaving — most
 "memory isn't working" reports turn out to be "this process has been running
 at LITE the whole time."
 
-**LITE's floor is "no LLM call, ever" — not "least capability possible."**
-Anything that costs an LLM completion (extraction, rolling summaries,
-consolidation merges) or an embedder call (vector search) is fully off at
-LITE, unconditionally, because that's the actual resource guarantee a
-RAM-starved host needs. But local, no-LLM operations — a sliver of episodic
-injection, a 1-hop graph traversal, graph decay/clustering — don't threaten
-that guarantee, so LITE now includes a small amount of each rather than
-zeroing them outright.
+**LITE's floor is "spend no new resources" — not "least capability
+possible."** By default LITE refuses exactly three things: an LLM call, a
+model load, and any sustained per-item cost (embedding every new chunk).
+Those are the guarantees a RAM-starved host actually needs. Everything
+else — anything that is just a local SQLite read or some string
+manipulation — runs at LITE too: consolidation, 1-hop graph traversal,
+graph decay/clustering, extractive summaries, and scoring vectors that
+already exist. Those are independent decisions, which is exactly why they
+can be made separately.
 
 ## Fact capture
 
@@ -25,7 +26,7 @@ zeroing them outright.
 |---|---|
 | FULL | Regex rules (always) **+** LLM extraction in the background, per turn |
 | STANDARD | Regex rules (always) **+** LLM extraction, batched every 2 turns |
-| LITE | Regex rules only — no LLM call is ever attempted |
+| LITE | Regex rules only. Set `lite_llm_extraction=True` to opt in to LLM extraction here, deferred to session end |
 
 Regex rules (`rules.py`) are ~10 hardcoded, high-precision patterns — "my
 name is X", "call me X", "I live in X", "I work as X", allergies, diet,
@@ -39,12 +40,20 @@ first thing that disappears going into LITE.
 |---|---|
 | FULL | Vector (embedder) + FTS5 + 2-hop knowledge graph nudge |
 | STANDARD | Vector (embedder) + FTS5 + 1-hop knowledge graph nudge |
-| LITE | FTS5 keyword search only — **no embedder call, ever** |
+| LITE | FTS5 + 1-hop graph nudge, **plus** the vector leg over chunks that are already embedded — if an embedder is already resident |
 
-Semantic/paraphrase matching requires the embedder, which is fully off at
-LITE regardless of whether one is configured and working. The knowledge
-graph nudge can only ever refine an existing FTS/vector hit — it never
-manufactures a result from a query with zero keyword or semantic overlap.
+The vector leg at LITE is narrower than it looks, and the distinction
+matters: LITE never *indexes* new chunks and never *loads* the built-in
+model. What it will do is score chunks embedded during an earlier
+STANDARD/FULL stretch, using an embedder that is already in memory — a
+host-supplied `embedder=` always is, since it lives in your process. So a
+store that dips to LITE mid-session keeps semantic recall over its existing
+history instead of falling off a cliff to keyword-only; a store that has
+only ever run at LITE with no host embedder gets FTS5 alone.
+
+The knowledge graph nudge can only ever refine an existing FTS/vector hit —
+it never manufactures a result from a query with zero keyword or semantic
+overlap.
 
 ## Episodic injection (`build_context()`)
 
@@ -52,7 +61,12 @@ manufactures a result from a query with zero keyword or semantic overlap.
 |---|---|
 | FULL | Top 5 recent turns injected |
 | STANDARD | Top 4 recent turns injected |
-| LITE | Top 1 recent turn injected, on a small token sliver reclaimed from the working-window carve-out — always reachable in full via explicit `recall()` regardless of tier |
+| LITE | Top 3 recent turns injected, on a reduced (but real) token share — full history always reachable via explicit `recall()` regardless of tier |
+
+How many rows get read is a token-budget question, not a resource one:
+pulling three rows out of SQLite instead of one costs a starved machine
+nothing. LITE keeps 45% of the normal episodic token share and 75% of the
+sessions share, returning the rest to the working window.
 
 ## Rolling / session summaries
 
@@ -60,7 +74,13 @@ manufactures a result from a query with zero keyword or semantic overlap.
 |---|---|
 | FULL | LLM-generated |
 | STANDARD | LLM-generated |
-| LITE | Marker line only: `"[k earlier turn(s) omitted — memory search can recall them]"` |
+| LITE | Extractive: the leading clause of each evicted user turn, fitted to the sessions budget. No model call. Falls back to the marker line `"[k earlier turn(s) omitted — memory search can recall them]"` only if nothing usable can be extracted |
+
+Extractive summarization is selection, not inference — it reuses text
+already persisted in the database, so it costs no model call and no
+embedder. It is bounded by the sessions token budget, with the oldest
+content ageing out first, so it cannot grow without limit across a long
+session.
 
 Session **titles** are a separate mechanism and not tier-gated: every
 session title is the first 80 chars of the first user message, at every
@@ -77,7 +97,14 @@ host explicitly generates and passes a summary at `end_session()` time.
 |---|---|
 | FULL | Full LLM-assisted merge, runs on idle sweep + session exit |
 | STANDARD | Dedupe + decay only (no LLM merge), exit only |
-| LITE | Off |
+| LITE | Dedupe + decay only (no LLM merge), exit only — same as STANDARD |
+
+Consolidation at the dedupe+decay level is entirely local SQLite: fact
+decay/archival, quarantine trimming, graph decay/archival, cluster
+recompute. It used to be `Off` at LITE, which made a starved machine the
+one machine that never pruned anything and grew monotonically — and, since
+graph upkeep lives in the same sweep, silently disabled that too. The
+LLM-assisted merge steps remain FULL-only.
 
 Contradictory fact updates (e.g. "I live in Austin" → weeks later "I live
 in Denver") are always versioned correctly — the old value is never lost —
@@ -96,14 +123,15 @@ Decay and connected-components clustering are free (no LLM call) and run
 at every tier including LITE; duplicate-entity merging and topic labeling
 cost an LLM call each, so they're FULL-only.
 
-**LITE reads the graph but never grows it.** Traversal is a local SQLite
-query with no LLM involved, so it runs at LITE same as STANDARD. But new
-nodes/edges are only ever written by the same per-turn LLM completion that
-produces facts (`extraction.py`), and that completion never runs at LITE.
-So a store that has only ever run at LITE has an empty graph — traversal
-finds nothing to nudge with. A store that spent time at STANDARD/FULL
-before dropping to LITE keeps querying whatever graph it already built; it
-just stops growing until the tier recovers.
+**LITE reads the graph but does not normally grow it.** Traversal is a
+local SQLite query with no LLM involved, so it runs at LITE same as
+STANDARD. But new nodes/edges are only ever written by the same per-turn
+LLM completion that produces facts (`extraction.py`), and that completion
+does not run at LITE unless you set `lite_llm_extraction=True`. So a store
+that has only ever run at LITE with the default config has an empty graph —
+traversal finds nothing to nudge with. A store that spent time at
+STANDARD/FULL before dropping to LITE keeps querying whatever graph it
+already built.
 
 ## Always on, every tier
 
@@ -112,7 +140,8 @@ just stops growing until the tier recovers.
 - `remember()` / `recall()` / `forget()` (explicit API calls)
 - Fact versioning and `timeline()` / `fact_history()`
 - `explain()` retrieval-transparency query
-- 1-hop knowledge graph traversal, decay, and clustering (as of this update)
+- 1-hop knowledge graph traversal, decay, and clustering
+- Consolidation at the dedupe + decay level (LLM merge steps need FULL)
 
 Nothing the user says is ever lost regardless of tier — raw transcripts
 persist everywhere and can be re-indexed once capacity recovers.
@@ -120,9 +149,9 @@ persist everywhere and can be re-indexed once capacity recovers.
 ## Degradation, not failure
 
 Every task above has a defined floor and none of them raise to the host.
-Losing a tier means losing *quality* (semantic recall → keyword recall, LLM
-merge → versioned-but-unmerged facts, LLM summary → a marker line) — never
-a crash, and never silent data loss. See governor.md's "Degradation matrix"
+Losing a tier means losing *quality* (semantic recall on new content →
+keyword recall, LLM merge → versioned-but-unmerged facts, LLM summary →
+extractive summary) — never a crash, and never silent data loss. See governor.md's "Degradation matrix"
 for the full fallback chain per capability, and "Known limitations" for the
 sharp edges (Windows RAM probe, chars/4 token estimate, the 256-token
 budget floor, English-only built-in embedder).
