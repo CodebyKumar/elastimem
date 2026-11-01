@@ -1,49 +1,42 @@
-"""The zero-capability floor, demonstrated: a memory-enabled bot with NO LLM.
+"""Memory with no LLM and no setup: a bot that only stores and searches.
 
-No model, no embeddings, no dependencies — yet it remembers your name across
-restarts, recalls past conversations by keyword, and budgets its context.
+It keeps every exchange, finds past ones by meaning (with the built-in
+embedder, ``pip install elastimem[embed]``) or by keyword (without it), and
+stores facts you give it explicitly.
 
 Run:  python examples/minimal_bot.py
-Try:  "my name is Sam", restart, "what do you know about me?",
-      "recall: <anything you said last run>", "quit".
+Try:  "remember: city = Lisbon", restart, "facts", "search: <anything from last run>", "quit".
 """
 
 import elastimem
 
 
 def main() -> None:
-    mem = elastimem.open("./minimal_bot_memory.db")
-    print(f"[elastimem tier: {mem.profile.tier.name}, "
-          f"facts known: {len(mem.facts())}]")
+    with elastimem.open("./minimal_bot_memory.db") as mem:
+        print(f"[tier {mem.status.tier.name}, vectors: {mem.status.reasons['vectors']}]")
+        while True:
+            try:
+                user = input("you> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                break
+            if not user or user.lower() in ("quit", "exit"):
+                break
 
-    while True:
-        try:
-            user = input("you> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            break
-        if not user or user.lower() in ("quit", "exit"):
-            break
+            if user.lower().startswith("remember:") and "=" in user:
+                key, value = user[9:].split("=", 1)
+                reply = "stored" if mem.remember(key, value) else "already known"
+            elif user.lower().startswith("search:"):
+                hits = mem.search(user[7:])
+                reply = "\n".join(f"[{h.date}] {h.text[:120]}" for h in hits) or "nothing found"
+            elif user.lower() == "facts":
+                reply = "\n".join(f"- {k}: {v}" for k, v in mem.facts().items()) or "no facts yet"
+            else:
+                # A real host sends str(mem.context(user)) and the message to its model.
+                reply = f"(no model here; memory for this turn:)\n{mem.context(user)}"
 
-        if user.lower().startswith("recall:"):
-            hits = mem.recall(user[7:])
-            reply = ("\n".join(f"[{h.date}] {h.text[:120]}" for h in hits)
-                     or "nothing found")
-        elif "know about me" in user.lower():
-            facts = mem.facts()
-            reply = ("\n".join(f"- {k}: {v}" for k, v in facts.items())
-                     or "nothing yet — tell me about yourself!")
-        else:
-            # A real host would send build_context() + user to a model.
-            plan = mem.build_context(user)
-            known = plan.sections["user_facts"].replace("\n", ", ")
-            reply = f"(no LLM here, but I'm listening{' — I know: ' + known if known else ''})"
-
-        print(f"bot> {reply}")
-        mem.record_turn(user, reply)   # rule capture happens in here
-
-    mem.end_session()
-    mem.close()
-    print("[session saved]")
+            print(f"bot> {reply}")
+            mem.record(user, reply)
+    print("[saved]")
 
 
 if __name__ == "__main__":

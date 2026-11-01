@@ -1,21 +1,14 @@
-"""Elastimem wired to any OpenAI-compatible chat completions endpoint
-(OpenAI itself, Groq, Together, a local vLLM/llama.cpp server, etc.) via a
-plain HTTP POST — no vendor SDK required, just requests.
+"""Elastimem with any OpenAI-compatible endpoint (OpenAI, Groq, Together, a
+local vLLM or llama.cpp server) through a plain HTTP POST.
 
 Requires:  pip install requests
-Env:       OPENAI_API_KEY (or GROQ_API_KEY etc.), OPENAI_BASE_URL,
-           OPENAI_MODEL — defaults target Groq's endpoint since it's a free
-           tier, but any OpenAI-compatible base_url/model works unchanged.
+Env:       OPENAI_API_KEY (or GROQ_API_KEY), OPENAI_BASE_URL, OPENAI_MODEL.
+           Defaults target Groq's free tier; any compatible endpoint works.
 
-This is the same `llm=` shape as any other example — a plain
-``(prompt, *, max_tokens, temperature) -> str`` callable — just backed by a
-network call instead of an in-process model.
-
-No `embedder=` is passed below, so Elastimem's built-in embedder
-auto-activates (see docs/governor.md) once the `elastimem[embed]` extra is
-installed — its first use downloads a small model from Hugging Face Hub in
-the background. Pass `disable_builtin_embedder=True` to opt out and stay
-FTS5-only.
+The model is remote, so it never competes with Elastimem's background work
+and no ``pause()`` is needed. No ``embedder=`` is passed: the built-in one
+is used when ``elastimem[embed]`` is installed (first use downloads a small
+model); pass ``embedder=None`` for keyword search only.
 """
 
 import os
@@ -34,12 +27,8 @@ def make_llm(api_key: str, base_url: str, model: str):
         resp = requests.post(
             f"{base_url}/chat/completions",
             headers={"Authorization": f"Bearer {api_key}"},
-            json={
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-            },
+            json={"model": model, "messages": [{"role": "user", "content": prompt}],
+                  "max_tokens": max_tokens, "temperature": temperature},
             timeout=30,
         )
         resp.raise_for_status()
@@ -54,26 +43,19 @@ def main() -> None:
         return
 
     llm = make_llm(API_KEY, BASE_URL, MODEL)
-    mem = elastimem.open("./openai_agent_memory.db", llm=llm)
-    print(f"[tier: {mem.profile.tier.name}, model: {MODEL}]")
-
-    while True:
-        try:
-            user = input("you> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            break
-        if not user or user.lower() in ("quit", "exit"):
-            break
-
-        plan = mem.build_context(user)
-        prompt = f"{plan.render()}\nUser: {user}\nAssistant:"
-        reply = llm(prompt, max_tokens=200, temperature=0.3)
-
-        print(f"bot> {reply}")
-        mem.record_turn(user, reply)
-
-    mem.end_session()
-    mem.close()
+    with elastimem.open("./openai_agent_memory.db", llm=llm) as mem:
+        print(f"[tier {mem.status.tier.name}, model {MODEL}]")
+        while True:
+            try:
+                user = input("you> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                break
+            if not user or user.lower() in ("quit", "exit"):
+                break
+            reply = llm(f"{mem.context(user)}\n\nUser: {user}\nAssistant:",
+                        max_tokens=200, temperature=0.3)
+            print(f"bot> {reply}")
+            mem.record(user, reply)
 
 
 if __name__ == "__main__":

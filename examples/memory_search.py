@@ -1,6 +1,5 @@
-"""Basic memory & search, no chat loop: mem.remember(), mem.recall(),
-mem.facts(), mem.fact_history() used directly. No LLM, no embedder required
-— demonstrates the memory API on its own, outside of a conversation.
+"""The memory API on its own, outside a conversation: facts, their
+history, and search. No LLM needed.
 
 Run:  python examples/memory_search.py
 """
@@ -9,32 +8,24 @@ import elastimem
 
 
 def main() -> None:
-    mem = elastimem.open("./memory_search_demo.db")
+    with elastimem.open("./memory_search_demo.db") as mem:
+        mem.remember("name", "Sam")
+        mem.remember("favorite_color", "teal")
+        print("same value again changes nothing:", mem.remember("favorite_color", "teal"))
+        mem.remember("favorite_color", "blue")
+        print("facts:", mem.facts())
+        print("history:", [(f.value, f.since, f.until) for f in mem.history("favorite_color")])
 
-    # Explicit facts (source="explicit" is the default).
-    mem.remember("name", "Sam")
-    mem.remember("favorite_color", "teal")
-    changed, reason = mem.remember("favorite_color", "teal")  # no-op, same value
-    print(f"re-storing the same value: changed={changed}, reason={reason!r}")
+        mem.forget("name")
+        print("after forget('name'):", mem.facts())
 
-    mem.remember("favorite_color", "blue")  # value changed -> new version
-    print("current facts:", mem.facts())
-    print("favorite_color history:", mem.fact_history("favorite_color"))
-
-    mem.forget("name")
-    print("facts after forget('name'):", mem.facts())
-
-    # A couple of turns, so recall() has something to search over.
-    mem.record_turn("what's the capital of Japan?", "Tokyo is the capital of Japan.")
-    mem.record_turn("what's 2+2?", "2+2 is 4.")
-    mem.drain()
-
-    hits = mem.recall("capital of Japan")
-    print("recall('capital of Japan'):")
-    for h in hits:
-        print(f"  [{h.kind}] {h.text[:80]}")
-
-    mem.close()
+        mem.record("what's the capital of Japan?", "Tokyo is the capital of Japan.")
+        mem.record("what's 2+2?", "2+2 is 4.")
+        mem.new_session()            # search() looks at past sessions and facts
+        mem.flush()
+        for hit in mem.search("Japanese capital city"):
+            print(f"  [{hit.kind} {hit.score:.2f}] {hit.text[:80]!r}")
+        print("why:", mem.explain("Japanese capital city", k=1).items[0].parts)
 
 
 if __name__ == "__main__":
