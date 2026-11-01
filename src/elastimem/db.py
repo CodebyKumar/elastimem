@@ -1,37 +1,30 @@
-"""SQLite layer: schema, migrations, connections, corruption recovery.
+"""SQLite storage: schema, migrations, connections.
 
-One Elastimem store is one SQLite file in WAL mode. Concurrency model:
+One store is one SQLite file in WAL mode. Each thread opens its own
+connection and writes are serialized by the store's write lock. A
+``:memory:`` store is the exception: every new ``:memory:`` connection is a
+separate empty database, so all threads share the first one.
 
-* WAL allows one writer and many readers at once.
-* Each thread gets its own connection (:func:`connect` is cheap; callers cache
-  per-thread). All writes are serialized through ``Elastimem._write_lock`` at the
-  store level, so ``check_same_thread=False`` is never needed.
-* FTS5 is feature-detected once per store; when absent, retrieval falls back
-  to ``LIKE`` matching (see the degradation matrix in docs/governor.md).
+``messages`` is the source of truth. Every other table is derived from it,
+and pending work is whatever derived data is still missing (a chunk with no
+embedding, a turn with no ``extracted_at``), so nothing is lost on a crash.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import os
 import sqlite3
 import time
+from datetime import datetime, timezone
 
 log = logging.getLogger("elastimem")
 
-SCHEMA_VERSION = 3
-
-_PRAGMAS = (
-    "PRAGMA journal_mode=WAL",
-    "PRAGMA synchronous=NORMAL",
-    "PRAGMA foreign_keys=ON",
-)
+SCHEMA_VERSION = 4
 
 _SCHEMA = """
-CREATE TABLE IF NOT EXISTS meta (
-  key   TEXT PRIMARY KEY,
-  value TEXT NOT NULL
-);
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
 CREATE TABLE IF NOT EXISTS sessions (
   id              INTEGER PRIMARY KEY,
@@ -40,18 +33,19 @@ CREATE TABLE IF NOT EXISTS sessions (
   title           TEXT,
   summary         TEXT,
   rolling_summary TEXT,
+  summary_turn    INTEGER NOT NULL DEFAULT 0,
   message_count   INTEGER NOT NULL DEFAULT 0,
-  host_tag        TEXT
+  tag             TEXT
 );
 
 CREATE TABLE IF NOT EXISTS messages (
-  id             INTEGER PRIMARY KEY,
-  session_id     INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-  turn           INTEGER NOT NULL,
-  role           TEXT NOT NULL CHECK (role IN ('user','assistant','system')),
-  content        TEXT NOT NULL,
-  created_at     TEXT NOT NULL,
-  token_estimate INTEGER NOT NULL DEFAULT 0
+  id         INTEGER PRIMARY KEY,
+  session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  turn       INTEGER NOT NULL,
+  role       TEXT NOT NULL CHECK (role IN ('user','assistant','system')),
+  content    TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  tokens     INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, turn);
 
@@ -62,42 +56,44 @@ CREATE TABLE IF NOT EXISTS chunks (
   last_msg_id     INTEGER NOT NULL,
   text            TEXT NOT NULL,
   created_at      TEXT NOT NULL,
+  importance      REAL NOT NULL DEFAULT 0.5,
   embedding       BLOB,
   embedding_model TEXT,
-  importance      REAL NOT NULL DEFAULT 0.5
+  extracted_at    TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_chunks_session ON chunks(session_id);
-CREATE INDEX IF NOT EXISTS idx_chunks_pending_embed ON chunks(id) WHERE embedding IS NULL;
+CREATE INDEX IF NOT EXISTS idx_chunks_unembedded ON chunks(id) WHERE embedding IS NULL;
+CREATE INDEX IF NOT EXISTS idx_chunks_unextracted ON chunks(id) WHERE extracted_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS facts (
-  id               INTEGER PRIMARY KEY,
-  key              TEXT NOT NULL,
-  value            TEXT NOT NULL,
-  category         TEXT NOT NULL CHECK (category IN ('profile','note')),
-  source           TEXT NOT NULL CHECK (source IN ('explicit','auto','rule','import')),
-  importance       REAL NOT NULL,
-  created_at       TEXT NOT NULL,
-  valid_from       TEXT NOT NULL,
-  invalidated_at   TEXT,
-  invalidated_by   INTEGER REFERENCES facts(id),
-  archived         INTEGER NOT NULL DEFAULT 0,
-  last_accessed_at TEXT,
-  access_count     INTEGER NOT NULL DEFAULT 0
+  id              INTEGER PRIMARY KEY,
+  key             TEXT NOT NULL,
+  value           TEXT NOT NULL,
+  source          TEXT NOT NULL CHECK (source IN ('explicit','auto','import')),
+  importance      REAL NOT NULL,
+  created_at      TEXT NOT NULL,
+  since           TEXT NOT NULL,
+  until           TEXT,
+  replaced_by     INTEGER,
+  archived        INTEGER NOT NULL DEFAULT 0,
+  last_used       TEXT,
+  uses            INTEGER NOT NULL DEFAULT 0,
+  embedding       BLOB,
+  embedding_model TEXT
 );
-CREATE UNIQUE INDEX IF NOT EXISTS idx_facts_current
-  ON facts(key) WHERE invalidated_at IS NULL;
-CREATE INDEX IF NOT EXISTS idx_facts_key_history ON facts(key, valid_from);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_facts_current ON facts(key) WHERE until IS NULL;
+CREATE INDEX IF NOT EXISTS idx_facts_history ON facts(key, since);
+CREATE INDEX IF NOT EXISTS idx_facts_unembedded ON facts(id) WHERE embedding IS NULL;
 
 CREATE TABLE IF NOT EXISTS lessons (
   id         INTEGER PRIMARY KEY,
   text       TEXT NOT NULL UNIQUE,
-  tag        TEXT,
   created_at TEXT NOT NULL,
-  use_count  INTEGER NOT NULL DEFAULT 0,
+  uses       INTEGER NOT NULL DEFAULT 0,
   archived   INTEGER NOT NULL DEFAULT 0
 );
 
-CREATE TABLE IF NOT EXISTS quarantine (
+CREATE TABLE IF NOT EXISTS rejected (
   id     INTEGER PRIMARY KEY,
   ts     TEXT NOT NULL,
   key    TEXT,
@@ -105,90 +101,157 @@ CREATE TABLE IF NOT EXISTS quarantine (
   reason TEXT NOT NULL,
   source TEXT
 );
-"""
 
-_GRAPH_SCHEMA = """
-CREATE TABLE IF NOT EXISTS graph_nodes (
-  id              INTEGER PRIMARY KEY,
-  type            TEXT NOT NULL DEFAULT 'entity',
-  canonical_name  TEXT NOT NULL,
-  aliases         TEXT NOT NULL DEFAULT '[]',
-  created_at      TEXT NOT NULL,
-  updated_at      TEXT NOT NULL,
-  importance      REAL NOT NULL DEFAULT 0.5,
-  confidence      REAL NOT NULL DEFAULT 0.5,
-  mention_count   INTEGER NOT NULL DEFAULT 1,
-  cluster_id      INTEGER,
-  cluster_label   TEXT
+CREATE TABLE IF NOT EXISTS entities (
+  id         INTEGER PRIMARY KEY,
+  type       TEXT NOT NULL DEFAULT 'entity',
+  name       TEXT NOT NULL,
+  aliases    TEXT NOT NULL DEFAULT '[]',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  confidence REAL NOT NULL DEFAULT 0.5,
+  seen       INTEGER NOT NULL DEFAULT 1,
+  topic_id   INTEGER,
+  topic      TEXT
 );
-CREATE UNIQUE INDEX IF NOT EXISTS idx_graph_nodes_canonical
-  ON graph_nodes(type, canonical_name);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_name ON entities(type, name);
+CREATE INDEX IF NOT EXISTS idx_entities_topic ON entities(topic_id);
 
-CREATE TABLE IF NOT EXISTS graph_edges (
-  id               INTEGER PRIMARY KEY,
-  source_node      INTEGER NOT NULL REFERENCES graph_nodes(id) ON DELETE CASCADE,
-  target_node      INTEGER NOT NULL REFERENCES graph_nodes(id) ON DELETE CASCADE,
-  relationship     TEXT NOT NULL,
-  confidence       REAL NOT NULL DEFAULT 0.5,
-  importance       REAL NOT NULL DEFAULT 0.5,
-  weight           REAL NOT NULL DEFAULT 1.0,
-  created_at       TEXT NOT NULL,
-  last_seen        TEXT NOT NULL,
-  seen_count       INTEGER NOT NULL DEFAULT 1,
-  source_chunk_id  INTEGER REFERENCES chunks(id) ON DELETE SET NULL
+CREATE TABLE IF NOT EXISTS relations (
+  id         INTEGER PRIMARY KEY,
+  source     INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+  target     INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+  relation   TEXT NOT NULL,
+  confidence REAL NOT NULL DEFAULT 0.5,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  seen       INTEGER NOT NULL DEFAULT 1,
+  chunk_id   INTEGER REFERENCES chunks(id) ON DELETE SET NULL
 );
-CREATE UNIQUE INDEX IF NOT EXISTS idx_graph_edges_dedup
-  ON graph_edges(source_node, target_node, relationship);
-CREATE INDEX IF NOT EXISTS idx_graph_edges_source ON graph_edges(source_node);
-CREATE INDEX IF NOT EXISTS idx_graph_edges_target ON graph_edges(target_node);
-"""
+CREATE UNIQUE INDEX IF NOT EXISTS idx_relations_identity ON relations(source, target, relation);
+CREATE INDEX IF NOT EXISTS idx_relations_target ON relations(target);
 
-# Applied separately from _GRAPH_SCHEMA (not folded into the CREATE TABLE
-# block above): the cluster_id/cluster_label columns are new as of v3, so
-# this index can only be created after a v2 store's ALTER TABLE has run
-# (see _migrate's `current < 3` step). A fresh store gets both the columns
-# (baked into _GRAPH_SCHEMA's CREATE TABLE) and this index applied here,
-# in open_store(), right after _GRAPH_SCHEMA - safe either way since
-# CREATE INDEX IF NOT EXISTS is idempotent and the column always exists by
-# this point on a fresh store.
-_GRAPH_CLUSTER_INDEX = (
-    "CREATE INDEX IF NOT EXISTS idx_graph_nodes_cluster ON graph_nodes(cluster_id)"
-)
+CREATE TABLE IF NOT EXISTS mentions (
+  entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+  chunk_id  INTEGER NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+  PRIMARY KEY (entity_id, chunk_id)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_mentions_chunk ON mentions(chunk_id);
+"""
 
 _FTS_SCHEMA = """
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
   text, content='chunks', content_rowid='id', tokenize='porter unicode61');
-
 CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
   INSERT INTO chunks_fts(rowid, text) VALUES (new.id, new.text);
 END;
 CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
   INSERT INTO chunks_fts(chunks_fts, rowid, text) VALUES ('delete', old.id, old.text);
 END;
-CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE OF text ON chunks BEGIN
-  INSERT INTO chunks_fts(chunks_fts, rowid, text) VALUES ('delete', old.id, old.text);
-  INSERT INTO chunks_fts(rowid, text) VALUES (new.id, new.text);
-END;
 
 CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
   key, value, content='facts', content_rowid='id', tokenize='porter unicode61');
-
 CREATE TRIGGER IF NOT EXISTS facts_ai AFTER INSERT ON facts BEGIN
   INSERT INTO facts_fts(rowid, key, value) VALUES (new.id, new.key, new.value);
 END;
 CREATE TRIGGER IF NOT EXISTS facts_ad AFTER DELETE ON facts BEGIN
-  INSERT INTO facts_fts(facts_fts, rowid, key, value)
-    VALUES ('delete', old.id, old.key, old.value);
+  INSERT INTO facts_fts(facts_fts, rowid, key, value) VALUES ('delete', old.id, old.key, old.value);
 END;
 CREATE TRIGGER IF NOT EXISTS facts_au AFTER UPDATE OF key, value ON facts BEGIN
-  INSERT INTO facts_fts(facts_fts, rowid, key, value)
-    VALUES ('delete', old.id, old.key, old.value);
+  INSERT INTO facts_fts(facts_fts, rowid, key, value) VALUES ('delete', old.id, old.key, old.value);
   INSERT INTO facts_fts(rowid, key, value) VALUES (new.id, new.key, new.value);
 END;
 """
 
+# v3 -> v4. Tables whose constraints change are rebuilt; the rest are
+# renamed in place. Turns recorded before v4 count as already extracted, so
+# opening an old store does not queue its whole history for the LLM.
+_MIGRATE_V3 = """
+ALTER TABLE sessions ADD COLUMN summary_turn INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE sessions RENAME COLUMN host_tag TO tag;
+ALTER TABLE messages RENAME COLUMN token_estimate TO tokens;
+ALTER TABLE chunks ADD COLUMN extracted_at TEXT;
+UPDATE chunks SET extracted_at = created_at;
+ALTER TABLE quarantine RENAME TO rejected;
 
-def _fts5_available(conn: sqlite3.Connection) -> bool:
+DROP INDEX IF EXISTS idx_chunks_pending_embed;
+DROP TRIGGER IF EXISTS chunks_au;
+DROP TRIGGER IF EXISTS facts_ai;
+DROP TRIGGER IF EXISTS facts_ad;
+DROP TRIGGER IF EXISTS facts_au;
+DROP TABLE IF EXISTS facts_fts;
+DROP INDEX IF EXISTS idx_facts_current;
+DROP INDEX IF EXISTS idx_facts_key_history;
+ALTER TABLE facts RENAME TO facts_v3;
+ALTER TABLE lessons RENAME TO lessons_v3;
+"""
+
+_COPY_V3 = """
+INSERT INTO facts(id, key, value, source, importance, created_at, since, until,
+                  replaced_by, archived, last_used, uses)
+  SELECT id, key, value, CASE source WHEN 'rule' THEN 'auto' ELSE source END,
+         importance, created_at, valid_from, invalidated_at, invalidated_by,
+         archived, last_accessed_at, access_count
+  FROM facts_v3;
+INSERT INTO lessons(id, text, created_at, uses, archived)
+  SELECT id, text, created_at, use_count, archived FROM lessons_v3;
+INSERT INTO entities(id, type, name, aliases, created_at, updated_at, confidence,
+                     seen, topic_id, topic)
+  SELECT id, type, canonical_name, aliases, created_at, updated_at, confidence,
+         mention_count, cluster_id, cluster_label
+  FROM graph_nodes;
+INSERT INTO relations(id, source, target, relation, confidence, created_at,
+                      updated_at, seen, chunk_id)
+  SELECT id, source_node, target_node, relationship, confidence, created_at,
+         last_seen, seen_count, source_chunk_id
+  FROM graph_edges;
+INSERT OR IGNORE INTO mentions(entity_id, chunk_id)
+  SELECT e.id, c.id FROM entities e JOIN chunks c
+  ON lower(c.text) LIKE '%' || e.name || '%' WHERE e.name != 'user';
+DROP TABLE facts_v3;
+DROP TABLE lessons_v3;
+DROP TABLE graph_edges;
+DROP TABLE graph_nodes;
+"""
+
+
+def utcnow() -> str:
+    """ISO-8601 UTC timestamp, the one time format used in the store."""
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def days_since(iso_ts: str | None) -> float:
+    """Days elapsed since an ``utcnow()`` timestamp (0 for missing/bad input)."""
+    if not iso_ts:
+        return 0.0
+    try:
+        then = datetime.fromisoformat(iso_ts)
+    except ValueError:
+        return 0.0
+    if then.tzinfo is None:
+        then = then.replace(tzinfo=timezone.utc)
+    return max(0.0, (datetime.now(timezone.utc) - then).total_seconds() / 86400.0)
+
+
+def decay(value: float, iso_ts: str | None, half_life_days: float) -> float:
+    """``value * exp(-days_since(ts) / half_life)``, also registered in SQL."""
+    return value * math.exp(-days_since(iso_ts) / half_life_days)
+
+
+def connect(path: str) -> sqlite3.Connection:
+    """Open a connection to an existing store. No schema work."""
+    # Each thread uses its own connection, but close() runs on the host's
+    # thread and must close the worker's too, so the thread check is off.
+    conn = sqlite3.connect(path, timeout=10.0, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.create_function("decay", 3, decay, deterministic=True)
+    return conn
+
+
+def fts5_available(conn: sqlite3.Connection) -> bool:
     try:
         conn.execute("CREATE VIRTUAL TABLE temp._fts_probe USING fts5(x)")
         conn.execute("DROP TABLE temp._fts_probe")
@@ -197,36 +260,11 @@ def _fts5_available(conn: sqlite3.Connection) -> bool:
         return False
 
 
-def connect(path: str) -> sqlite3.Connection:
-    """Open a connection to an existing store. One per thread; no schema work.
-
-    ``:memory:`` is the one exception to "one per thread": sqlite3 gives
-    each new connection to ``:memory:`` its own separate, empty database,
-    so a ":memory:" store must share a single connection across every
-    thread that touches it (see ``store.py``'s ``_memory_conn``) rather
-    than opening a fresh one per thread the way file-backed stores do.
-    That shared connection is therefore genuinely used from multiple
-    threads, so it needs ``check_same_thread=False`` — safe here because
-    every write already goes through ``Elastimem._write_lock``, and reads
-    are short synchronous calls, the same safety property WAL mode
-    provides for file-backed stores' actually-separate per-thread
-    connections.
-    """
-    conn = sqlite3.connect(
-        path, timeout=10.0, check_same_thread=(path != ":memory:")
-    )
-    conn.row_factory = sqlite3.Row
-    for pragma in _PRAGMAS:
-        conn.execute(pragma)
-    return conn
-
-
 def open_store(path: str) -> tuple[sqlite3.Connection, bool]:
-    """Open (creating/migrating if needed) the store at ``path``.
+    """Open, creating or migrating if needed. Returns ``(conn, fts_enabled)``.
 
-    Returns ``(connection, fts_enabled)``. If the existing file is corrupt it
-    is renamed to ``<path>.corrupt-<ts>`` and a fresh store is created — the
-    store must never take the host down (degradation floor).
+    A corrupt file is moved to ``<path>.corrupt-<ts>`` and a fresh store is
+    created: memory must never take the host down.
     """
     if path != ":memory:":
         os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
@@ -234,67 +272,49 @@ def open_store(path: str) -> tuple[sqlite3.Connection, bool]:
         conn = connect(path)
         conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
     except sqlite3.DatabaseError:
-        quarantined = f"{path}.corrupt-{int(time.time())}"
-        log.warning("elastimem: store at %s is corrupt; moving to %s and recreating",
-                    path, quarantined)
-        os.replace(path, quarantined)
+        moved = f"{path}.corrupt-{int(time.time())}"
+        log.warning("elastimem: store at %s is corrupt; moved to %s", path, moved)
+        os.replace(path, moved)
         conn = connect(path)
 
-    fts = _fts5_available(conn)
-    with conn:
-        conn.executescript(_SCHEMA)
-        conn.executescript(_GRAPH_SCHEMA)
-        if fts:
-            conn.executescript(_FTS_SCHEMA)
-        _migrate(conn)
-        # Only safe to run after _migrate(): on a store upgrading from v2,
-        # cluster_id doesn't exist as a column until _migrate's `current <
-        # 3` step adds it. On a fresh store the column already exists (see
-        # _GRAPH_SCHEMA above), so this is a harmless no-op there.
-        conn.execute(_GRAPH_CLUSTER_INDEX)
+    fts = fts5_available(conn)
+    version = _version(conn)
+    if version is not None and version > SCHEMA_VERSION:
+        raise RuntimeError(
+            f"store schema v{version} is newer than this elastimem (v{SCHEMA_VERSION}); "
+            "upgrade the elastimem package"
+        )
+    if version is not None and version < 3:
+        raise RuntimeError(
+            f"store schema v{version} is too old to migrate; open it once with "
+            "elastimem 0.2 to upgrade it to v3"
+        )
+    migrating = version == 3
+    script = "".join([
+        _MIGRATE_V3 if migrating else "",
+        _SCHEMA,
+        _COPY_V3 if migrating else "",
+        _FTS_SCHEMA if fts else "",
+        "INSERT INTO facts_fts(facts_fts) VALUES ('rebuild');" if fts and migrating else "",
+        f"INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', '{SCHEMA_VERSION}');",
+    ])
+    # One transaction: a failed migration leaves the v3 store untouched.
+    # Foreign keys are off while tables are rebuilt; the pragma is a no-op
+    # inside a transaction, so it is set around it.
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.executescript(f"BEGIN;{script}COMMIT;")
+    except sqlite3.Error:
+        conn.rollback()
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
     return conn, fts
 
 
-def _migrate(conn: sqlite3.Connection) -> None:
-    """Versioned migrations. v1 is the base schema; future versions append here."""
-    row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
-    if row is None:
-        conn.execute(
-            "INSERT INTO meta(key, value) VALUES ('schema_version', ?)",
-            (str(SCHEMA_VERSION),),
-        )
-        return
-    current = int(row["value"])
-    if current > SCHEMA_VERSION:
-        raise RuntimeError(
-            f"store schema v{current} is newer than this elastimem (v{SCHEMA_VERSION}); "
-            "upgrade the elastimem package"
-        )
-    if current < 2:
-        conn.executescript(_GRAPH_SCHEMA)
-        current = 2
-    if current < 3:
-        # cluster_id/cluster_label are new columns on an existing table for
-        # any v2 store — CREATE TABLE IF NOT EXISTS (already applied above/
-        # unconditionally in open_store) is a no-op here, unlike the v1->v2
-        # step where graph_nodes didn't exist at all yet.
-        existing_cols = {
-            r["name"] for r in conn.execute("PRAGMA table_info(graph_nodes)")
-        }
-        if "cluster_id" not in existing_cols:
-            conn.execute("ALTER TABLE graph_nodes ADD COLUMN cluster_id INTEGER")
-        if "cluster_label" not in existing_cols:
-            conn.execute("ALTER TABLE graph_nodes ADD COLUMN cluster_label TEXT")
-        current = 3
-    if current != int(row["value"]):
-        conn.execute(
-            "UPDATE meta SET value=? WHERE key='schema_version'", (str(current),)
-        )
-    # future: stepwise `if current < 3: ...` blocks, then bump the meta row.
-
-
-def utcnow() -> str:
-    """ISO-8601 UTC timestamp, the single time format used across the store."""
-    from datetime import datetime, timezone
-
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+def _version(conn: sqlite3.Connection) -> int | None:
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+    except sqlite3.OperationalError:
+        return None
+    return int(row["value"]) if row else None

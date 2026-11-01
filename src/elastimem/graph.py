@@ -1,642 +1,269 @@
-"""Embedded semantic knowledge graph: entities and relationships extracted
-from conversation, stored as plain tables in the same SQLite file.
+"""Graph: entities and relations extracted from conversation, plus
+``mentions`` linking entities to the chunks they came from.
 
-The graph is not a separate product — it is one more retrieval signal
-(see :mod:`elastimem.retrieval`), governed by the same Memory Governor tier
-gating as everything else (:class:`elastimem.config.MemoryProfile.graph_hops`).
-No NER library, no graph library: entities/relationships come from the same
-LLM completion :mod:`elastimem.extraction` already makes for facts, and
-multi-hop traversal is a plain SQLite ``WITH RECURSIVE`` query.
-
-Write-time dedup (unique indexes on node identity and edge identity) means
-repeated mentions of the same entity/relationship update an existing row
-instead of creating a new one. On top of that, :func:`_enforce_caps` bounds
-growth from genuinely distinct entities/relationships, mirroring
-``guards.quarantine``'s trim-on-write pattern.
-
-Nothing in this module raises to the caller; failures degrade to "no graph
-signal" (empty results / stored-seeds-only), matching the rest of the
-extraction and retrieval pipeline.
+Entities and relations come from the same LLM call that extracts facts.
+Traversal is a ``WITH RECURSIVE`` query. Repeated mentions update the
+existing row (unique indexes on identity); caps bound growth from distinct
+entities. Topics are connected components, optionally named by the LLM.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import math
+import re
 import sqlite3
-from datetime import datetime, timezone
-from typing import Callable
 
+from . import tiers
 from .db import utcnow
 
 log = logging.getLogger("elastimem")
 
-CompleteFn = Callable[..., str]
-
-_ARTICLES = ("the ", "a ", "an ")
+# The extraction prompt names the user "user". That node links to nearly
+# every entity, so traversal never passes through it.
+USER = "user"
+_TYPES = frozenset({"person", "place", "org", "thing", "entity"})
 _MAX_ALIASES = 8
-_VALID_ENTITY_TYPES = frozenset({"person", "place", "org", "thing", "entity"})
 
 
-def _canonicalize(name: str) -> str:
-    """Lowercase, collapse whitespace, strip a leading article. No fuzzy
-    matching — this is deliberately simple, matching the project's
-    no-new-dependency stance on entity resolution."""
-    normalized = " ".join(name.strip().lower().split())
-    for article in _ARTICLES:
-        if normalized.startswith(article):
-            normalized = normalized[len(article):]
-            break
-    return normalized
+def _name(raw: str) -> str:
+    return " ".join(str(raw).casefold().split())
 
 
-def upsert_node(
-    conn: sqlite3.Connection, node_type: str, name: str, *, confidence: float = 0.5
+def padded_words(text: str) -> str:
+    """Space-padded word string, for word-boundary name matching."""
+    return " " + " ".join(re.findall(r"\w+", text.casefold())) + " "
+
+
+# --- writing -----------------------------------------------------------------
+def upsert_entity(
+    conn: sqlite3.Connection, kind: str, raw: str, confidence: float = 0.5
 ) -> int | None:
-    """Insert or update one entity by canonical identity. Returns the node
-    id, or None if ``name`` canonicalizes to nothing (empty/whitespace)."""
-    raw = str(name).strip()
-    canonical = _canonicalize(raw)
-    if not canonical:
-        return None
-    node_type = node_type if node_type in _VALID_ENTITY_TYPES else "entity"
-    now = utcnow()
-    row = conn.execute(
-        "INSERT INTO graph_nodes(type, canonical_name, aliases, created_at,"
-        " updated_at, importance, confidence, mention_count)"
-        " VALUES (?, ?, '[]', ?, ?, 0.5, ?, 1)"
-        " ON CONFLICT(type, canonical_name) DO UPDATE SET"
-        "   updated_at = excluded.updated_at,"
-        "   mention_count = mention_count + 1,"
-        "   confidence = (confidence * mention_count + excluded.confidence)"
-        "                / (mention_count + 1)"
-        " RETURNING id, aliases, mention_count",
-        (node_type, canonical, now, now, confidence),
-    ).fetchone()
-    node_id = row["id"]
-
-    if raw != canonical:
-        try:
-            aliases = json.loads(row["aliases"]) or []
-        except (TypeError, ValueError):
-            aliases = []
-        if raw not in aliases:
-            aliases = ([raw] + aliases)[:_MAX_ALIASES]
-            conn.execute(
-                "UPDATE graph_nodes SET aliases=? WHERE id=?",
-                (json.dumps(aliases), node_id),
-            )
-    return node_id
-
-
-def upsert_edge(
-    conn: sqlite3.Connection,
-    source_id: int,
-    target_id: int,
-    relationship: str,
-    *,
-    confidence: float = 0.5,
-    source_chunk_id: int | None = None,
-) -> int | None:
-    """Insert or update one directed relationship. Returns the edge id, or
-    None if ``relationship`` is empty or the two endpoints are identical
-    (a self-loop carries no traversal value here)."""
-    relation = " ".join(str(relationship).strip().lower().split())
-    if not relation or source_id == target_id:
+    name = _name(raw)
+    if not name:
         return None
     now = utcnow()
     row = conn.execute(
-        "INSERT INTO graph_edges(source_node, target_node, relationship,"
-        " confidence, importance, weight, created_at, last_seen, seen_count,"
-        " source_chunk_id)"
-        " VALUES (?, ?, ?, ?, 0.5, 1.0, ?, ?, 1, ?)"
-        " ON CONFLICT(source_node, target_node, relationship) DO UPDATE SET"
-        "   last_seen = excluded.last_seen,"
-        "   seen_count = seen_count + 1,"
-        "   confidence = (confidence * seen_count + excluded.confidence)"
-        "                / (seen_count + 1)"
-        " RETURNING id",
-        (source_id, target_id, relation, confidence, now, now, source_chunk_id),
+        "INSERT INTO entities(type, name, created_at, updated_at, confidence)"
+        " VALUES (?,?,?,?,?)"
+        " ON CONFLICT(type, name) DO UPDATE SET updated_at=excluded.updated_at,"
+        "   seen=seen+1, confidence=(confidence*seen + excluded.confidence)/(seen+1)"
+        " RETURNING id, aliases",
+        (kind if kind in _TYPES else "entity", name, now, now, confidence),
     ).fetchone()
+    raw = str(raw).strip()
+    aliases = json.loads(row["aliases"] or "[]")
+    if raw != name and raw not in aliases:
+        conn.execute(
+            "UPDATE entities SET aliases=? WHERE id=?",
+            (json.dumps(([raw] + aliases)[:_MAX_ALIASES]), row["id"]),
+        )
     return row["id"]
 
 
-def _enforce_caps(conn: sqlite3.Connection, node_cap: int, edge_cap: int) -> None:
-    """Trim graph_nodes/graph_edges to their configured caps, evicting the
-    least important / least recently seen rows first. ON DELETE CASCADE on
-    graph_edges' foreign keys cleans up edges orphaned by a trimmed node."""
-    conn.execute(
-        "DELETE FROM graph_nodes WHERE id NOT IN ("
-        " SELECT id FROM graph_nodes"
-        " ORDER BY importance DESC, mention_count DESC, updated_at DESC LIMIT ?)",
-        (node_cap,),
-    )
-    conn.execute(
-        "DELETE FROM graph_edges WHERE id NOT IN ("
-        " SELECT id FROM graph_edges"
-        " ORDER BY importance DESC, seen_count DESC, last_seen DESC LIMIT ?)",
-        (edge_cap,),
-    )
-
-
 def store_extraction(
-    conn: sqlite3.Connection,
-    entities: object,
-    relationships: object,
-    *,
-    node_cap: int = 2000,
-    edge_cap: int = 5000,
-    source_chunk_id: int | None = None,
-) -> dict[str, int]:
-    """Single defensive entry point for one LLM extraction's graph payload.
-
-    ``entities``/``relationships`` are whatever the model returned under
-    those JSON keys — untyped and untrusted. Malformed entries are skipped
-    individually rather than aborting the whole batch; this function never
-    raises. Returns ``{"nodes": n, "edges": m}`` counts actually stored.
-    """
+    conn: sqlite3.Connection, entities: object, relations: object, chunk_ids: list[int]
+) -> int:
+    """Store one LLM extraction's untrusted ``entities``/``relations`` lists.
+    Malformed items are skipped. Returns the number of entities stored."""
+    ids: dict[str, int] = {}
     with conn:
-        node_ids: dict[str, int] = {}
-        node_count = 0
-        if isinstance(entities, list):
-            for item in entities:
-                if not isinstance(item, dict):
-                    continue
-                name = item.get("name")
-                if not isinstance(name, str) or not name.strip():
-                    continue
-                etype = item.get("type")
-                etype = etype if isinstance(etype, str) else "entity"
-                node_id = upsert_node(conn, etype, name)
-                if node_id is not None:
-                    node_ids[_canonicalize(name)] = node_id
-                    node_count += 1
-
-        edge_count = 0
-        if isinstance(relationships, list):
-            for item in relationships:
-                if not isinstance(item, dict):
-                    continue
-                source = item.get("source")
-                relation = item.get("relation")
-                target = item.get("target")
-                if not all(isinstance(v, str) and v.strip() for v in (source, relation, target)):
-                    continue
-                # Endpoints may reference an entity from `entities` above or
-                # be a bare mention not otherwise extracted (e.g. "user") —
-                # upsert either way so the edge always has valid endpoints.
-                source_id = node_ids.get(_canonicalize(source)) or upsert_node(
-                    conn, "entity", source
-                )
-                target_id = node_ids.get(_canonicalize(target)) or upsert_node(
-                    conn, "entity", target
-                )
-                if source_id is None or target_id is None:
-                    continue
-                edge_id = upsert_edge(
-                    conn, source_id, target_id, relation,
-                    source_chunk_id=source_chunk_id,
-                )
-                if edge_id is not None:
-                    edge_count += 1
-
-        if node_count or edge_count:
-            _enforce_caps(conn, node_cap, edge_cap)
-
-    return {"nodes": node_count, "edges": edge_count}
+        for item in entities if isinstance(entities, list) else []:
+            if isinstance(item, dict) and isinstance(item.get("name"), str):
+                kind = item.get("type") if isinstance(item.get("type"), str) else "entity"
+                entity_id = upsert_entity(conn, kind, item["name"])
+                if entity_id:
+                    ids[_name(item["name"])] = entity_id
+        now = utcnow()
+        for item in relations if isinstance(relations, list) else []:
+            if not isinstance(item, dict):
+                continue
+            parts = [item.get(k) for k in ("source", "relation", "target")]
+            if not all(isinstance(p, str) and p.strip() for p in parts):
+                continue
+            source, relation, target = parts
+            ends = [ids.get(_name(n)) or upsert_entity(conn, "entity", n) for n in (source, target)]
+            relation = "_".join(relation.casefold().split())
+            if None in ends or ends[0] == ends[1]:
+                continue
+            conn.execute(
+                "INSERT INTO relations(source, target, relation, created_at, updated_at, chunk_id)"
+                " VALUES (?,?,?,?,?,?)"
+                " ON CONFLICT(source, target, relation) DO UPDATE SET"
+                "   updated_at=excluded.updated_at, seen=seen+1",
+                (*ends, relation, now, now, chunk_ids[0] if chunk_ids else None),
+            )
+        conn.executemany(
+            "INSERT OR IGNORE INTO mentions(entity_id, chunk_id) VALUES (?,?)",
+            [(e, c) for name, e in ids.items() if name != USER for c in chunk_ids],
+        )
+        if ids:
+            _enforce_caps(conn)
+    return len(ids)
 
 
-def detect_seed_nodes(conn: sqlite3.Connection, query: str, limit: int = 5) -> list[tuple[int, int]]:
-    """[(node_id, match_length), ...] for nodes whose canonical_name or an
-    alias appears in ``query`` (case-insensitive substring match). No NER —
-    deliberately simple, an O(nodes) Python scan. Longer/more specific
-    matches are ranked first. Never raises."""
-    terms = query.lower()
-    try:
-        rows = conn.execute("SELECT id, canonical_name, aliases FROM graph_nodes").fetchall()
-    except sqlite3.Error:
-        log.exception("elastimem: seed node scan failed")
-        return []
-    matched: list[tuple[int, int]] = []
-    for row in rows:
-        names = [row["canonical_name"]]
-        try:
-            names.extend(json.loads(row["aliases"]) or [])
-        except (TypeError, ValueError):
-            pass
-        best = 0
-        for name in names:
-            if name and name.lower() in terms:
-                best = max(best, len(name))
+def _enforce_caps(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "DELETE FROM entities WHERE id NOT IN (SELECT id FROM entities"
+        " ORDER BY seen DESC, updated_at DESC LIMIT ?)", (tiers.ENTITY_CAP,),
+    )
+    conn.execute(
+        "DELETE FROM relations WHERE id NOT IN (SELECT id FROM relations"
+        " ORDER BY seen DESC, updated_at DESC LIMIT ?)", (tiers.RELATION_CAP,),
+    )
+
+
+# --- reading -----------------------------------------------------------------
+def seeds(conn: sqlite3.Connection, query: str, limit: int = 5) -> list[int]:
+    """Entities named in ``query`` (name or alias, whole words), longest first."""
+    words = padded_words(query)
+    found = []
+    for row in conn.execute("SELECT id, name, aliases FROM entities WHERE name != ?", (USER,)):
+        names = [row["name"], *json.loads(row["aliases"] or "[]")]
+        best = max((len(n) for n in names if padded_words(n).strip() and padded_words(n) in words), default=0)
         if best:
-            matched.append((row["id"], best))
-    matched.sort(key=lambda pair: -pair[1])
-    return matched[:limit]
+            found.append((best, row["id"]))
+    return [entity_id for _, entity_id in sorted(found, reverse=True)[:limit]]
 
 
-def expand(conn: sqlite3.Connection, seed_ids: list[int], hops: int) -> list[int]:
-    """Node ids reachable from any seed within ``hops`` edges (traversal is
-    undirected for retrieval purposes, even though edges are stored
-    directed — a query matching the object of a relationship must still
-    expand to the subject and vice versa). Includes the seeds themselves.
-    Degrades to the seed list on any SQL error, never raises."""
+def expand(conn: sqlite3.Connection, seed_ids: list[int], hops: int) -> dict[int, int]:
+    """``{entity_id: hop_distance}`` for everything within ``hops`` of a seed,
+    seeds included. Relations count in both directions."""
     if not seed_ids:
-        return []
-    if hops <= 0:
-        return list(dict.fromkeys(seed_ids))
-    placeholders = ",".join("?" * len(seed_ids))
-    try:
-        rows = conn.execute(
-            f"""
-            WITH RECURSIVE reachable(id, depth) AS (
-                SELECT id, 0 FROM graph_nodes WHERE id IN ({placeholders})
-                UNION
-                SELECT e.target_node, r.depth + 1
-                FROM graph_edges e JOIN reachable r ON e.source_node = r.id
-                WHERE r.depth < ?
-                UNION
-                SELECT e.source_node, r.depth + 1
-                FROM graph_edges e JOIN reachable r ON e.target_node = r.id
-                WHERE r.depth < ?
+        return {}
+    marks = ",".join("?" * len(seed_ids))
+    rows = conn.execute(
+        f"""WITH RECURSIVE reach(id, depth) AS (
+              SELECT id, 0 FROM entities WHERE id IN ({marks})
+              UNION
+              SELECT CASE WHEN r.source = reach.id THEN r.target ELSE r.source END, depth + 1
+              FROM reach JOIN relations r ON reach.id IN (r.source, r.target)
+              JOIN entities e ON e.id = reach.id
+              WHERE depth < ? AND (depth = 0 OR e.name != ?)
             )
-            SELECT DISTINCT id FROM reachable
-            """,
-            [*seed_ids, hops, hops],
-        ).fetchall()
-        # Union with the input seeds themselves: a seed id that no longer
-        # has a row in graph_nodes (e.g. evicted by cap enforcement between
-        # detection and expansion) must still come back rather than
-        # silently vanishing — "includes the seeds" is an unconditional
-        # guarantee, not contingent on the row still existing.
-        return list(dict.fromkeys([*seed_ids, *(row["id"] for row in rows)]))
-    except sqlite3.Error:
-        log.exception("elastimem: graph expansion query failed")
-        return list(dict.fromkeys(seed_ids))
+            SELECT reach.id, min(depth) AS depth FROM reach JOIN entities e ON e.id = reach.id
+            WHERE e.name != ? GROUP BY reach.id""",
+        (*seed_ids, hops, USER, USER),
+    ).fetchall()
+    return {r["id"]: r["depth"] for r in rows}
 
 
-def expand_with_depth(
-    conn: sqlite3.Connection, seed_ids: list[int], hops: int
-) -> list[tuple[int, int]]:
-    """Like :func:`expand`, but returns ``(node_id, min_hop_distance)``
-    pairs instead of a bare id list — used by ``retrieval.explain()`` to
-    show the traversal path a query took, not just its end result.
-    Degrades to seeds-at-depth-0 on any SQL error, never raises."""
-    if not seed_ids:
+def entities(conn: sqlite3.Connection, ids: list[int]) -> list[sqlite3.Row]:
+    if not ids:
         return []
-    if hops <= 0:
-        return [(sid, 0) for sid in dict.fromkeys(seed_ids)]
-    placeholders = ",".join("?" * len(seed_ids))
-    try:
-        rows = conn.execute(
-            f"""
-            WITH RECURSIVE reachable(id, depth) AS (
-                SELECT id, 0 FROM graph_nodes WHERE id IN ({placeholders})
-                UNION
-                SELECT e.target_node, r.depth + 1
-                FROM graph_edges e JOIN reachable r ON e.source_node = r.id
-                WHERE r.depth < ?
-                UNION
-                SELECT e.source_node, r.depth + 1
-                FROM graph_edges e JOIN reachable r ON e.target_node = r.id
-                WHERE r.depth < ?
-            )
-            SELECT id, MIN(depth) AS depth FROM reachable GROUP BY id
-            """,
-            [*seed_ids, hops, hops],
-        ).fetchall()
-        found = {row["id"]: row["depth"] for row in rows}
-        for sid in seed_ids:
-            found.setdefault(sid, 0)
-        return list(found.items())
-    except sqlite3.Error:
-        log.exception("elastimem: graph expansion-with-depth query failed")
-        return [(sid, 0) for sid in dict.fromkeys(seed_ids)]
+    return conn.execute(
+        f"SELECT id, name, confidence, topic FROM entities WHERE id IN ({','.join('?' * len(ids))})",
+        ids,
+    ).fetchall()
 
 
-def nodes_for_ids(conn: sqlite3.Connection, node_ids: list[int]) -> list[sqlite3.Row]:
-    """canonical_name/confidence rows for a set of node ids. Never raises."""
-    if not node_ids:
+def chunk_mentions(conn: sqlite3.Connection, ids: list[int]) -> list[sqlite3.Row]:
+    """``(entity_id, chunk_id)`` rows for the given entities."""
+    if not ids:
         return []
-    placeholders = ",".join("?" * len(node_ids))
-    try:
-        return conn.execute(
-            f"SELECT id, canonical_name, confidence FROM graph_nodes"
-            f" WHERE id IN ({placeholders})",
-            node_ids,
-        ).fetchall()
-    except sqlite3.Error:
-        log.exception("elastimem: graph node lookup failed")
-        return []
+    return conn.execute(
+        f"SELECT entity_id, chunk_id FROM mentions WHERE entity_id IN ({','.join('?' * len(ids))})",
+        ids,
+    ).fetchall()
 
 
-# --------------------------------------------------------------------------- #
-# maintenance: decay/archival, duplicate merging
-# --------------------------------------------------------------------------- #
-def _days_since(iso_ts: str) -> float:
-    try:
-        then = datetime.fromisoformat(iso_ts)
-        if then.tzinfo is None:
-            then = then.replace(tzinfo=timezone.utc)
-    except ValueError:
-        return 0.0
-    return max(0.0, (datetime.now(timezone.utc) - then).total_seconds() / 86400.0)
-
-
-def _decayed(confidence: float, anchor_ts: str, half_life_days: float) -> float:
-    """confidence * exp(-days_since_anchor / half_life) — same shape as
-    semantic.effective_importance, applied to graph confidence instead of
-    fact importance."""
-    return confidence * math.exp(-_days_since(anchor_ts) / half_life_days)
-
-
-def apply_decay(
-    conn: sqlite3.Connection, *, half_life_days: float, archive_threshold: float
-) -> dict[str, int]:
-    """Hard-delete nodes/edges whose decayed confidence has fallen below
-    ``archive_threshold``. Unlike facts (which soft-archive to preserve an
-    audit trail), the graph is a derived retrieval index with no audit
-    requirement, so a decayed row is simply removed — consistent with how
-    cap enforcement already hard-deletes on overflow. Reinforcement
-    (re-extraction bumping mention_count/seen_count and refreshing
-    updated_at/last_seen) resets the decay clock, so an entity that keeps
-    coming up in conversation never decays away.
-
-    Edges are checked first: a node with no edges left after edge decay is
-    a good deletion candidate on its own decay pass (ON DELETE CASCADE
-    handles the reverse — deleting a decayed node removes its edges).
-    Returns ``{"nodes": n, "edges": m}`` counts removed. Never raises.
-    """
-    removed = {"nodes": 0, "edges": 0}
-    try:
-        with conn:
-            edge_rows = conn.execute(
-                "SELECT id, confidence, last_seen FROM graph_edges"
-            ).fetchall()
-            stale_edges = [
-                row["id"] for row in edge_rows
-                if _decayed(row["confidence"], row["last_seen"], half_life_days)
-                < archive_threshold
-            ]
-            if stale_edges:
-                placeholders = ",".join("?" * len(stale_edges))
-                conn.execute(
-                    f"DELETE FROM graph_edges WHERE id IN ({placeholders})",
-                    stale_edges,
-                )
-                removed["edges"] = len(stale_edges)
-
-            node_rows = conn.execute(
-                "SELECT id, confidence, updated_at FROM graph_nodes"
-            ).fetchall()
-            stale_nodes = [
-                row["id"] for row in node_rows
-                if _decayed(row["confidence"], row["updated_at"], half_life_days)
-                < archive_threshold
-            ]
-            if stale_nodes:
-                placeholders = ",".join("?" * len(stale_nodes))
-                conn.execute(
-                    f"DELETE FROM graph_nodes WHERE id IN ({placeholders})",
-                    stale_nodes,
-                )
-                removed["nodes"] = len(stale_nodes)
-    except sqlite3.Error:
-        log.exception("elastimem: graph decay sweep failed")
+# --- maintenance ---------------------------------------------------------------
+def retire_stale(conn: sqlite3.Connection, half_life_days: float) -> int:
+    """Delete relations, then entities, whose decayed confidence is too low.
+    The graph is a derived index, so retired rows are deleted, not archived."""
+    with conn:
+        removed = conn.execute(
+            "DELETE FROM relations WHERE decay(confidence, updated_at, ?) < ?",
+            (half_life_days, tiers.ARCHIVE_BELOW),
+        ).rowcount
+        removed += conn.execute(
+            "DELETE FROM entities WHERE decay(confidence, updated_at, ?) < ?",
+            (half_life_days, tiers.ARCHIVE_BELOW),
+        ).rowcount
     return removed
 
 
-_MERGE_PROMPT = (
-    "Are these two labels the same real-world entity, just written "
-    "differently (e.g. abbreviation, typo, or rephrasing)? Reply with "
-    "ONLY \"yes\" or \"no\"."
-)
+def merge_candidates(conn: sqlite3.Connection, limit: int = 5) -> list[tuple[sqlite3.Row, sqlite3.Row]]:
+    """Recent same-type entity pairs sharing a word: possible duplicates."""
+    rows = conn.execute(
+        "SELECT id, type, name FROM entities WHERE created_at >= datetime('now', ?)"
+        " AND name != ? ORDER BY created_at", (f"-{tiers.MERGE_WINDOW_DAYS} days", USER),
+    ).fetchall()
+    pairs = []
+    for i, a in enumerate(rows):
+        for b in rows[i + 1:]:
+            if a["type"] == b["type"] and set(a["name"].split()) & set(b["name"].split()):
+                pairs.append((a, b))
+                if len(pairs) == limit:
+                    return pairs
+    return pairs
 
 
-def merge_duplicates(
-    conn: sqlite3.Connection,
-    complete_fn: CompleteFn,
-    *,
-    review_window_days: float,
-    max_tokens: int = 16,
-) -> int:
-    """FULL-tier-only maintenance: ask the LLM whether pairs of same-type
-    entities created within ``review_window_days`` of each other and
-    sharing a token (cheap pre-filter — no fuzzy-matching library, see
-    graph._canonicalize's docstring) are actually the same entity under
-    different names. On "yes", the newer node's edges are repointed to the
-    older node and the newer node is deleted.
-
-    This is the one piece of graph maintenance that costs an LLM call, so
-    it is capped at a handful of pairs per sweep (mirrors
-    extraction.consolidate's fact-merge review, which caps at 5). Never
-    raises; a malformed/absent response is treated as "no merge".
-    """
-    merged = 0
-    try:
-        candidates = conn.execute(
-            "SELECT id, type, canonical_name, created_at FROM graph_nodes"
-            " WHERE created_at >= datetime('now', ?) ORDER BY created_at",
-            (f"-{review_window_days} days",),
-        ).fetchall()
-    except sqlite3.Error:
-        log.exception("elastimem: graph duplicate-merge candidate scan failed")
-        return 0
-
-    checked = 0
-    for i, a in enumerate(candidates):
-        if checked >= 5:
-            break
-        a_tokens = set(a["canonical_name"].split())
-        for b in candidates[i + 1:]:
-            if checked >= 5:
-                break
-            if b["type"] != a["type"]:
-                continue
-            b_tokens = set(b["canonical_name"].split())
-            if not (a_tokens & b_tokens):
-                continue
-            checked += 1
-            try:
-                answer = complete_fn(
-                    f"{_MERGE_PROMPT}\n\nA: {a['canonical_name']}\nB: {b['canonical_name']}",
-                    max_tokens=max_tokens, temperature=0.0,
-                ) or ""
-            except Exception:
-                log.exception("elastimem: graph duplicate-merge completion failed")
-                continue
-            if not answer.strip().lower().startswith("y"):
-                continue
-            try:
-                with conn:
-                    conn.execute(
-                        "UPDATE OR IGNORE graph_edges SET source_node=? WHERE source_node=?",
-                        (a["id"], b["id"]),
-                    )
-                    conn.execute(
-                        "UPDATE OR IGNORE graph_edges SET target_node=? WHERE target_node=?",
-                        (a["id"], b["id"]),
-                    )
-                    conn.execute("DELETE FROM graph_nodes WHERE id=?", (b["id"],))
-                merged += 1
-            except sqlite3.Error:
-                log.exception("elastimem: graph duplicate-merge apply failed")
-    return merged
+def merge(conn: sqlite3.Connection, keep_id: int, drop_id: int) -> None:
+    """Fold entity ``drop_id`` into ``keep_id``."""
+    with conn:
+        for column in ("source", "target"):
+            conn.execute(f"UPDATE OR IGNORE relations SET {column}=? WHERE {column}=?", (keep_id, drop_id))
+        conn.execute("UPDATE OR IGNORE mentions SET entity_id=? WHERE entity_id=?", (keep_id, drop_id))
+        conn.execute("DELETE FROM entities WHERE id=?", (drop_id,))
 
 
-# --------------------------------------------------------------------------- #
-# semantic clusters: topic discovery via connected components
-# --------------------------------------------------------------------------- #
-_CLUSTER_LABEL_PROMPT = (
-    "These are labels for related entities that came up in conversation. "
-    "Reply with ONLY a short (1-4 word) topic name covering all of them, "
-    "e.g. \"Local AI\" or \"Home Renovation\". No punctuation, no explanation."
-)
+def recompute_topics(conn: sqlite3.Connection) -> int:
+    """Topics are connected components of 2+ entities (union-find over
+    relations, ignoring the user node). Returns the number of topics."""
+    ids = [r["id"] for r in conn.execute("SELECT id FROM entities WHERE name != ?", (USER,))]
+    parent = {i: i for i in ids}
 
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
 
-def _find(parent: dict[int, int], x: int) -> int:
-    while parent[x] != x:
-        parent[x] = parent[parent[x]]   # path halving
-        x = parent[x]
-    return x
-
-
-def _union(parent: dict[int, int], a: int, b: int) -> None:
-    ra, rb = _find(parent, a), _find(parent, b)
-    if ra != rb:
-        parent[ra] = rb
-
-
-def compute_clusters(conn: sqlite3.Connection, *, min_size: int = 2) -> dict[int, list[int]]:
-    """Group entities into topics via connected components over
-    graph_edges — no clustering library, same union-find approach any
-    graph toolkit uses internally. A cluster is "all entities reachable
-    from each other," full stop; no distance/similarity threshold since
-    edges themselves are the only relationship signal available.
-
-    Returns ``{root_node_id: [member_node_id, ...]}`` for components with
-    at least ``min_size`` members — singletons (a node with no edges, or
-    only edges to nodes that were themselves filtered) aren't a "topic,"
-    just an isolated fact, so they're excluded by default. Never raises;
-    returns ``{}`` on any failure or an edgeless graph.
-    """
-    try:
-        node_ids = [r["id"] for r in conn.execute("SELECT id FROM graph_nodes")]
-        if not node_ids:
-            return {}
-        parent = {nid: nid for nid in node_ids}
-        for row in conn.execute("SELECT source_node, target_node FROM graph_edges"):
-            if row["source_node"] in parent and row["target_node"] in parent:
-                _union(parent, row["source_node"], row["target_node"])
-
-        components: dict[int, list[int]] = {}
-        for nid in node_ids:
-            root = _find(parent, nid)
-            components.setdefault(root, []).append(nid)
-        return {root: members for root, members in components.items()
-                if len(members) >= min_size}
-    except sqlite3.Error:
-        log.exception("elastimem: cluster computation failed")
-        return {}
-
-
-def store_clusters(conn: sqlite3.Connection, clusters: dict[int, list[int]]) -> None:
-    """Stamp ``cluster_id`` (the component's root node id — stable across
-    sweeps as long as the component doesn't split/merge) onto every
-    clustered node, and clear it from nodes no longer in any cluster.
-    ``cluster_label`` is left untouched here — see :func:`label_clusters`,
-    a separate step so unlabeled clustering never blocks on an LLM call.
-    Never raises.
-    """
-    try:
-        with conn:
-            clustered_ids = {nid for members in clusters.values() for nid in members}
-            conn.execute(
-                "UPDATE graph_nodes SET cluster_id=NULL, cluster_label=NULL"
-                " WHERE cluster_id IS NOT NULL"
-                + (" AND id NOT IN ({})".format(",".join("?" * len(clustered_ids)))
-                   if clustered_ids else ""),
-                list(clustered_ids),
-            )
-            for root, members in clusters.items():
-                placeholders = ",".join("?" * len(members))
-                conn.execute(
-                    f"UPDATE graph_nodes SET cluster_id=? WHERE id IN ({placeholders})",
-                    [root, *members],
-                )
-    except sqlite3.Error:
-        log.exception("elastimem: storing clusters failed")
-
-
-def label_clusters(
-    conn: sqlite3.Connection, complete_fn: CompleteFn, *, max_tokens: int = 16
-) -> int:
-    """FULL-tier-only: ask the LLM for a short topic name for each
-    unlabeled cluster (``cluster_label IS NULL``), one completion per
-    cluster. Costs an LLM call per new cluster, so — like
-    :func:`merge_duplicates` — this is a separate, tier-gated step from
-    :func:`store_clusters`, not folded into it. A cluster works fine as a
-    retrieval grouping with no label at all; the label is presentation
-    sugar for a host that wants to show "Local AI" instead of a bare list
-    of entity names. Returns the number of clusters labeled. Never raises;
-    a failed/malformed response leaves that cluster unlabeled rather than
-    stamping a bad label.
-    """
-    labeled = 0
-    try:
-        rows = conn.execute(
-            "SELECT DISTINCT cluster_id FROM graph_nodes"
-            " WHERE cluster_id IS NOT NULL AND cluster_label IS NULL"
-        ).fetchall()
-    except sqlite3.Error:
-        log.exception("elastimem: cluster label candidate scan failed")
-        return 0
-
-    for row in rows:
-        cluster_id = row["cluster_id"]
-        try:
-            members = conn.execute(
-                "SELECT canonical_name FROM graph_nodes WHERE cluster_id=? LIMIT 12",
-                (cluster_id,),
-            ).fetchall()
-            names = ", ".join(m["canonical_name"] for m in members)
-            label = complete_fn(
-                f"{_CLUSTER_LABEL_PROMPT}\n\nEntities: {names}",
-                max_tokens=max_tokens, temperature=0.0,
-            ) or ""
-            label = label.strip().strip('"').strip("'")
-            if not label or len(label) > 60:
-                continue
-            with conn:
-                conn.execute(
-                    "UPDATE graph_nodes SET cluster_label=? WHERE cluster_id=?",
-                    (label, cluster_id),
-                )
-            labeled += 1
-        except Exception:
-            log.exception("elastimem: cluster labeling failed for cluster %s", cluster_id)
-    return labeled
-
-
-def list_clusters(conn: sqlite3.Connection) -> list[dict]:
-    """Read-only view of all current clusters: ``[{"cluster_id": int,
-    "label": str | None, "members": [canonical_name, ...]}, ...]``, largest
-    first. Never raises."""
-    try:
-        rows = conn.execute(
-            "SELECT cluster_id, cluster_label, canonical_name FROM graph_nodes"
-            " WHERE cluster_id IS NOT NULL ORDER BY cluster_id"
-        ).fetchall()
-    except sqlite3.Error:
-        log.exception("elastimem: cluster listing failed")
-        return []
-    grouped: dict[int, dict] = {}
-    for row in rows:
-        entry = grouped.setdefault(
-            row["cluster_id"],
-            {"cluster_id": row["cluster_id"], "label": row["cluster_label"], "members": []},
+    for r in conn.execute("SELECT source, target FROM relations"):
+        if r["source"] in parent and r["target"] in parent:
+            parent[find(r["source"])] = find(r["target"])
+    groups: dict[int, list[int]] = {}
+    for i in ids:
+        groups.setdefault(find(i), []).append(i)
+    topics = {root: members for root, members in groups.items() if len(members) > 1}
+    with conn:
+        # A topic keeps its id (its root entity), and so its name, while it lasts.
+        conn.execute(
+            "UPDATE entities SET topic_id=NULL, topic=NULL WHERE topic_id IS NOT NULL"
+            f" AND topic_id NOT IN ({','.join('?' * len(topics))})", list(topics),
         )
-        entry["members"].append(row["canonical_name"])
-        if row["cluster_label"]:
-            entry["label"] = row["cluster_label"]
-    return sorted(grouped.values(), key=lambda c: -len(c["members"]))
+        for root, members in topics.items():
+            conn.execute(
+                "UPDATE entities SET topic_id=?,"
+                " topic=(SELECT max(topic) FROM entities WHERE topic_id=?)"
+                f" WHERE id IN ({','.join('?' * len(members))})",
+                (root, root, *members),
+            )
+    return len(topics)
+
+
+def unnamed_topics(conn: sqlite3.Connection) -> dict[int, list[str]]:
+    rows = conn.execute(
+        "SELECT topic_id, name FROM entities WHERE topic_id IS NOT NULL AND topic IS NULL"
+    ).fetchall()
+    out: dict[int, list[str]] = {}
+    for r in rows:
+        out.setdefault(r["topic_id"], []).append(r["name"])
+    return out
+
+
+def name_topic(conn: sqlite3.Connection, topic_id: int, label: str) -> None:
+    with conn:
+        conn.execute("UPDATE entities SET topic=? WHERE topic_id=?", (label, topic_id))
+
+
+def list_topics(conn: sqlite3.Connection) -> list[dict]:
+    """``[{"id", "name", "members"}]``, largest first."""
+    out: dict[int, dict] = {}
+    for r in conn.execute(
+        "SELECT topic_id, topic, name FROM entities WHERE topic_id IS NOT NULL ORDER BY name"
+    ):
+        entry = out.setdefault(r["topic_id"], {"id": r["topic_id"], "name": r["topic"], "members": []})
+        entry["members"].append(r["name"])
+    return sorted(out.values(), key=lambda t: -len(t["members"]))

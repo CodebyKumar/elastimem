@@ -1,23 +1,18 @@
-"""The Memory Governor: Elastimem's defining component.
+"""The governor: what can this machine afford right now?
 
-The governor answers one question, continuously: *what can this machine
-afford right now?* It probes hardware at startup, re-checks cheaply on every
-``tick()`` (call it once per turn), and emits a frozen
-:class:`~elastimem.config.MemoryProfile` that every other component consumes —
-token budgets per prompt section, whether embeddings run, how often
-background LLM extraction fires, how aggressive consolidation is.
+It picks a :class:`~elastimem.config.Tier` from three signals:
 
-Rules of movement:
+* **capacity** - total RAM: 16 GiB+ FULL, 8 GiB+ STANDARD, else LITE;
+* **pressure** - the OS's own reading (macOS ``kern.memorystatus_vm_pressure_level``,
+  Linux ``MemAvailable/MemTotal``, psutil elsewhere): "warn" caps at
+  STANDARD, "critical" forces LITE. Free-page counts are not used, because
+  macOS keeps most memory compressed or cached and reports little as free;
+* **measured cost** - how long memory work took per turn. Over
+  ``turn_budget_ms`` for several turns in a row steps the tier down.
 
-* **Downgrades are immediate.** Low available RAM or a host-reported pressure
-  event (OOM, decode failure) drops the tier on the next profile read.
-* **Upgrades are cautious.** Only after ``upgrade_healthy_ticks`` consecutive
-  healthy ticks, one tier at a time, and never above the startup tier.
-
-Hardware probing prefers ``psutil`` when installed (the ``[system]`` extra)
-and falls back to stdlib-only reads (``/proc/meminfo`` on Linux, ``sysctl`` /
-``vm_stat`` on macOS). When nothing works, the governor assumes STANDARD —
-being wrong by one tier degrades quality, never correctness.
+Down is immediate; up waits for ``tiers.UPGRADE_TURNS`` healthy turns and
+never exceeds what capacity and pressure allow. Hardware is read at most
+every ``tiers.PROBE_SECONDS``.
 """
 
 from __future__ import annotations
@@ -27,340 +22,198 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from typing import Callable
 
-from .config import (
-    Budgets,
-    Cadence,
-    ConsolidationLevel,
-    ElastimemConfig,
-    MemoryProfile,
-    RollingSummaryMode,
-    Tier,
-)
+from . import tiers
+from .config import ElastimemConfig, Tier
 
 log = logging.getLogger("elastimem")
 
 GIB = 1024**3
-
-_PRESSURE_AVAILABLE = int(1.2 * GIB)   # below this, downgrade immediately
-# A burst of host-reported pressure events (several decode failures in the
-# same bad turn, or one failure surfacing through more than one call site)
-# must not cascade the tier down multiple levels for what is really one
-# underlying event. This does NOT weaken "downgrades are immediate" - the
-# FIRST report in a burst still downgrades right away, same as before; only
-# additional reports within the window are coalesced into that same
-# downgrade rather than each dropping the tier again.
-_PRESSURE_REPORT_COOLDOWN_SECONDS = 30.0
-
-# Fraction of the normal episodic/sessions token share that LITE keeps (the
-# remainder is handed to the working window). See _build_profile.
-LITE_EPISODIC_SHARE = 0.45
-LITE_SESSIONS_SHARE = 0.75
+ProbeFn = Callable[[], "tuple[int, str]"]
 
 
-def _tier_thresholds_bytes(cfg: ElastimemConfig) -> dict[Tier, tuple[int, int]]:
-    """User-tunable GiB thresholds (config.py) converted to bytes."""
-    full_total, full_avail = cfg.tier_thresholds_gib["full"]
-    std_total, std_avail = cfg.tier_thresholds_gib["standard"]
-    return {
-        Tier.FULL: (int(full_total * GIB), int(full_avail * GIB)),
-        Tier.STANDARD: (int(std_total * GIB), int(std_avail * GIB)),
-    }
+@dataclass(frozen=True)
+class Budgets:
+    """Token budget per prompt section. The same on every tier."""
+
+    working: int
+    facts: int
+    moments: int
+    topics: int
+    sessions: int
+    lessons: int
 
 
-# --------------------------------------------------------------------------- #
-# hardware probe
-# --------------------------------------------------------------------------- #
-def probe_ram() -> tuple[int, int]:
-    """Return ``(total_bytes, available_bytes)``, best effort, stdlib-safe.
+@dataclass(frozen=True)
+class Status:
+    """What memory will do this turn, and why."""
 
-    Stdlib-only probing is implemented for Linux (``/proc/meminfo``) and
-    macOS (``sysctl``/``vm_stat``). Windows and any other platform have no
-    stdlib probe here and fall through to the "assume a mid-size machine"
-    floor below (8/4 GiB) — install the ``system`` extra (``psutil``) for
-    accurate probing on Windows; without it, tier classification on Windows
-    is a guess, not a measurement.
-    """
+    tier: Tier
+    budgets: Budgets
+    keep_turns: int         # recent turns the host should keep verbatim
+    vectors: bool           # is search by meaning on?
+    llm: str                # background extraction: per_turn | batched | session_end | off
+    graph_hops: int
+    reasons: dict[str, str]
+
+    @property
+    def spec(self) -> tiers.TierSpec:
+        return tiers.TIERS[self.tier]
+
+
+def budgets(config: ElastimemConfig) -> Budgets:
+    free = config.context_tokens - config.reserved_tokens
+    working = int(free * tiers.WORKING_SHARE)
+    pool = free - working
+    moments = int(pool * tiers.SPLIT["moments"])
+    topics = int(moments * tiers.TOPICS_SHARE)
+    return Budgets(
+        working=working,
+        facts=int(pool * tiers.SPLIT["facts"]),
+        moments=moments - topics,
+        topics=topics,
+        sessions=int(pool * tiers.SPLIT["sessions"]),
+        lessons=int(pool * tiers.SPLIT["lessons"]),
+    )
+
+
+def keep_turns(b: Budgets) -> int:
+    return max(tiers.MIN_KEEP_TURNS, b.working // tiers.TURN_TOKENS // 2)
+
+
+# --- hardware ------------------------------------------------------------------
+def probe() -> tuple[int, str]:
+    """``(total_ram_bytes, pressure)`` with pressure normal | warn | critical."""
     try:
-        import psutil  # optional [system] extra
-
-        vm = psutil.virtual_memory()
-        return int(vm.total), int(vm.available)
-    except ImportError:
-        pass
-
-    if sys.platform.startswith("linux"):
-        try:
-            info: dict[str, int] = {}
+        if sys.platform == "darwin":
+            out = subprocess.run(
+                ["sysctl", "-n", "hw.memsize", "kern.memorystatus_vm_pressure_level"],
+                capture_output=True, text=True, timeout=2,
+            ).stdout.split()
+            level = {"1": "normal", "2": "warn", "4": "critical"}.get(out[1], "normal")
+            return int(out[0]), level
+        if sys.platform.startswith("linux"):
+            info = {}
             with open("/proc/meminfo") as f:
                 for line in f:
-                    parts = line.split()
-                    if parts and parts[0].rstrip(":") in ("MemTotal", "MemAvailable"):
-                        info[parts[0].rstrip(":")] = int(parts[1]) * 1024
-            return info.get("MemTotal", 8 * GIB), info.get("MemAvailable", 4 * GIB)
-        except OSError:
-            pass
-    elif sys.platform == "darwin":
-        try:
-            total = int(
-                subprocess.run(
-                    ["sysctl", "-n", "hw.memsize"],
-                    capture_output=True, text=True, timeout=2,
-                ).stdout.strip()
-            )
-            available = _darwin_available()
-            return total, available if available else total // 3
-        except (OSError, ValueError, subprocess.SubprocessError):
-            pass
-    # Unknown platform / probe failed: assume a mid-size machine.
-    return 8 * GIB, 4 * GIB
+                    name, value, *_ = line.split()
+                    info[name.rstrip(":")] = int(value) * 1024
+            return info["MemTotal"], _level(info["MemAvailable"] / info["MemTotal"])
+        import psutil
+        vm = psutil.virtual_memory()
+        return int(vm.total), _level(vm.available / vm.total)
+    except Exception:
+        return 8 * GIB, "normal"   # unknown: assume a mid-size machine
 
 
-def _darwin_available() -> int:
-    """Free + inactive pages from vm_stat (what macOS can hand out quickly)."""
+def _level(free_share: float) -> str:
+    if free_share < tiers.CRITICAL_FREE_SHARE:
+        return "critical"
+    return "warn" if free_share < tiers.WARN_FREE_SHARE else "normal"
+
+
+def on_battery() -> bool:
+    """True when running on battery (needs psutil; False when unknown)."""
     try:
-        out = subprocess.run(
-            ["vm_stat"], capture_output=True, text=True, timeout=2
-        ).stdout
-        page_size = 16384 if "page size of 16384" in out else 4096
-        pages = 0
-        for line in out.splitlines():
-            if line.startswith(("Pages free", "Pages inactive")):
-                pages += int(line.split(":")[1].strip().rstrip("."))
-        return pages * page_size
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return 0
+        import psutil
+        info = psutil.sensors_battery()
+        return bool(info and not info.power_plugged)
+    except Exception:
+        return False
 
 
-def _classify(total: int, available: int, thresholds: dict[Tier, tuple[int, int]]) -> Tier:
-    for tier in (Tier.FULL, Tier.STANDARD):
-        t_min, a_min = thresholds[tier]
-        if total >= t_min and available >= a_min:
-            return tier
-    return Tier.LITE
+def _allowed(total: int, pressure: str) -> Tier:
+    capacity = (Tier.FULL if total >= tiers.FULL_RAM_GIB * GIB
+                else Tier.STANDARD if total >= tiers.STANDARD_RAM_GIB * GIB else Tier.LITE)
+    cap = {"normal": Tier.FULL, "warn": Tier.STANDARD, "critical": Tier.LITE}[pressure]
+    return min(capacity, cap)
 
 
-# --------------------------------------------------------------------------- #
-# governor
-# --------------------------------------------------------------------------- #
+# --- governor ------------------------------------------------------------------
 class Governor:
-    """Owns the current tier and derives the :class:`MemoryProfile`.
-
-    ``probe_fn`` is injectable for tests (and for hosts with better
-    information than psutil, e.g. a Jetson reading its own thermal state).
-    ``on_tier_change(old, new)`` lets the host react — unload an embedder,
-    print a notice.
-    """
-
     def __init__(
         self,
         config: ElastimemConfig,
         *,
-        probe_fn: Callable[[], tuple[int, int]] = probe_ram,
-        on_tier_change: Callable[[Tier, Tier], None] | None = None,
+        probe_fn: ProbeFn | None = None,
+        battery_fn: Callable[[], bool] | None = None,
+        on_change: Callable[[Tier, Tier], None] | None = None,
     ) -> None:
         self.config = config
-        self._probe = probe_fn
-        self._on_tier_change = on_tier_change
+        self._probe = probe_fn or probe
+        self._battery = battery_fn or on_battery
+        self._on_change = on_change
         self._lock = threading.Lock()
-        self._healthy_streak = 0
-        self._last_pressure_report = 0.0
-        self._thresholds = _tier_thresholds_bytes(config)
-
-        total, available = self._probe()
-        # Explicit None check: Tier.LITE is 0 and would be swallowed by `or`.
-        self._startup_tier = (
-            config.tier_override
-            if config.tier_override is not None
-            else _classify(total, available, self._thresholds)
-        )
-        self._tier = self._startup_tier
-        self._profile = self._build_profile(self._tier)
-        log.info("elastimem governor: startup tier %s (ram %.1f/%.1f GiB available)",
-                 self._tier.name, available / GIB, total / GIB)
-
-    # -- public --------------------------------------------------------- #
-    @property
-    def profile(self) -> MemoryProfile:
-        return self._profile
+        self._slow = self._healthy = 0
+        self._last_probe = self._last_pressure_report = 0.0
+        self.on_battery = False
+        self.reason = ""
+        self._tier = self._read()
 
     @property
     def tier(self) -> Tier:
         return self._tier
 
-    def tick(self) -> MemoryProfile:
-        """Cheap per-turn re-evaluation. Returns the (possibly new) profile."""
-        if self.config.tier_override is not None:
-            return self._profile
-        total, available = self._probe()
-        with self._lock:
-            if available < _PRESSURE_AVAILABLE:
-                self._set_tier(Tier.LITE)
-            else:
-                measured = _classify(total, available, self._thresholds)
-                if measured < self._tier:
-                    self._set_tier(measured)          # downgrade immediately
-                elif measured > self._tier:
-                    self._healthy_streak += 1          # upgrade cautiously
-                    if self._healthy_streak >= self.config.upgrade_healthy_ticks:
-                        self._set_tier(min(Tier(self._tier + 1), self._startup_tier))
-                else:
-                    self._healthy_streak = 0
-        return self._profile
+    def _read(self) -> Tier:
+        """Re-read hardware; returns the tier it allows."""
+        self._last_probe = time.monotonic()
+        self.on_battery = self._battery()
+        if self.config.tier is not None:
+            self.reason = "fixed by configuration"
+            return self.config.tier
+        total, pressure = self._probe()
+        allowed = _allowed(total, pressure)
+        self.reason = f"{total / GIB:.0f} GiB RAM, memory pressure {pressure}"
+        return allowed
 
-    def report_pressure(self) -> MemoryProfile:
-        """Host signal: an OOM/decode failure happened. Downgrades one tier
-        immediately - UNLESS this report arrives within
-        _PRESSURE_REPORT_COOLDOWN_SECONDS of the last one, in which case it's
-        coalesced into that same downgrade instead of dropping the tier
-        again. Without this, a burst of several decode failures in one bad
-        turn (a plausible retry pattern, or the same failure surfacing
-        through more than one call site) could cascade the tier down
-        multiple levels for what is really one underlying event, needing
-        many more healthy ticks than warranted to recover."""
+    def check(self) -> Tier:
+        """Cheap per-turn check: re-reads hardware at most every PROBE_SECONDS."""
+        with self._lock:
+            if time.monotonic() - self._last_probe >= tiers.PROBE_SECONDS:
+                allowed = self._read()
+                if self.config.tier is not None or allowed < self._tier:
+                    self._set(allowed)
+                elif allowed > self._tier and self._healthy >= tiers.UPGRADE_TURNS:
+                    self._set(Tier(self._tier + 1))
+            return self._tier
+
+    def observe(self, ms: float) -> None:
+        """Report how long this turn's memory work took."""
+        with self._lock:
+            if ms > self.config.turn_budget_ms:
+                self._slow, self._healthy = self._slow + 1, 0
+                if self._slow >= tiers.SLOW_TURNS and self._tier > Tier.LITE and self.config.tier is None:
+                    self._set(Tier(self._tier - 1), f"memory work took {ms:.0f} ms per turn")
+            else:
+                self._slow, self._healthy = 0, self._healthy + 1
+
+    def report_pressure(self) -> None:
+        """Host signal (OOM, failed decode): step down one tier. Reports within
+        PRESSURE_COOLDOWN_SECONDS of the last one count as the same event."""
         with self._lock:
             now = time.monotonic()
-            if now - self._last_pressure_report < _PRESSURE_REPORT_COOLDOWN_SECONDS:
-                self._last_pressure_report = now
-                return self._profile
+            first = now - self._last_pressure_report >= tiers.PRESSURE_COOLDOWN_SECONDS
             self._last_pressure_report = now
-            if self._tier > Tier.LITE:
-                self._set_tier(Tier(self._tier - 1))
-        return self._profile
+            if first and self._tier > Tier.LITE and self.config.tier is None:
+                self._set(Tier(self._tier - 1), "host reported memory pressure")
 
-    def reconfigure(self, *, reprobe: bool = False) -> MemoryProfile:
-        """Rebuild the current tier's budgets from ``self.config`` right now.
-
-        Budgets are only recomputed on a tier change (see ``_set_tier``), so
-        a host that mutates ``config.context_tokens`` (e.g. after switching
-        to a model with a different context window) would otherwise see
-        stale budgets until the tier happens to flip — which may never
-        happen. Call this immediately after changing any config field that
-        feeds budget math (``context_tokens``, ``static_prompt_tokens``,
-        ``output_reserve``, ``tool_reserve``).
-
-        ``reprobe=True`` also re-measures hardware and re-classifies the
-        tier before rebuilding budgets, same as ``tick()``. The tier is
-        RAM-based and blind to which model is active, so on its own it can't
-        tell a 4K-context model from a 128K one apart - but startup order
-        matters: if the host constructs its Elastimem store BEFORE loading
-        its own (possibly large) model - as most hosts do, since the model
-        card isn't known until the model is chosen - the constructor's
-        one-time probe measures RAM the model hasn't claimed yet, and
-        without reprobing the tier stays keyed to that pre-load reading
-        until the next tick() (normally the first turn). Pass this when
-        calling reconfigure() right after a model finishes loading, so the
-        tier the host's first turn actually runs under reflects real
-        post-load memory pressure instead of a stale pre-load guess.
-        """
+    def reconfigure(self, config: ElastimemConfig) -> None:
         with self._lock:
-            self._thresholds = _tier_thresholds_bytes(self.config)
-            if reprobe and self.config.tier_override is None:
-                total, available = self._probe()
-                self._set_tier(_classify(total, available, self._thresholds))
-            self._profile = self._build_profile(self._tier)
-        return self._profile
+            self.config = config
+            self._set(self._read())
 
-    # -- internals ------------------------------------------------------ #
-    def _set_tier(self, tier: Tier) -> None:
+    def _set(self, tier: Tier, reason: str | None = None) -> None:
+        self._slow = self._healthy = 0
+        if reason:
+            self.reason = reason
         if tier == self._tier:
             return
         old, self._tier = self._tier, tier
-        self._healthy_streak = 0
-        self._profile = self._build_profile(tier)
-        log.info("elastimem governor: tier %s -> %s", old.name, tier.name)
-        if self._on_tier_change is not None:
+        log.info("elastimem: tier %s -> %s (%s)", old.name, tier.name, self.reason)
+        if self._on_change:
             try:
-                self._on_tier_change(old, tier)
+                self._on_change(old, tier)
             except Exception:
-                log.exception("elastimem: on_tier_change callback failed")
-
-    def _build_profile(self, tier: Tier) -> MemoryProfile:
-        cfg = self.config
-        dynamic = max(
-            256,
-            cfg.context_tokens - cfg.output_reserve - cfg.tool_reserve
-            - cfg.static_prompt_tokens,
-        )
-        working = int(dynamic * cfg.working_share)
-        memory_pool = dynamic - working
-        split = dict(cfg.memory_split)
-
-        if tier is Tier.LITE:
-            # Episodic injection and session summaries are trimmed, and the
-            # freed tokens go back to the working window - immediacy still
-            # beats recall on a starved machine. But this is a TOKEN-split
-            # decision, not a resource one: reading a few more rows out of
-            # SQLite costs a starved machine nothing, and the old split
-            # (episodic at 10% of normal, sessions halved) left episodic
-            # with single-digit token budgets on a typical 4K-context host
-            # - not "a small amount of recall" but effectively none, which
-            # is what made LITE feel broken rather than merely reduced.
-            # LITE_EPISODIC_SHARE/LITE_SESSIONS_SHARE keep a real, usable
-            # amount of both while still handing the majority back.
-            episodic_share = split["episodic"]
-            sessions_share = split["sessions"]
-            freed = (
-                episodic_share * (1.0 - LITE_EPISODIC_SHARE)
-                + sessions_share * (1.0 - LITE_SESSIONS_SHARE)
-            )
-            split["episodic"] = episodic_share * LITE_EPISODIC_SHARE
-            split["sessions"] = sessions_share * LITE_SESSIONS_SHARE
-            working += int(memory_pool * freed)
-
-        budgets = Budgets(
-            working=working,
-            facts=int(memory_pool * split["facts"]),
-            episodic=int(memory_pool * split["episodic"]),
-            sessions=int(memory_pool * split["sessions"]),
-            lessons=int(memory_pool * split["lessons"]),
-        )
-        # LITE only reaches for the LLM when the host explicitly opts in,
-        # and even then only at session end, where nothing competes with a
-        # live foreground generation. Default stays off, so LITE's
-        # "no LLM call, ever" floor holds unless asked otherwise.
-        lite_llm = tier is Tier.LITE and cfg.lite_llm_extraction
-
-        return MemoryProfile(
-            tier=tier,
-            budgets=budgets,
-            # Indexing NEW chunks is the sustained embedding cost; that is
-            # what LITE gives up. Scoring chunks that are already embedded
-            # is a separate decision - see vector_recall_enabled.
-            embeddings_enabled=tier is not Tier.LITE,
-            llm_extraction_enabled=tier is not Tier.LITE or lite_llm,
-            extraction_cadence={
-                Tier.FULL: Cadence.PER_TURN,
-                Tier.STANDARD: Cadence.BATCHED,
-                Tier.LITE: Cadence.SESSION_END if lite_llm else Cadence.OFF,
-            }[tier],
-            rolling_summary_mode={
-                Tier.FULL: RollingSummaryMode.LLM,
-                Tier.STANDARD: RollingSummaryMode.LLM,
-                # Not MARKER: condensing evicted turns extractively is pure
-                # string work over text already in the DB, so a starved
-                # machine can have real content instead of a placeholder.
-                Tier.LITE: RollingSummaryMode.EXTRACTIVE,
-            }[tier],
-            # Every tier may score already-embedded chunks. The RAM cost
-            # sits in loading a model, not in a cosine loop, and that cost
-            # is gated by embedder_load_allowed below.
-            vector_recall_enabled=True,
-            embedder_load_allowed=tier is not Tier.LITE,
-            consolidation_level={
-                Tier.FULL: ConsolidationLevel.FULL,
-                Tier.STANDARD: ConsolidationLevel.DEDUPE_ONLY,
-                # DEDUPE_ONLY, not OFF: at this level consolidation is 100%
-                # local SQLite (fact decay/archival, quarantine trimming,
-                # graph decay/archival, cluster recompute) with the LLM
-                # merge steps gated separately on FULL. Leaving it OFF meant
-                # a LITE store never pruned anything and grew monotonically
-                # - the opposite of what a RAM-starved host wants - and it
-                # also silently disabled graph maintenance, which lives
-                # inside the same sweep.
-                Tier.LITE: ConsolidationLevel.DEDUPE_ONLY,
-            }[tier],
-            episodic_top_k={Tier.FULL: 5, Tier.STANDARD: 4, Tier.LITE: 3}[tier],
-            graph_hops={Tier.FULL: 2, Tier.STANDARD: 1, Tier.LITE: 1}[tier],
-        )
+                log.exception("elastimem: on_tier callback failed")

@@ -1,23 +1,18 @@
-"""Configuration and shared value types for Elastimem.
+"""Host settings. Every field has a default; most hosts set none.
 
-Three objects travel through the whole framework:
-
-* :class:`ElastimemConfig` — host-supplied knobs, all optional.
-* :class:`Tier` — the governor's coarse resource class (LITE/STANDARD/FULL).
-* :class:`MemoryProfile` — the governor's *output*: a frozen snapshot of every
-  capability decision and token budget, consumed by retrieval assembly and the
-  background worker. Hosts read it; they never build it.
+Values a typical host would not change live in :mod:`elastimem.tiers`.
 """
 
 from __future__ import annotations
 
 import enum
 import os
-from dataclasses import dataclass, field
+import re
+from dataclasses import dataclass
 
 
 class Tier(enum.IntEnum):
-    """Resource class of the host machine. Ordering is meaningful (LITE < FULL)."""
+    """How much background work the machine can afford. Ordered: LITE < FULL."""
 
     LITE = 0
     STANDARD = 1
@@ -25,256 +20,41 @@ class Tier(enum.IntEnum):
 
     @classmethod
     def from_env(cls) -> "Tier | None":
-        """Read the ELASTIMEM_TIER override (``lite|standard|full``), if set."""
-        raw = os.environ.get("ELASTIMEM_TIER", "").strip().lower()
-        return {"lite": cls.LITE, "standard": cls.STANDARD, "full": cls.FULL}.get(raw)
+        """The ``ELASTIMEM_TIER`` override (``lite|standard|full``), if set."""
+        return cls.__members__.get(os.environ.get("ELASTIMEM_TIER", "").strip().upper())
 
 
-class Cadence(str, enum.Enum):
-    """When background LLM extraction runs."""
-
-    PER_TURN = "per_turn"
-    BATCHED = "batched"          # coalesced, every N turns
-    SESSION_END = "session_end"
-    OFF = "off"
-
-
-class ConsolidationLevel(str, enum.Enum):
-    """How aggressive idle/exit consolidation is."""
-
-    FULL = "full"                # dedupe + decay + LLM contradiction-merge + backfill
-    DEDUPE_ONLY = "dedupe_only"  # dedupe + decay math, no LLM
-    OFF = "off"                  # exact dedupe at exit only
-
-
-class RollingSummaryMode(str, enum.Enum):
-    """How evicted turns are condensed into the rolling summary.
-
-    Three modes, because the middle one used not to exist: a tier either
-    paid for a model call or got nothing but a marker line. EXTRACTIVE sits
-    between them - it is pure Python string work over text Elastimem has
-    already persisted, so it costs no model call and no embedder, yet it
-    keeps real content in front of the model instead of a bare
-    "[3 earlier turn(s) omitted]" placeholder.
-    """
-
-    LLM = "llm"                  # condense with complete_fn (FULL/STANDARD)
-    EXTRACTIVE = "extractive"    # first clause of each evicted user turn (LITE)
-    MARKER = "marker"            # "[N earlier turn(s) omitted]" only
-
-
-@dataclass(frozen=True)
-class Budgets:
-    """Per-turn token budgets for each injected prompt section."""
-
-    working: int
-    facts: int
-    episodic: int
-    sessions: int
-    lessons: int
-
-    @property
-    def memory_total(self) -> int:
-        return self.facts + self.episodic + self.sessions + self.lessons
-
-
-@dataclass(frozen=True)
-class MemoryProfile:
-    """The governor's decision snapshot. Recreated on every tier change."""
-
-    tier: Tier
-    budgets: Budgets
-    # Write path: may the background worker EMBED newly recorded chunks?
-    # This is the sustained cost (one encode per chunk, forever), so it is
-    # the first thing a starved machine gives up.
-    embeddings_enabled: bool
-    llm_extraction_enabled: bool
-    extraction_cadence: Cadence
-    consolidation_level: ConsolidationLevel
-    episodic_top_k: int
-    window_min_turns: int = 2
-    graph_hops: int = 0
-    # Read path: may retrieval run its vector leg over chunks that are
-    # ALREADY embedded? Deliberately separate from embeddings_enabled -
-    # scoring existing vectors is one query encode plus a cosine loop, a
-    # very different cost from indexing every new chunk, and there is no
-    # reason a machine that already paid for the vectors should throw them
-    # away. See embedder_load_allowed for the part that does cost RAM.
-    vector_recall_enabled: bool = True
-    # May Elastimem trigger a FIRST load of the built-in embedding model
-    # (~130MB resident, plus a one-time download)? False at LITE: that load
-    # is the only genuinely RAM-expensive part of the embedding path, so
-    # LITE may use an embedder that is already resident but must never
-    # cause one to appear. A host-supplied embed_fn is always considered
-    # resident - it lives in the host's process and was loaded before
-    # Elastimem ever saw it, so declining to call it saves nothing.
-    embedder_load_allowed: bool = True
-    rolling_summary_mode: RollingSummaryMode = RollingSummaryMode.LLM
-
-    @property
-    def rolling_summary_enabled(self) -> bool:
-        """True when the rolling summary is produced by a model call.
-
-        Kept as a property (it used to be a plain field) so the Stable
-        surface - hosts and `store.report_evictions` both read it - keeps
-        meaning exactly what it always meant: "will this cost an LLM call?"
-        EXTRACTIVE is not a model call, so it reads False here, same as
-        MARKER did before it existed.
-        """
-        return self.rolling_summary_mode is RollingSummaryMode.LLM
-
-
-# Default allowlist of keys that belong to the stable user profile (always
-# injected into the prompt). Everything else lands in the 'note' category.
-DEFAULT_PROFILE_KEYS = frozenset(
-    {"name", "email", "location", "age", "occupation", "pronouns"}
-)
-
-# Governor defaults, defined here (not in governor.py) so ElastimemConfig is
-# the single source of truth for every user-tunable value. Tier thresholds
-# are (total_gib, available_gib) pairs; FULL and STANDARD are checked in
-# that order, anything below STANDARD's floor is LITE.
-DEFAULT_TIER_THRESHOLDS_GIB: dict[str, tuple[float, float]] = {
-    "full": (16.0, 6.0),
-    "standard": (8.0, 2.5),
-}
-DEFAULT_MEMORY_SPLIT: dict[str, float] = {
-    "facts": 0.40, "episodic": 0.30, "sessions": 0.15, "lessons": 0.15,
-}
-DEFAULT_WORKING_SHARE = 0.55
+def normalize_key(key: str) -> str:
+    """Fact keys are casefolded snake_case: ``"Favorite Color"`` -> ``favorite_color``."""
+    return re.sub(r"\W+", "_", str(key).strip().casefold()).strip("_")
 
 
 @dataclass
 class ElastimemConfig:
-    """Host-tunable configuration. Every field has a sensible default.
+    """Host-tunable settings.
 
-    ``context_tokens`` should be the context window of the host's chat model
-    (llama.cpp ``n_ctx``, or the API model's limit). ``static_prompt_tokens``
-    is the host-measured size of its own fixed prompt (persona, tool specs)
-    so the governor can budget only what is actually free.
+    ``context_tokens`` is the chat model's context window. ``reserved_tokens``
+    is what the host needs for itself: its own prompt, tool output and the
+    reply. Elastimem budgets the rest.
     """
 
-    # --- budget inputs -----------------------------------------------------
     context_tokens: int = 4096
-    output_reserve: int = 512        # generation headroom
-    tool_reserve: int = 600          # mid-turn tool observations (ReAct etc.)
-    static_prompt_tokens: int = 0    # host's fixed prompt, measured by the host
-
-    # --- fact hygiene ------------------------------------------------------
-    profile_keys: frozenset[str] = DEFAULT_PROFILE_KEYS
-    reserved_keys: frozenset[str] = frozenset()   # host-owned keys Elastimem must reject
-    quarantine_cap: int = 200
-    # How far back consolidate() looks for a key whose value changed, to
-    # offer the LLM a chance to merge OLD/NEW into one value instead of a
-    # blunt overwrite ("moving to Austin in May" + "lives in Austin"). A
-    # change older than this is assumed settled and reviewed only if it
-    # changes again. FULL tier only consolidates on session end / idle
-    # ticks, not continuously, so this should stay well above the gap
-    # between two such ticks in normal use, or genuinely-recent changes can
-    # age out of the window before consolidation ever sees them.
-    fact_merge_review_window_days: float = 7.0
-
-    # --- procedural memory -------------------------------------------------
-    max_lessons: int = 15            # older lessons archived beyond this
-    lessons_in_prompt: int = 5
-
-    # --- episodic memory ---------------------------------------------------
-    chunk_target_tokens: int = 400   # split exchanges bigger than this
-    # Gates LLM-based fact extraction (a real cost/latency operation) below
-    # this word count - not worth a model call for "ok" or "thanks".
-    min_query_words: int = 4
-    # Gates retrieval (FTS5/vector search - local, no LLM, cheap) below this
-    # word count. Deliberately much lower than min_query_words: a short but
-    # meaningful question ("my birthday?", "where do I live") would
-    # otherwise get zero episodic/fact-relevance retrieval just because it's
-    # under 4 words, silently weakening recall on exactly the kind of short
-    # follow-up question that's common in real conversation. 1 excludes only
-    # single-word inputs ("hi", "thanks", "ok") that carry no query intent.
-    min_retrieval_query_words: int = 1
-
-    # --- embeddings ----------------------------------------------------------
-    # When the host supplies no embedder=/embed_fn=, Elastimem activates its
-    # own built-in one (see default_embedder.py) so semantic recall works
-    # with zero setup. Set True to force FTS5/keyword-only retrieval instead
-    # (e.g. an air-gapped environment that must never attempt the optional
-    # extra's first-run model download).
-    disable_builtin_embedder: bool = False
-
-    # --- forgetting --------------------------------------------------------
-    fact_decay_half_life_days: float = 60.0
-    fact_archive_threshold: float = 0.15
-    episodic_recency_half_life_days: float = 30.0
-    fact_recency_half_life_days: float = 90.0
-
-    # --- governor ----------------------------------------------------------
-    tier_override: Tier | None = field(default_factory=Tier.from_env)
-    upgrade_healthy_ticks: int = 10  # consecutive healthy ticks before tier upgrade
-    idle_consolidate_seconds: float = 90.0
-    # RAM thresholds (GiB) for FULL/STANDARD tiers: (total_min, available_min).
-    # Below STANDARD's floor, the governor classifies the host as LITE.
-    tier_thresholds_gib: dict[str, tuple[float, float]] = field(
-        default_factory=lambda: dict(DEFAULT_TIER_THRESHOLDS_GIB)
-    )
-    # Share of the dynamic token pool reserved for the working window (the
-    # rest is split among facts/episodic/sessions/lessons per memory_split).
-    working_share: float = DEFAULT_WORKING_SHARE
-    # How the non-working share of the dynamic token pool is split across
-    # memory sections. Must sum to 1.0.
-    memory_split: dict[str, float] = field(
-        default_factory=lambda: dict(DEFAULT_MEMORY_SPLIT)
-    )
-
-    # --- background worker -------------------------------------------------
-    worker_max_tokens: int = 96      # cap on every background LLM call
-    batched_every_n_turns: int = 2
-    # Opt-in: allow LLM fact extraction at LITE tier, deferred to session
-    # end (Cadence.SESSION_END) rather than running per turn or in batches.
-    # Default False, which preserves LITE's documented floor: no LLM call is
-    # ever attempted at LITE unless the host explicitly asks for one. Set
-    # True when you know the machine can afford a short burst of capped
-    # (worker_max_tokens) calls at session close - e.g. a host whose model
-    # is unloaded between sessions, or one that classifies as LITE only
-    # because of other processes rather than a genuinely small machine.
-    # Extraction jobs are held by the worker until end_session()/drain(),
-    # so they never compete with a live foreground generation.
-    lite_llm_extraction: bool = False
-
-    # --- knowledge graph -----------------------------------------------------
-    # Row-count ceilings for graph_nodes/graph_edges. Write-time dedup (a
-    # unique index on canonical entity/relationship identity) already stops
-    # repeated mentions from creating new rows; these caps bound growth from
-    # genuinely distinct low-value entities, evicting the least
-    # important/least recently seen rows on overflow — same trim-on-write
-    # pattern as quarantine_cap.
-    graph_node_cap: int = 2000
-    graph_edge_cap: int = 5000
-    # Decay/archival, mirroring fact_decay_half_life_days/fact_archive_threshold
-    # (semantic.apply_decay) but applied to graph_nodes.confidence and
-    # graph_edges.confidence instead of fact importance. A node/edge that
-    # hasn't been re-extracted in a while decays toward archival; one that
-    # keeps getting reinforced (mention_count/seen_count going up) never
-    # decays meaningfully because each reinforcement resets the clock
-    # (updated_at/last_seen) that the decay is measured from.
-    graph_decay_half_life_days: float = 30.0
-    graph_archive_threshold: float = 0.15
-    # How far back a consolidation sweep looks for entity pairs to offer the
-    # LLM for duplicate-merge review (FULL tier only) - same idea as
-    # fact_merge_review_window_days.
-    graph_merge_review_window_days: float = 7.0
+    reserved_tokens: int = 1112
+    tier: Tier | None = None          # fixed tier; None = decided by the governor
+    pinned: frozenset[str] = frozenset()   # fact keys always shown first
+    blocked: frozenset[str] = frozenset()  # fact keys owned by the host, never stored
+    turn_budget_ms: float = 50.0      # memory work per turn before the tier steps down
+    half_life_days: float = 30.0      # how fast unused memories fade
+    max_lessons: int = 15
 
     def __post_init__(self) -> None:
         if self.context_tokens < 1024:
             raise ValueError("context_tokens must be >= 1024")
-        self.profile_keys = frozenset(k.lower() for k in self.profile_keys)
-        self.reserved_keys = frozenset(k.lower() for k in self.reserved_keys)
-        if not 0.0 < self.working_share < 1.0:
-            raise ValueError("working_share must be between 0 and 1")
-        if abs(sum(self.memory_split.values()) - 1.0) > 1e-6:
-            raise ValueError("memory_split values must sum to 1.0")
-        if set(self.memory_split) != {"facts", "episodic", "sessions", "lessons"}:
-            raise ValueError(
-                "memory_split must have exactly these keys: "
-                "facts, episodic, sessions, lessons"
-            )
-        if set(self.tier_thresholds_gib) != {"full", "standard"}:
-            raise ValueError("tier_thresholds_gib must have exactly keys: full, standard")
+        if not 0 <= self.reserved_tokens <= self.context_tokens - 256:
+            raise ValueError("reserved_tokens must leave at least 256 tokens for memory")
+        if self.half_life_days <= 0 or self.turn_budget_ms <= 0 or self.max_lessons < 1:
+            raise ValueError("half_life_days, turn_budget_ms and max_lessons must be positive")
+        if self.tier is None:
+            self.tier = Tier.from_env()
+        self.pinned = frozenset(normalize_key(k) for k in self.pinned)
+        self.blocked = frozenset(normalize_key(k) for k in self.blocked)

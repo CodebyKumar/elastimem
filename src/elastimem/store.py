@@ -1,666 +1,310 @@
-"""The Elastimem store: the one class hosts interact with.
+"""The ``Elastimem`` class: the one object hosts use.
 
-Thread model: public methods may be called from the host's main thread; the
-background worker (phase 4) owns deferred writes. All writes acquire the
-store-level ``_write_lock``; reads use per-thread connections (WAL-safe).
+Typical turn::
+
+    context = mem.context(user)          # memory for the prompt
+    reply = llm(f"{context}\\n\\n{user}")
+    mem.record(user, reply)              # store it; derived work runs in the background
+
+Threads: public methods run on the host's thread; one background worker
+fills in vectors, extraction and summaries. Writes share one lock; each
+thread has its own SQLite connection. Methods that write memory on the hot
+path (``context``, ``record``, ``search``) never raise.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 import sqlite3
 import threading
+import time
 from typing import Callable
 
-import contextlib
-
-from . import assembly, episodic, extraction, procedural, rules, semantic
-from .assembly import ContextPlan
-from .config import (
-    ConsolidationLevel,
-    ElastimemConfig,
-    MemoryProfile,
-    RollingSummaryMode,
-)
-from .db import open_store, connect
-from .governor import Governor
-from .worker import Job, Worker
+from . import context as context_mod
+from . import db, episodes, facts, graph, inspection, lessons, llm, search, tiers
+from .config import ElastimemConfig, Tier
+from .context import Context
+from .governor import Governor, Status, budgets, keep_turns
+from .jobs import Pause, Worker, consolidate
+from .vectors import Vectors
 
 log = logging.getLogger("elastimem")
 
-CompleteFn = Callable[..., str]
-EmbedFn = Callable[[list[str]], list[list[float]]]
 
-
-def _resolve_config(
-    config: ElastimemConfig | None, overrides: dict
-) -> ElastimemConfig:
-    """Merge an optional external config with inline keyword overrides."""
-    import dataclasses
-
+def _settings(config: ElastimemConfig | None, overrides: dict) -> ElastimemConfig:
     valid = {f.name for f in dataclasses.fields(ElastimemConfig)}
     unknown = set(overrides) - valid
     if unknown:
-        raise TypeError(
-            f"unknown config option(s): {', '.join(sorted(unknown))} "
-            f"(valid: {', '.join(sorted(valid))})"
-        )
-    if config is None:
-        return ElastimemConfig(**overrides)
-    if overrides:
-        return dataclasses.replace(config, **overrides)
-    return config
-
-
-_IMMUTABLE_AFTER_INIT = frozenset({"embed_fn", "embed_query_fn", "tokenizer_fn", "path"})
+        raise TypeError(f"unknown setting(s): {', '.join(sorted(unknown))}"
+                        f" (valid: {', '.join(sorted(valid))})")
+    return dataclasses.replace(config or ElastimemConfig(), **overrides)
 
 
 class Elastimem:
-    """One persistent memory store backed by a single SQLite file.
+    """A persistent memory store in one SQLite file.
 
-    Simplest form — everything is optional except the path::
-
-        mem = Elastimem("~/.myagent/memory.db")
-
-    Full form — inject an LLM and an embedder, tune config inline::
-
-        mem = Elastimem(
-            "~/.myagent/memory.db",
-            llm=my_complete_fn,        # (prompt, *, max_tokens, temperature) -> str
-            embedder=my_embed_fn,      # (list[str]) -> list[list[float]]
-            context_tokens=4096,       # any ElastimemConfig field works here
-            reserved_keys={"model"},
-        )
-
-    Config fields may be passed directly as keyword arguments (as above), or
-    bundled in an external :class:`ElastimemConfig` via ``config=``; inline
-    keywords override the bundle. Elastimem degrades gracefully around any
-    capability you don't provide (see docs/governor.md).
+    ``llm`` is ``(prompt, *, max_tokens, temperature) -> str``. ``embedder``
+    is ``(list[str]) -> list[list[float]]``, ``"auto"`` (the built-in model
+    when ``elastimem[embed]`` is installed) or ``None`` (keyword search
+    only). Settings are :class:`ElastimemConfig` fields, passed inline or as
+    ``config=``.
     """
 
     def __init__(
         self,
         path: str,
         *,
-        llm: CompleteFn | None = None,
-        embedder: EmbedFn | None = None,
+        llm: Callable[..., str] | None = None,
+        embedder: Callable | str | None = "auto",
+        tokenizer: Callable[[str], int] | None = None,
+        on_tier: Callable[[Tier, Tier], None] | None = None,
         config: ElastimemConfig | None = None,
-        tokenizer_fn: Callable[[str], int] | None = None,
-        probe_fn: Callable[[], tuple[int, int]] | None = None,
-        on_tier_change: Callable | None = None,
-        complete_fn: CompleteFn | None = None,   # legacy alias of llm
-        embed_fn: EmbedFn | None = None,         # legacy alias of embedder
-        **config_overrides,
+        **settings,
     ) -> None:
-        self.path = os.path.expanduser(path) if path != ":memory:" else path
-        self._config = _resolve_config(config, config_overrides)
-        self.complete_fn = complete_fn if complete_fn is not None else llm
-        self.embed_fn = embed_fn if embed_fn is not None else embedder
-        # Query-side encoder for an asymmetrically-trained embedder (see
-        # default_embedder.py). None for a host-supplied embed_fn (the
-        # common case — most embedding APIs are symmetric): retrieval then
-        # reuses embed_fn for queries exactly as before this existed.
-        self.embed_query_fn = None
-        if self.embed_fn is None and not self._config.disable_builtin_embedder:
-            # No embedder supplied — activate elastimem's own built-in
-            # semantic search so hosts get real recall quality with zero
-            # setup. Both functions are lazy: nothing downloads or loads
-            # until the first chunk/query is actually embedded, so this
-            # never slows down __init__ or blocks on network access, and
-            # degrades silently to FTS5/keyword search if the optional
-            # 'embed' extra isn't installed or the download fails.
-            from . import default_embedder
-            self.embed_fn = default_embedder.default_embed_fn
-            self.embed_query_fn = default_embedder.embed_query
-        self.tokenizer_fn = tokenizer_fn
+        self.path = path if path == ":memory:" else os.path.expanduser(path)
+        self._config = _settings(config, settings)
+        self._llm, self._tokenizer = llm, tokenizer
+        self._vectors = Vectors(embedder)
         self._write_lock = threading.RLock()
         self._local = threading.local()
+        self._conns: list[sqlite3.Connection] = []
+        self._conns_lock = threading.Lock()
+        self._closed = False
 
-        conn, self.fts_enabled = open_store(self.path)
-        self._local.conn = conn
-        # A ":memory:" database is private to the connection that created
-        # it - sqlite3.connect(":memory:") from another thread opens a
-        # SEPARATE, empty database, not the same one. Every other _conn
-        # user (record_turn, remember, ...) works fine on the main thread
-        # BUT the background worker thread's _conn would silently see an
-        # empty schema-less database, so writes from `extract`/`embed`/
-        # `consolidate` jobs would raise "no such table" - not a hang, but
-        # a silent-looking failure logged only via Worker._run's exception
-        # catch. The fix: for ":memory:" specifically, every thread reuses
-        # this one connection instead of opening its own. sqlite3
-        # connections are not documented thread-safe for concurrent
-        # *statement execution* from multiple threads simultaneously, but
-        # Elastimem already serializes all writes through `_write_lock`
-        # and every read here is a short, synchronous call - the same
-        # safety property file-backed stores get from WAL is provided here
-        # by the existing write lock instead.
-        self._memory_conn = conn if self.path == ":memory:" else None
-
-        governor_kwargs = {"on_tier_change": on_tier_change}
-        if probe_fn is not None:
-            governor_kwargs["probe_fn"] = probe_fn
-        self._governor = Governor(self._config, **governor_kwargs)
-
-        # Session state (lazy: first record_turn opens one).
-        self.session_id: int | None = None
+        conn, self._fts = db.open_store(self.path)
+        self._register(conn)
+        self._governor = Governor(self._config, on_change=on_tier)
+        self._session: int | None = None
         self._turn = 0
-        self._rolling: str | None = None
-        # _rolling is read/written from both the main thread (begin_session,
-        # report_evictions' degradation-floor path, build_context's reader)
-        # and the worker thread (_execute_job's rolling_summary handler) -
-        # a plain attribute access is torn-write-safe under the GIL but NOT
-        # race-free: two writers close together can silently drop one side's
-        # contribution (a fresh LLM-condensed summary racing a degradation
-        # marker append). _write_lock isn't reused here on purpose - that
-        # lock guards SQLite writes specifically, and _rolling is a plain
-        # in-memory attribute, not a DB write.
-        self._rolling_lock = threading.Lock()
         with self._write_lock:
-            episodic.close_orphan_sessions(conn)
-
+            episodes.close_orphans(conn)
+        self._vectors.forget_other_models(conn, self._write_lock)
         self._worker = Worker(self)
-        self._initialized = True
 
-    def __setattr__(self, name: str, value) -> None:
-        # embed_fn/embed_query_fn/tokenizer_fn/path are read by the
-        # background worker without synchronization (see the module
-        # docstring's thread model) — reassigning them after construction
-        # would race the worker rather than raise, so guard it explicitly
-        # instead of leaving it as a documented-but-unenforced "don't."
-        if getattr(self, "_initialized", False) and name in _IMMUTABLE_AFTER_INIT:
-            raise AttributeError(
-                f"Elastimem.{name} is set at construction and cannot be "
-                f"reassigned — open a new store instead"
-            )
-        super().__setattr__(name, value)
+    # -- connections ------------------------------------------------------------
+    def _register(self, conn: sqlite3.Connection) -> None:
+        self._local.conn = conn
+        with self._conns_lock:
+            self._conns.append(conn)
 
-    # ------------------------------------------------------------------ #
-    # connections
-    # ------------------------------------------------------------------ #
     @property
     def _conn(self) -> sqlite3.Connection:
-        """Per-thread connection. ``:memory:`` stores are the one exception:
-        every thread shares the single connection created in ``__init__``,
-        since sqlite3 gives each new connection to ``:memory:`` its own
-        separate (and here, empty) database — see the comment in
-        ``__init__`` next to ``self._memory_conn``."""
-        if self._memory_conn is not None:
-            return self._memory_conn
+        if self.path == ":memory:":
+            return self._conns[0]       # each new :memory: connection is a separate empty db
         conn = getattr(self._local, "conn", None)
         if conn is None:
-            conn = connect(self.path)
-            self._local.conn = conn
+            conn = db.connect(self.path)
+            self._register(conn)
         return conn
+
+    # -- status and settings ----------------------------------------------------
+    @property
+    def status(self) -> Status:
+        """What memory will do this turn, and why."""
+        tier = self._governor.tier
+        spec = tiers.TIERS[tier]
+        b = budgets(self._config)
+        reasons = {"tier": f"{tier.name}: {self._governor.reason}"}
+        vector_reason = self._vectors.unavailable(spec.load_embedder)
+        reasons["vectors"] = vector_reason or "on"
+        if self._llm is None:
+            cadence, reasons["llm"] = "off", "no llm given"
+        elif self._governor.on_battery and spec.extraction != "session_end":
+            cadence, reasons["llm"] = "session_end", "on battery: background LLM work waits for session end"
+        else:
+            cadence, reasons["llm"] = spec.extraction, f"{spec.extraction} ({tier.name})"
+        return Status(tier, b, keep_turns(b), vector_reason is None, cadence,
+                      spec.graph_hops, reasons)
 
     @property
     def config(self) -> ElastimemConfig:
-        """Read-only snapshot of the active config. Mutating the returned
-        object has no effect — call :meth:`reconfigure` to change settings,
-        so budgets stay in sync with whatever changed."""
-        import dataclasses
-
+        """A copy of the active settings; change them with :meth:`configure`."""
         return dataclasses.replace(self._config)
 
-    # ------------------------------------------------------------------ #
-    # governor / context
-    # ------------------------------------------------------------------ #
-    @property
-    def profile(self) -> MemoryProfile:
-        """The governor's current capability/budget snapshot."""
-        return self._governor.profile
+    def configure(self, **settings) -> Status:
+        """Change settings (for example ``context_tokens`` after a model switch)."""
+        self._config = _settings(self._config, settings)
+        self._governor.reconfigure(self._config)
+        return self.status
 
-    def tick(self) -> MemoryProfile:
-        """Call once per turn: cheap hardware re-check, may change the tier."""
-        return self._governor.tick()
+    def report_pressure(self) -> Status:
+        """Tell memory the host hit an out-of-memory or decode failure."""
+        self._governor.report_pressure()
+        return self.status
 
-    def report_pressure(self) -> MemoryProfile:
-        """Host signal that an OOM/decode failure happened; downgrades a tier."""
-        return self._governor.report_pressure()
-
-    def reconfigure(self, *, reprobe: bool = False, **config_overrides) -> MemoryProfile:
-        """Update config fields (e.g. after a model switch) and immediately
-        rebuild token budgets from them.
-
-        Budgets are normally only recomputed on a tier change; call this
-        whenever you change something that feeds budget math after
-        construction — most commonly ``context_tokens`` and
-        ``static_prompt_tokens`` when the host switches models::
-
-            mem.reconfigure(context_tokens=new_model_ctx,
-                            static_prompt_tokens=measured_prompt_tokens)
-
-        ``reprobe=True`` also re-measures hardware and re-classifies the
-        tier before rebuilding budgets (see ``Governor.reconfigure``) -
-        pass this when calling reconfigure() right after a (possibly large)
-        model finishes loading, since the store is normally constructed
-        before any model is chosen and its startup tier reading predates
-        that model claiming its share of RAM.
-
-        Returns the refreshed :class:`MemoryProfile`.
-        """
-        if config_overrides:
-            self._config = _resolve_config(self._config, config_overrides)
-            self._governor.config = self._config
-        return self._governor.reconfigure(reprobe=reprobe)
-
-    def build_context(self, user_input: str = "") -> ContextPlan:
-        """Assemble this turn's budgeted memory sections.
-
-        ``user_input`` (when given) makes retrieval query-aware; retrieval
-        never raises — on any failure a section is simply empty.
-        """
-        profile = self._governor.profile
-        conn = self._conn
-
-        relevance: dict[int, float] = {}
-        episodic_text = ""
-        graph_context_text = ""
-        if user_input and len(user_input.split()) >= self._config.min_retrieval_query_words:
-            try:
-                from . import retrieval
-
-                relevance = retrieval.fact_relevance(
-                    conn, user_input, fts=self.fts_enabled
-                )
-                if profile.budgets.episodic > 0:
-                    episodic_text = retrieval.episodic_section(
-                        self, user_input, profile, tokenizer_fn=self.tokenizer_fn
-                    )
-                    graph_context_text = retrieval.graph_context_section(
-                        self, user_input, profile, tokenizer_fn=self.tokenizer_fn
-                    )
-            except Exception:
-                log.exception("elastimem: retrieval failed; sections degraded to empty")
-
-        facts_text, fact_ids = assembly.build_facts_section(
-            conn, self._config, profile, relevance, self.tokenizer_fn
-        )
-        if fact_ids:
-            with self._write_lock:
-                semantic.touch(conn, fact_ids)
-
-        sections = {
-            assembly.SECTION_FACTS: facts_text,
-            assembly.SECTION_GRAPH_CONTEXT: graph_context_text,
-            assembly.SECTION_EPISODIC: episodic_text,
-            assembly.SECTION_SESSIONS: self._sessions_section(profile),
-            assembly.SECTION_LESSONS: assembly.build_lessons_section(
-                conn, self._config, profile, self.tokenizer_fn
-            ),
-        }
-        return ContextPlan(
-            sections=sections,
-            rolling_summary=self._rolling_summary(),
-            keep_last_n_turns=assembly.estimate_window_turns(
-                profile.budgets.working, min_turns=profile.window_min_turns
-            ),
-            profile=profile,
-            fact_ids=tuple(fact_ids),
-        )
-
-    def _sessions_section(self, profile: MemoryProfile) -> str:
-        """Recent session summaries (populated from phase 3 onward)."""
-        rows = self._conn.execute(
-            "SELECT summary FROM sessions WHERE summary IS NOT NULL AND summary != ''"
-            " ORDER BY id DESC LIMIT 5"
-        ).fetchall()
-        lines = [f"- {r['summary']}" for r in reversed(rows)]
-        return "\n".join(
-            assembly.fit_lines(lines, profile.budgets.sessions, self.tokenizer_fn)
-        )
-
-    def _rolling_summary(self) -> str | None:
-        """Current session's rolling summary (maintained by the worker)."""
-        with self._rolling_lock:
-            return self._rolling
-
-    # ------------------------------------------------------------------ #
-    # episodic memory (turns, sessions, recall)
-    # ------------------------------------------------------------------ #
-    def begin_session(self, host_tag: str | None = None) -> int:
-        """Start a new session explicitly (record_turn does this lazily)."""
-        with self._write_lock:
-            if self.session_id is not None:
-                episodic.end_session(self._conn, self.session_id)
-            self.session_id = episodic.begin_session(self._conn, host_tag)
-            self._turn = 0
-        with self._rolling_lock:
-            self._rolling = None
-        return self.session_id
-
-    def record_turn(self, user_text: str, assistant_text: str) -> None:
-        """Persist one exchange and run inline rule capture.
-
-        Never raises: memory writes must not break the host's chat loop.
-        """
+    # -- the turn ---------------------------------------------------------------
+    def context(self, query: str = "") -> Context:
+        """Memory for this turn's prompt: ``str(context)`` renders it."""
+        started = time.perf_counter()
+        self._governor.check()
         try:
+            ctx, shown = context_mod.build(self, query)
             with self._write_lock:
-                if self.session_id is None:
-                    self.session_id = episodic.begin_session(self._conn)
+                facts.touch(self._conn, shown)
+        except Exception:
+            log.exception("elastimem: building context failed; returning an empty one")
+            status = self.status
+            ctx = Context(dict.fromkeys(context_mod.TITLES, ""), None, status.keep_turns, status)
+        self._governor.observe((time.perf_counter() - started) * 1000)
+        return ctx
+
+    def record(self, user: str, reply: str) -> None:
+        """Store one exchange. Never raises."""
+        try:
+            status = self.status
+            with self._write_lock:
+                if self._session is None:
+                    self._session = episodes.begin(self._conn)
                 self._turn += 1
-                chunk_ids = episodic.record_turn(
-                    self._conn, self._config, self.session_id, self._turn,
-                    user_text, assistant_text, tokenizer_fn=self.tokenizer_fn,
-                )
-            captured = rules.capture(user_text)
-            for key, value in captured:
-                self.remember(key, value, source="rule")
-            if captured:
-                with self._write_lock:
-                    episodic.bump_importance(self._conn, chunk_ids)
-            self._after_record_turn(user_text, assistant_text, chunk_ids)
+                episodes.record(self._conn, self._session, self._turn, user, reply, self._tokenizer)
+                if not (status.spec.llm_summary and self._llm):
+                    self._fold(status)
+            self._worker.wake()
         except Exception:
-            log.exception("elastimem: record_turn failed (chat unaffected)")
+            log.exception("elastimem: record failed (chat unaffected)")
 
-    def _after_record_turn(
-        self, user_text: str, assistant_text: str, chunk_ids: list[int]
-    ) -> None:
-        """Enqueue deferred work: LLM extraction, chunk embedding."""
-        profile = self._governor.profile
-        if (self.complete_fn is not None
-                and profile.llm_extraction_enabled
-                and len(user_text.split()) >= self._config.min_query_words):
-            self._worker.submit(Job(
-                "extract", needs_llm=True,
-                payload={"user": user_text, "assistant": assistant_text,
-                         "chunk_ids": chunk_ids},
-            ))
-        if (self.embed_fn is not None and profile.embeddings_enabled and chunk_ids):
-            self._worker.submit(Job("embed", needs_llm=False,
-                                    payload={"chunk_ids": chunk_ids}))
+    def _fold(self, status: Status) -> None:
+        """Fold turns that left the window into the summary, without a model."""
+        up_to, previous, turns = episodes.evicted(self._conn, self._session, status.keep_turns)
+        if turns:
+            summary = episodes.extractive_summary(
+                previous, turns, status.budgets.sessions, self._tokenizer)
+            episodes.save_summary(self._conn, self._session, summary, up_to)
 
-    @contextlib.contextmanager
-    def foreground(self):
-        """Bracket the host's own LLM generation: while held, the worker
-        will not start background LLM jobs (single-model-instance safety).
+    def pause(self) -> Pause:
+        """Hold background LLM work while the host's own model generates::
 
-        Prefer this over `foreground_begin()`/`foreground_end()` whenever
-        generation happens inside a single synchronous call — it can't be
-        left unbalanced. The explicit begin/end pair exists only for hosts
-        that can't bracket generation in one `with` block (e.g. streaming
-        token-by-token across separate callback invocations, where "begin"
-        and "end" naturally happen in different stack frames)."""
-        self._worker.foreground_begin()
+            with mem.pause():
+                reply = llm(prompt)
+
+        Only needed when the host and Elastimem share one model instance.
+        """
+        return self._worker.pause()
+
+    def flush(self, timeout: float = 5.0) -> bool:
+        """Finish all pending background work. Returns False on timeout."""
+        return self._worker.flush(timeout)
+
+    # -- searching ----------------------------------------------------------------
+    def search(self, query: str, k: int = 5) -> list[search.Hit]:
+        """Past moments and facts matching ``query``, best first. Never raises."""
         try:
-            yield
-        finally:
-            self._worker.foreground_end()
-
-    def foreground_begin(self) -> None:
-        """Explicit half of the foreground gate — see `foreground()`'s
-        docstring for when to prefer this over the context manager. Every
-        call must be matched by exactly one `foreground_end()`; unbalanced
-        calls leave the worker permanently blocked (or unblocked when it
-        shouldn't be)."""
-        self._worker.foreground_begin()
-
-    def foreground_end(self) -> None:
-        self._worker.foreground_end()
-
-    def report_evictions(self, turns: list[tuple[str, str]]) -> None:
-        """Host reports (user, assistant) pairs it evicted from its window;
-        they fold into the rolling summary (already persisted verbatim)."""
-        if not turns:
-            return
-        profile = self._governor.profile
-        mode = profile.rolling_summary_mode
-        if mode is RollingSummaryMode.LLM and self.complete_fn is not None:
-            self._worker.submit(Job(
-                "rolling_summary", needs_llm=True, payload={"turns": turns},
-            ))
-            return
-        if mode is RollingSummaryMode.EXTRACTIVE:
-            # No model call: select from text already persisted. Done inline
-            # rather than on the worker because it is pure string work on a
-            # handful of turns - queueing it would cost more than running it.
-            # _rolling_lock is a plain (non-reentrant) Lock, so the whole
-            # read-compute-write is done inside ONE acquisition and the
-            # marker fallback below is reached only after releasing it.
-            with self._rolling_lock:
-                summary = extraction.extractive_rolling_summary(
-                    self._rolling, turns, profile.budgets.sessions,
-                    tokenizer_fn=self.tokenizer_fn,
-                )
-                if summary:
-                    self._rolling = summary
-            if summary:
-                return
-            # Nothing usable came out (e.g. every evicted turn was empty or
-            # the sessions budget rounded to zero) - fall back to the marker.
-        # Degradation floor: a marker line, so the model knows history
-        # exists and recall() can retrieve it.
-        with self._rolling_lock:
-            self._rolling = (
-                f"[{len(turns)} earlier turn(s) omitted — memory search can"
-                " recall them]"
-                if self._rolling is None
-                else self._rolling + f" [+{len(turns)} more turn(s) omitted]"
-            )
-
-    def drain(self, timeout: float = 5.0) -> bool:
-        """Finish queued background work (call before unloading the model)."""
-        return self._worker.drain(timeout)
-
-    # ------------------------------------------------------------------ #
-    # background job execution (called from the worker thread)
-    # ------------------------------------------------------------------ #
-    def _execute_job(self, job: Job) -> None:
-        conn = self._conn  # worker thread gets its own connection
-        if job.kind == "extract" and self.complete_fn is not None:
-            chunk_ids = job.payload.get("chunk_ids") or []
-            stored = extraction.extract_facts(
-                conn, self._config, self.complete_fn,
-                job.payload["user"], job.payload["assistant"],
-                store_fn=lambda k, v, s: self.remember(k, v, source=s),
-                graph_hops=self._governor.profile.graph_hops,
-                source_chunk_id=chunk_ids[0] if chunk_ids else None,
-            )
-            if stored and job.payload.get("chunk_ids"):
-                with self._write_lock:
-                    episodic.bump_importance(conn, job.payload["chunk_ids"])
-        elif job.kind == "rolling_summary" and self.complete_fn is not None:
-            with self._rolling_lock:
-                previous = self._rolling
-            summary = extraction.rolling_summary(
-                self.complete_fn, self._config, previous, job.payload["turns"]
-            )
-            if summary:
-                with self._rolling_lock:
-                    self._rolling = summary
-                if self.session_id is not None:
-                    with self._write_lock:
-                        conn.execute(
-                            "UPDATE sessions SET rolling_summary=? WHERE id=?",
-                            (summary, self.session_id),
-                        )
-                        conn.commit()
-        elif job.kind == "embed":
-            from . import embeddings
-
-            embeddings.embed_chunks(self, job.payload["chunk_ids"])
-        elif job.kind == "consolidate":
-            level = self._governor.profile.consolidation_level
-            if level is not ConsolidationLevel.OFF:
-                with self._write_lock:
-                    extraction.consolidate(
-                        conn, self._config, self.complete_fn,
-                        llm_merge=(level is ConsolidationLevel.FULL
-                                   and self.complete_fn is not None),
-                    )
-
-    def recall(self, query: str, k: int = 5) -> list:
-        """Search past conversations and facts. Works in every tier; returns
-        a list of :class:`elastimem.retrieval.Hit`, best first. Never raises."""
-        try:
-            from . import retrieval
-
-            return retrieval.search_all(self, query, k=k)
+            return search.search(self, query, k)
         except Exception:
-            log.exception("elastimem: recall failed")
+            log.exception("elastimem: search failed")
             return []
 
-    def explain(self, query: str, k: int = 5) -> "retrieval.ExplainResult":
-        """Retrieval transparency: same ranking as ``recall()``, but keeps
-        every per-leg score (FTS, vector, graph, importance, recency) and
-        the graph traversal path instead of collapsing them into a final
-        number. For debugging retrieval quality, not the per-turn hot path
-        — it recomputes rather than reusing ``recall()``'s work. Never
-        raises."""
-        from . import retrieval
+    def explain(self, query: str, k: int = 5) -> inspection.Explanation:
+        """Like :meth:`search`, with each result's score broken into its terms."""
+        return inspection.explain(self, query, k)
 
-        return retrieval.explain(self, query, k=k)
+    # -- facts and lessons ------------------------------------------------------
+    def remember(self, key: str, value: str) -> bool:
+        """Store a fact. True if it was new or changed."""
+        with self._write_lock:
+            changed, _ = facts.store(self._conn, key, value, blocked=self._config.blocked)
+        self._worker.wake()
+        return changed
 
+    def forget(self, key: str) -> bool:
+        with self._write_lock:
+            return facts.forget(self._conn, key)
+
+    def facts(self) -> dict[str, str]:
+        return facts.as_dict(self._conn)
+
+    def history(self, key_or_question: str) -> list[facts.Fact]:
+        """Every version of a fact, oldest first."""
+        return inspection.history(self, key_or_question)
+
+    def learn(self, lesson: str) -> bool:
+        with self._write_lock:
+            return lessons.learn(self._conn, lesson, self._config.max_lessons)
+
+    def lessons(self, n: int = tiers.LESSONS_SHOWN) -> list[str]:
+        return lessons.recent(self._conn, n)
+
+    def topics(self) -> list[dict]:
+        """Groups of related entities: ``[{"id", "name", "members"}]``."""
+        return graph.list_topics(self._conn)
+
+    def rejected(self, n: int = 20) -> list[dict]:
+        """Recently rejected automatic facts, for debugging."""
+        return facts.list_rejected(self._conn, n)
+
+    # -- sessions -------------------------------------------------------------------
     def sessions(self, n: int = 20) -> list[dict]:
-        """Recent sessions, newest first."""
-        return episodic.list_sessions(self._conn, n)
+        return episodes.list_sessions(self._conn, n)
 
-    def resume_session(self, session_id: int | None = None) -> tuple[str | None, list[dict]]:
-        """Return ``(rolling_summary, tail_messages)`` of a past session so the
-        host can reload them into its message list. Defaults to the most
-        recently ended session. Starts a fresh session for new turns."""
-        conn = self._conn
+    def new_session(self, tag: str | None = None) -> int:
+        """Close the current session (if any) and start another."""
+        self.end_session()
+        with self._write_lock:
+            self._session = episodes.begin(self._conn, tag)
+        return self._session
+
+    def resume(self, session_id: int | None = None) -> tuple[str | None, list[dict]]:
+        """``(summary, messages)`` of a past session (default: the latest
+        ended one) for the host to reload. New turns go to a new session."""
         if session_id is None:
-            row = conn.execute(
-                "SELECT id FROM sessions WHERE ended_at IS NOT NULL"
-                " AND message_count > 0 ORDER BY id DESC LIMIT 1"
+            row = self._conn.execute(
+                "SELECT id FROM sessions WHERE ended_at IS NOT NULL AND message_count > 0"
+                " ORDER BY id DESC LIMIT 1"
             ).fetchone()
             if row is None:
                 return None, []
             session_id = row["id"]
-        return episodic.session_tail(
-            conn, session_id, self._governor.profile.budgets.working
-        )
+        return episodes.tail(self._conn, session_id, self.status.budgets.working)
 
     def end_session(self) -> None:
-        """Close the current session: flush deferred work, summarize (when a
-        completion callable exists), run exit consolidation."""
-        if self.session_id is None:
+        """Finish background work, summarize the session and tidy memory."""
+        if self._session is None:
             return
-        self._worker.drain()
-
+        # Inside a pause() the host holds llm_lock; waiting for it would hang,
+        # so LLM steps are skipped and the turns stay pending for next time.
+        use_llm = self._llm is not None and not self._worker._paused
+        if use_llm:
+            self._worker.flush()
         summary = None
-        if self.complete_fn is not None:
-            user_turns = [
-                r["content"] for r in self._conn.execute(
-                    "SELECT content FROM messages WHERE session_id=? AND"
-                    " role='user' ORDER BY id", (self.session_id,)
-                )
-            ]
-            # drain() only finishes what was already queued - the worker
-            # thread stays alive and could still pick up a job submitted by
-            # another thread between drain() returning and this call
-            # running. This call itself never went through the worker, so
-            # without llm_lock it could race a background complete_fn call
-            # against this one on the same (typically single-instance,
-            # non-thread-safe) model. Mirrors Worker._execute's own guard.
+        if use_llm:
+            turns = episodes.user_turns(self._conn, self._session)
             with self._worker.llm_lock:
-                summary = extraction.session_summary(
-                    self.complete_fn, self._config, user_turns
-                ) or None
-
-        level = self._governor.profile.consolidation_level
-        llm_merge = level is ConsolidationLevel.FULL and self.complete_fn is not None
-        # consolidate() interleaves complete_fn calls with the writes below
-        # (contradiction-merge reviews a row, calls the model, writes the
-        # merged value, repeats) - can't cleanly separate "the LLM part"
-        # from "the DB part" into two locks without changing consolidate()
-        # itself. Acquire llm_lock BEFORE _write_lock, matching the order
-        # Worker._execute already uses everywhere else (llm_lock, then
-        # _write_lock inside _execute_job) - reversing that order here would
-        # be a lock-order inversion: this thread holding _write_lock while
-        # waiting on llm_lock, with the worker thread holding llm_lock while
-        # waiting on _write_lock inside its own consolidate job, deadlocks.
-        # Only taken when llm_merge is actually possible, so the common
-        # (DB-only consolidation) path pays no extra lock cost.
-        with contextlib.ExitStack() as stack:
-            if llm_merge:
-                stack.enter_context(self._worker.llm_lock)
-            stack.enter_context(self._write_lock)
-            episodic.end_session(self._conn, self.session_id, summary)
-            if level is not ConsolidationLevel.OFF:
-                extraction.consolidate(
-                    self._conn, self._config, self.complete_fn,
-                    llm_merge=llm_merge,
-                )
-            self.session_id = None
-            self._turn = 0
-            with self._rolling_lock:
-                self._rolling = None
-
-    # ------------------------------------------------------------------ #
-    # semantic memory (facts)
-    # ------------------------------------------------------------------ #
-    def remember(self, key: str, value: str, source: str = "explicit") -> tuple[bool, str]:
-        """Durably store one fact, synchronously. Returns ``(changed, reason)``."""
+                summary = llm.session_summary(self._llm, turns) or None
+        try:
+            consolidate(self, use_llm)
+        except Exception:
+            log.exception("elastimem: consolidation failed")
         with self._write_lock:
-            return semantic.store_fact(self._conn, self._config, key, value, source)
+            episodes.end(self._conn, self._session, summary)
+            self._session, self._turn = None, 0
 
-    def facts(self) -> dict[str, str]:
-        """Current facts as a merged ``{key: value}`` dict."""
-        return semantic.facts_as_dict(self._conn)
-
-    def fact_history(self, key: str) -> list[semantic.Fact]:
-        """Every version ever stored for ``key`` — the audit chain."""
-        return semantic.fact_history(self._conn, key)
-
-    def timeline(self, query: str) -> "retrieval.TimelineResult":
-        """Resolve ``query`` to a fact key (exact key match, or a fact
-        search over free text — e.g. "what did I do before AI?") and
-        return its full version history, oldest first. Never raises."""
-        from . import retrieval
-
-        return retrieval.timeline(self, query)
-
-    def clusters(self) -> list[dict]:
-        """Current knowledge-graph topic clusters (computed during
-        consolidation — see governor.md's Knowledge graph section), largest
-        first: ``[{"cluster_id", "label", "members": [name, ...]}, ...]``.
-        Empty on LITE tier or a graph with no multi-node components yet.
-        Never raises."""
-        from . import graph
-
-        return graph.list_clusters(self._conn)
-
-    def forget(self, key: str) -> bool:
-        """Invalidate the current version of ``key`` (non-destructive tombstone)."""
-        with self._write_lock:
-            return semantic.forget(self._conn, key)
-
-    # ------------------------------------------------------------------ #
-    # procedural memory (lessons)
-    # ------------------------------------------------------------------ #
-    def add_lesson(self, text: str, tag: str | None = None) -> bool:
-        with self._write_lock:
-            return procedural.add_lesson(self._conn, self._config, text, tag)
-
-    def lessons(self, n: int | None = None) -> list[str]:
-        return procedural.load_lessons(self._conn, n or self._config.lessons_in_prompt)
-
-    # ------------------------------------------------------------------ #
-    # inspection / maintenance
-    # ------------------------------------------------------------------ #
-    def quarantine_entries(self, n: int = 20) -> list[dict]:
-        """Recently rejected automatic extractions (debugging; never prompted)."""
-        rows = self._conn.execute(
-            "SELECT ts, key, value, reason, source FROM quarantine"
-            " ORDER BY id DESC LIMIT ?", (n,)
-        ).fetchall()
-        return [dict(r) for r in reversed(rows)]
-
+    # -- lifecycle -----------------------------------------------------------------
     def stats(self) -> dict:
-        counts = {
-            table: self._conn.execute(f"SELECT count(*) c FROM {table}").fetchone()["c"]
-            for table in ("facts", "sessions", "messages", "chunks", "lessons", "quarantine")
-        }
+        tables = ("facts", "sessions", "messages", "chunks", "lessons", "entities", "rejected")
+        counts = {t: self._conn.execute(f"SELECT count(*) FROM {t}").fetchone()[0] for t in tables}
         size = os.path.getsize(self.path) if self.path != ":memory:" else 0
-        return {"path": self.path, "db_bytes": size, "fts_enabled": self.fts_enabled,
-                **counts}
+        return {"path": self.path, "bytes": size, "fts": self._fts, **counts}
 
     def close(self) -> None:
-        """Stop the worker (draining pending jobs) and close connections."""
-        self._worker.stop()
-        conn = getattr(self._local, "conn", None)
-        if conn is not None:
-            conn.close()
-            self._local.conn = None
+        """End the session, stop the worker and close every connection."""
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self.end_session()
+        except Exception:      # every turn is already stored; finish shutting down
+            log.exception("elastimem: ending the session on close failed")
+        finally:
+            self._worker.stop()
+            with self._conns_lock:
+                for conn in self._conns:
+                    conn.close()
+                self._conns.clear()
+
+    def __enter__(self) -> "Elastimem":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()

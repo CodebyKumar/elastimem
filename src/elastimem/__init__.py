@@ -1,64 +1,37 @@
-"""Elastimem — elastic, resource-adaptive memory for local-first AI agents.
+"""Elastimem: long-term memory for local AI agents, in one SQLite file.
 
-Quickstart::
+::
 
     import elastimem
 
-    mem = elastimem.open("~/.myagent/memory.db")
-    mem.remember("favorite_color", "blue")
-    mem.facts()   # {'favorite_color': 'blue'}
-
-With an LLM and embedder (both optional — everything degrades gracefully)::
-
-    mem = elastimem.open(
-        "~/.myagent/memory.db",
-        llm=my_complete_fn,       # (prompt, *, max_tokens, temperature) -> str
-        embedder=my_embed_fn,     # (list[str]) -> list[list[float]]
-        context_tokens=4096,      # any ElastimemConfig field, passed inline
-    )
+    with elastimem.open("~/.myagent/memory.db", llm=my_llm) as mem:
+        context = mem.context(user)
+        reply = my_llm(f"{context}\\n\\n{user}")
+        mem.record(user, reply)
 """
 
 from importlib.metadata import PackageNotFoundError, version
 
-from .config import (
-    Budgets,
-    Cadence,
-    ConsolidationLevel,
-    ElastimemConfig,
-    MemoryProfile,
-    RollingSummaryMode,
-    Tier,
-)
-from .semantic import Fact
+from .config import ElastimemConfig, Tier
+from .context import Context
+from .facts import Fact
+from .governor import Budgets, Status
+from .inspection import Explanation
+from .search import Hit
 from .store import Elastimem
 
 try:
     __version__ = version("elastimem")
 except PackageNotFoundError:
-    # Editable/dev checkout with no installed distribution metadata.
     __version__ = "0.0.0+dev"
 
 
 def open(path: str, **kwargs) -> Elastimem:
-    """Open (creating if needed) a memory store at ``path``.
-
-    The friendly front door — identical to ``Elastimem(path, **kwargs)``.
-    Accepts ``llm=``, ``embedder=``, ``config=ElastimemConfig(...)``, and any
-    individual :class:`ElastimemConfig` field as a keyword argument.
-    """
+    """Open (creating if needed) the store at ``path``. Same as ``Elastimem(path, ...)``."""
     return Elastimem(path, **kwargs)
 
 
 __all__ = [
-    "open",
-    "Elastimem",
-    "ElastimemConfig",
-    "MemoryProfile",
-    "Budgets",
-    "Tier",
-    "Cadence",
-    "ConsolidationLevel",
-    "RollingSummaryMode",
-    "Fact",
-    "__version__",
+    "open", "Elastimem", "ElastimemConfig", "Tier", "Status", "Budgets",
+    "Context", "Fact", "Hit", "Explanation", "__version__",
 ]

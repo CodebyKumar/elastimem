@@ -1,232 +1,67 @@
-"""Governor: tier classification, budgets, hysteresis, pressure response."""
-
 import pytest
 
-from elastimem import (
-    Cadence,
-    ConsolidationLevel,
-    Elastimem,
-    ElastimemConfig,
-    RollingSummaryMode,
-    Tier,
-)
-from elastimem.governor import Governor, GIB, probe_ram
+from elastimem import ElastimemConfig, Tier, governor, tiers
+from elastimem.governor import GIB, Governor
 
 
-def gov(total_gib, avail_gib, **cfg_kwargs):
-    cfg = ElastimemConfig(**cfg_kwargs)
-    return Governor(cfg, probe_fn=lambda: (int(total_gib * GIB), int(avail_gib * GIB)))
+@pytest.mark.parametrize("total_gib, pressure, tier", [
+    (32, "normal", Tier.FULL),
+    (16, "normal", Tier.FULL),
+    (8, "normal", Tier.STANDARD),
+    (8, "warn", Tier.STANDARD),       # this Mac: used to be LITE in 0.2
+    (32, "warn", Tier.STANDARD),
+    (32, "critical", Tier.LITE),
+    (4, "normal", Tier.LITE),
+])
+def test_tier_from_capacity_and_pressure(total_gib, pressure, tier):
+    assert Governor(ElastimemConfig(), probe_fn=lambda: (total_gib * GIB, pressure)).tier is tier
 
 
-def test_tier_classification():
-    assert gov(32, 20).tier is Tier.FULL
-    assert gov(16, 8).tier is Tier.FULL
-    assert gov(8, 4).tier is Tier.STANDARD
-    assert gov(16, 3).tier is Tier.STANDARD   # big machine under load
-    assert gov(4, 2).tier is Tier.LITE
-    assert gov(8, 1).tier is Tier.LITE
+def test_fixed_tier_ignores_hardware():
+    g = Governor(ElastimemConfig(tier=Tier.LITE), probe_fn=lambda: (64 * GIB, "normal"))
+    g.observe(10_000)
+    g.report_pressure()
+    assert g.tier is Tier.LITE
+
+
+def test_slow_turns_step_down_then_recover(monkeypatch):
+    monkeypatch.setattr(tiers, "PROBE_SECONDS", 0)
+    g = Governor(ElastimemConfig(turn_budget_ms=50), probe_fn=lambda: (32 * GIB, "normal"))
+    for _ in range(tiers.SLOW_TURNS - 1):
+        g.observe(200)
+    assert g.tier is Tier.FULL                  # one bad stretch is not enough
+    g.observe(200)
+    assert g.tier is Tier.STANDARD and "ms per turn" in g.reason
+    for _ in range(tiers.UPGRADE_TURNS):
+        g.observe(5)
+    assert g.check() is Tier.FULL
+
+
+def test_pressure_drops_immediately(monkeypatch):
+    monkeypatch.setattr(tiers, "PROBE_SECONDS", 0)
+    readings = iter([(32 * GIB, "normal"), (32 * GIB, "critical")])
+    g = Governor(ElastimemConfig(), probe_fn=lambda: next(readings))
+    assert g.check() is Tier.LITE
+
+
+def test_pressure_reports_in_a_burst_count_once():
+    g = Governor(ElastimemConfig(), probe_fn=lambda: (32 * GIB, "normal"))
+    g.report_pressure()
+    g.report_pressure()
+    assert g.tier is Tier.STANDARD
 
 
 def test_env_override(monkeypatch):
     monkeypatch.setenv("ELASTIMEM_TIER", "lite")
-    g = Governor(ElastimemConfig(), probe_fn=lambda: (32 * GIB, 20 * GIB))
-    assert g.tier is Tier.LITE
-    assert g.tick().tier is Tier.LITE  # override pins the tier
+    assert ElastimemConfig().tier is Tier.LITE
 
 
-def test_budgets_derive_from_context():
-    g = gov(32, 20, context_tokens=4096, static_prompt_tokens=1200)
-    b = g.profile.budgets
-    dynamic = 4096 - 512 - 600 - 1200  # = 1784
-    assert b.working == int(dynamic * 0.55)
-    assert b.working + b.memory_total <= dynamic
-    assert b.facts > b.sessions  # facts get the largest memory share
+def test_probe_reads_this_machine():
+    total, pressure = governor.probe()
+    assert total > GIB and pressure in {"normal", "warn", "critical"}
 
 
-def test_lite_shrinks_episodic_and_boosts_working():
-    full = gov(32, 20, context_tokens=8192)
-    lite = gov(4, 2, context_tokens=8192)
-    assert 0 < lite.profile.budgets.episodic < full.profile.budgets.episodic
-    assert lite.profile.budgets.working > full.profile.budgets.working
-    assert lite.profile.extraction_cadence is Cadence.OFF
-    assert lite.profile.embeddings_enabled is False
-
-
-def test_lite_consolidation_is_dedupe_only_not_off():
-    """DEDUPE_ONLY is 100% local SQLite (fact decay/archival, quarantine
-    trimming, graph decay, cluster recompute) — the LLM merge steps are
-    gated separately on FULL. Leaving LITE at OFF meant a starved machine
-    was the one machine that never pruned anything."""
-    lite = gov(4, 2).profile
-    assert lite.consolidation_level is ConsolidationLevel.DEDUPE_ONLY
-    assert gov(8, 4).profile.consolidation_level is ConsolidationLevel.DEDUPE_ONLY
-    assert gov(32, 20).profile.consolidation_level is ConsolidationLevel.FULL
-
-
-def test_lite_rolling_summary_is_extractive_but_not_an_llm_call():
-    lite = gov(4, 2).profile
-    assert lite.rolling_summary_mode is RollingSummaryMode.EXTRACTIVE
-    # The Stable flag keeps its original meaning: "does this cost a model
-    # call?" Extractive summarization does not.
-    assert lite.rolling_summary_enabled is False
-    for prof in (gov(8, 4).profile, gov(32, 20).profile):
-        assert prof.rolling_summary_mode is RollingSummaryMode.LLM
-        assert prof.rolling_summary_enabled is True
-
-
-def test_lite_separates_indexing_from_vector_recall():
-    lite = gov(4, 2).profile
-    assert lite.embeddings_enabled is False      # no indexing of new chunks
-    assert lite.vector_recall_enabled is True    # existing vectors still score
-    assert lite.embedder_load_allowed is False   # but never load a model
-    full = gov(32, 20).profile
-    assert (full.embeddings_enabled, full.embedder_load_allowed) == (True, True)
-
-
-def test_lite_episodic_top_k_and_budget_are_usable():
-    lite = gov(4, 2, context_tokens=8192).profile
-    full = gov(32, 20, context_tokens=8192).profile
-    assert lite.episodic_top_k == 3
-    # Reduced relative to FULL, but a real budget rather than a sliver that
-    # rounds to single-digit tokens on a typical host.
-    assert 0 < lite.budgets.episodic < full.budgets.episodic
-    assert lite.budgets.episodic >= full.budgets.episodic * 0.4
-    assert lite.budgets.sessions >= full.budgets.sessions * 0.7
-
-
-def test_lite_llm_extraction_is_opt_in_and_defers_to_session_end():
-    default = gov(4, 2).profile
-    assert default.extraction_cadence is Cadence.OFF
-    assert default.llm_extraction_enabled is False
-
-    opted_in = gov(4, 2, lite_llm_extraction=True).profile
-    assert opted_in.extraction_cadence is Cadence.SESSION_END
-    assert opted_in.llm_extraction_enabled is True
-    # The opt-in is LITE-only; it must not perturb the other tiers.
-    assert gov(32, 20, lite_llm_extraction=True).profile.extraction_cadence \
-        is Cadence.PER_TURN
-
-
-def test_graph_hops_by_tier():
-    assert gov(32, 20).profile.graph_hops == 2      # FULL
-    assert gov(8, 4).profile.graph_hops == 1        # STANDARD
-    assert gov(4, 2).profile.graph_hops == 1        # LITE
-
-
-def test_immediate_downgrade_and_cautious_upgrade():
-    ram = {"avail": 20.0}
-    cfg = ElastimemConfig(upgrade_healthy_ticks=3)
-    g = Governor(cfg, probe_fn=lambda: (32 * GIB, int(ram["avail"] * GIB)))
-    assert g.tier is Tier.FULL
-
-    ram["avail"] = 2.0  # below both FULL and STANDARD availability thresholds
-    assert g.tick().tier is Tier.LITE      # downgrade jumps straight to measured
-    # recovery requires 3 consecutive healthy ticks, one tier per step
-    ram["avail"] = 20.0
-    tiers = [g.tick().tier for _ in range(8)]
-    assert tiers[-1] is Tier.FULL
-    assert tiers[0] is not Tier.FULL  # did not jump back instantly
-
-
-def test_pressure_report_downgrades():
-    g = gov(32, 20)
-    assert g.tier is Tier.FULL
-    assert g.report_pressure().tier is Tier.STANDARD
-
-
-def test_pressure_report_floors_at_lite():
-    g = gov(32, 20)
-    g._last_pressure_report -= 1000  # bypass cooldown between calls in this test
-    g.report_pressure()
-    g._last_pressure_report -= 1000
-    g.report_pressure()
-    g._last_pressure_report -= 1000
-    assert g.report_pressure().tier is Tier.LITE  # floor
-
-
-def test_pressure_report_burst_coalesces_into_one_downgrade():
-    """Regression test: several pressure reports in quick succession (a
-    burst of decode failures within one bad turn, or the same failure
-    surfacing through more than one call site) must drop the tier once, not
-    cascade through every tier - otherwise a single bad turn could tank
-    memory quality all the way to LITE and require far more healthy ticks
-    to recover than the underlying event actually warranted."""
-    g = gov(32, 20)
-    assert g.tier is Tier.FULL
-    g.report_pressure()
-    assert g.tier is Tier.STANDARD
-    # Two more reports arriving immediately after (same burst) must NOT
-    # each drop the tier again.
-    g.report_pressure()
-    g.report_pressure()
-    assert g.tier is Tier.STANDARD
-
-
-def test_pressure_report_after_cooldown_downgrades_again():
-    g = gov(32, 20)
-    g.report_pressure()
-    assert g.tier is Tier.STANDARD
-    g._last_pressure_report -= 1000  # simulate cooldown window elapsing
-    g.report_pressure()
-    assert g.tier is Tier.LITE
-
-
-def test_tier_change_callback():
-    calls = []
-    ram = {"avail": 20.0}
-    g = Governor(
-        ElastimemConfig(),
-        probe_fn=lambda: (32 * GIB, int(ram["avail"] * GIB)),
-        on_tier_change=lambda old, new: calls.append((old.name, new.name)),
-    )
-    ram["avail"] = 0.5
-    g.tick()
-    assert calls == [("FULL", "LITE")]
-
-
-def test_probe_ram_returns_sane_values():
-    total, available = probe_ram()
-    assert total >= 1 * GIB
-    assert 0 < available <= total
-
-
-def test_store_exposes_governor(tmp_path):
-    s = Elastimem(str(tmp_path / "g.db"), probe_fn=lambda: (32 * GIB, 20 * GIB))
-    assert s.profile.tier is Tier.FULL
-    assert s.tick().tier is Tier.FULL
-    s.close()
-
-
-def test_budgets_are_stale_without_reconfigure(tmp_path):
-    """Documents the gap reconfigure() closes: mutating config directly does
-    NOT change budgets until the tier happens to flip."""
-    s = Elastimem(str(tmp_path / "stale.db"), context_tokens=4096,
-                  probe_fn=lambda: (32 * GIB, 20 * GIB))
-    before = s.profile.budgets.working
-    s.config.context_tokens = 131_072   # e.g. switched to a big API model
-    assert s.profile.budgets.working == before   # still stale — no tick happened
-    s.close()
-
-
-def test_reconfigure_rebuilds_budgets_immediately(tmp_path):
-    s = Elastimem(str(tmp_path / "r.db"), context_tokens=4096,
-                  probe_fn=lambda: (32 * GIB, 20 * GIB))
-    small_budget = s.profile.budgets.working
-
-    profile = s.reconfigure(context_tokens=131_072, static_prompt_tokens=2000)
-    assert s.config.context_tokens == 131_072
-    assert s.config.static_prompt_tokens == 2000
-    assert profile.budgets.working > small_budget
-    assert s.profile.budgets.working == profile.budgets.working  # not stale
-    s.close()
-
-
-def test_reconfigure_with_no_args_still_rebuilds(tmp_path):
-    """Calling with zero kwargs rebuilds from whatever config already holds
-    (covers a host that mutated the config object directly)."""
-    s = Elastimem(str(tmp_path / "nr.db"), context_tokens=4096,
-                  probe_fn=lambda: (32 * GIB, 20 * GIB))
-    s.config.context_tokens = 131_072
-    profile = s.reconfigure()
-    assert profile.budgets.working > s.profile.budgets.working - 1  # rebuilt
-    s.close()
+def test_budgets_are_the_same_on_every_tier():
+    b = governor.budgets(ElastimemConfig(context_tokens=8192, reserved_tokens=1024))
+    assert b.working + b.facts + b.moments + b.topics + b.sessions + b.lessons <= 8192 - 1024
+    assert governor.keep_turns(b) >= tiers.MIN_KEEP_TURNS

@@ -1,113 +1,88 @@
-"""Recall latency benchmark: is brute-force cosine really fine at this scale?
+"""Per-turn cost: how long do context(), search() and record() take?
 
-Ingests N synthetic sessions (default 10k chunks), then measures FTS5-only
-and hybrid (FTS5 + vector) recall latency. Targets: <100 ms FTS5, <150 ms
-hybrid at 10k chunks on a laptop. The numbers this script produces are what
-docs/schema.md's "Size expectations" section and embeddings.py's module
-docstring cite — re-run it after any change to retrieval.py or
-embeddings.py to keep those claims honest.
+Ingests N exchanges with 384-dim vectors (the built-in model's size) from a
+fast hashing embedder, then times the calls a host makes every turn.
+``ram`` mode instead reports the process memory Elastimem adds, with and
+without the built-in embedder.
 
 Run:  uv run python benchmarks/bench_recall.py [n_chunks]
+      uv run python benchmarks/bench_recall.py ram [keyword|builtin]
 """
 
 import hashlib
 import math
 import os
 import random
+import resource
 import statistics
 import sys
+import tempfile
 import time
 
-from elastimem import Elastimem
-from elastimem.governor import GIB
+import elastimem
+from elastimem import Tier
+
+WORDS = ("python rust berlin paris coffee hiking guitar startup mortgage dentist "
+         "sister marathon kubernetes llama garden").split()
 
 
-def toy_embed(texts):
-    """Deterministic 'semantic' embedding: bag of word-stems hashed into 64
-    dims. Paraphrases sharing words land close; good enough to exercise
-    fusion without a real model. Kept in sync with tests/test_retrieval.py's
-    copy — duplicated here rather than imported so this script has no
-    dependency on the tests/ directory or an internal test module."""
+def toy_embed(texts, dim=384):
+    """Deterministic bag-of-words vectors: shared words land close."""
     out = []
     for text in texts:
-        vec = [0.0] * 64
+        vec = [0.0] * dim
         for word in text.lower().split():
-            stem = word.strip(".,!?')(\"")[:5]
-            if len(stem) < 3:
-                continue
-            idx = int(hashlib.md5(stem.encode()).hexdigest(), 16) % 64
-            vec[idx] += 1.0
+            vec[int(hashlib.md5(word.encode()).hexdigest(), 16) % dim] += 1.0
         norm = math.sqrt(sum(x * x for x in vec)) or 1.0
         out.append([x / norm for x in vec])
     return out
 
 
-TOPICS = [
-    "car brake pads squealing repair garage", "kitchen repainting color walls",
-    "sourdough starter feeding flour bakery", "japan trip kyoto autumn temples",
-    "marathon training schedule running shoes", "python project sqlite database",
-    "birthday party planning cake candles", "guitar practice chords fingers",
-    "vegetable garden tomatoes watering", "tax filing deadline documents",
-]
+def _ms(fn, n):
+    times = []
+    for _ in range(n):
+        t = time.perf_counter()
+        fn()
+        times.append((time.perf_counter() - t) * 1000)
+    return statistics.median(times)
 
 
-def main(n_chunks: int = 10_000) -> None:
-    import tempfile
+def latency(n: int) -> None:
+    mem = elastimem.open(os.path.join(tempfile.mkdtemp(), "bench.db"),
+                         embedder=toy_embed, tier=Tier.FULL)
+    rng = random.Random(1)
+    for i in range(n):
+        if i and i % 50 == 0:
+            mem.new_session()       # history lives in past sessions, as in real use
+        a, b = rng.sample(WORDS, 2)
+        mem.record(f"I talked about {a} and {b} today, number {i}", f"Tell me more about {a}.")
+    mem.flush(600)
+    q = "what did I say about hiking in berlin"
+    mem.context(q)   # first call loads the vector index
+    print(f"{n:>6} chunks: context {_ms(lambda: mem.context(q), 10):6.1f} ms"
+          f"  search {_ms(lambda: mem.search(q), 10):6.1f} ms"
+          f"  record {_ms(lambda: mem.record('my favorite food is ramen', 'ok'), 50):5.2f} ms")
+    mem.close()
 
-    db_path = tempfile.mktemp(suffix=".db")
-    store = Elastimem(db_path, embed_fn=toy_embed,
-                   probe_fn=lambda: (32 * GIB, 20 * GIB))
-    rng = random.Random(42)
 
-    t0 = time.monotonic()
-    conn = store._conn
-    from elastimem.db import utcnow
-    from elastimem.embeddings import encode
+def ram(mode: str) -> None:
+    def peak_mb():   # ru_maxrss is bytes on macOS, KiB on Linux
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return rss / 1024 / (1024 if sys.platform == "darwin" else 1)
 
-    with conn:
-        conn.execute("INSERT INTO sessions(started_at) VALUES (?)", (utcnow(),))
-        rows = []
-        for i in range(n_chunks):
-            topic = rng.choice(TOPICS)
-            words = topic.split()
-            rng.shuffle(words)
-            text = (f"User: tell me about {' '.join(words[:3])} number {i}\n"
-                    f"Assistant: sure, {' '.join(words)} details here.")
-            rows.append((1, 1, 2, text, utcnow(), encode(toy_embed([text])[0])))
-        conn.executemany(
-            "INSERT INTO chunks(session_id, first_msg_id, last_msg_id, text,"
-            " created_at, embedding) VALUES (?,?,?,?,?,?)", rows)
-    print(f"ingested {n_chunks} chunks in {time.monotonic()-t0:.1f}s")
-
-    queries = ["what did we discuss about my car brakes",
-               "remind me about the japan travel plans",
-               "how was my sourdough starter doing",
-               "anything about the vegetable garden tomatoes"]
-
-    def bench(label, fn):
-        times = []
-        for _ in range(5):
-            for q in queries:
-                t = time.monotonic()
-                hits = fn(q)
-                times.append((time.monotonic() - t) * 1000)
-                assert hits, f"no hits for {q!r}"
-        print(f"{label}: median {statistics.median(times):.1f} ms, "
-              f"p95 {sorted(times)[int(len(times)*0.95)]:.1f} ms")
-
-    bench("hybrid (FTS+cos)", lambda q: store.recall(q))
-    store.close()
-
-    # embed_fn/tokenizer_fn/path are construction-time-only (see store.py) —
-    # a fresh store over the same DB file is the correct way to get an
-    # FTS5-only view of identical data, rather than mutating a live store.
-    fts_only = Elastimem(db_path, disable_builtin_embedder=True,
-                          probe_fn=lambda: (32 * GIB, 20 * GIB))
-    bench("FTS5 only     ", lambda q: fts_only.recall(q))
-    fts_only.close()
-
-    os.remove(db_path)
+    base = peak_mb()
+    mem = elastimem.open(os.path.join(tempfile.mkdtemp(), "ram.db"), tier=Tier.FULL,
+                         embedder=None if mode == "keyword" else "auto")
+    for i in range(500):
+        mem.record(f"turn {i} about hiking and coffee", "nice")
+    mem.flush(600)
+    mem.search("hiking")
+    print(f"{mode}: elastimem adds {peak_mb() - base:.0f} MB (process peak {peak_mb():.0f} MB)")
+    mem.close()
 
 
 if __name__ == "__main__":
-    main(int(sys.argv[1]) if len(sys.argv) > 1 else 10_000)
+    if len(sys.argv) > 1 and sys.argv[1] == "ram":
+        ram(sys.argv[2] if len(sys.argv) > 2 else "keyword")
+    else:
+        latency(int(sys.argv[1]) if len(sys.argv) > 1 else 10_000)
