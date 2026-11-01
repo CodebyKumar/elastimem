@@ -1,213 +1,131 @@
 # Integration guide
 
-Elastimem needs, at most, one callable from you — an LLM. Embeddings are
-handled automatically:
+## Install
 
-```python
-llm(prompt: str, *, max_tokens: int, temperature: float) -> str      # optional
-embedder(texts: list[str]) -> list[list[float]]                      # optional — see below
+Python 3.10-3.13, no required dependencies. Not on PyPI; install from
+GitHub:
+
+```bash
+pip install "elastimem @ git+https://github.com/CodebyKumar/elastimem.git@v0.3.0"
+pip install "elastimem[embed] @ git+https://github.com/CodebyKumar/elastimem.git@v0.3.0"   # + built-in embedder
+pip install "elastimem[system] @ git+https://github.com/CodebyKumar/elastimem.git@v0.3.0"  # + psutil
 ```
 
-**`llm` is fully optional** — without it you get rule-based fact capture,
-full transcripts, and keyword (FTS5) episodic recall; no LLM extraction, no
-LLM-condensed summaries, no consolidation merges.
+- `embed` adds fastembed and the BAAI/bge-small-en-v1.5 model (about 130 MB
+  on disk, downloaded on first use; about 360 MB of RAM once loaded).
+  Without it, search uses keywords only unless you pass an `embedder`.
+- `system` adds psutil: battery detection everywhere, and memory readings
+  on Windows, which otherwise assumes a mid-size machine (STANDARD).
 
-**`embedder` is different: if you don't pass one, Elastimem activates its
-own built-in embedder automatically** (real model — `BAAI/bge-small-en-v1.5`
-via `fastembed`, not a hashing trick — see
-[governor.md](governor.md#built-in-embedder-auto-activates-read-this-before-assuming-embeddings-are-off)
-for the full story). This means semantic/paraphrase recall works out of the
-box with zero setup, as long as:
-1. the optional extra is installed (`pip install elastimem[embed]`), and
-2. the store's tier is STANDARD or FULL, which is where new chunks get
-   embedded. At LITE, Elastimem never indexes new chunks and never loads
-   the built-in model — but it will still run the vector leg at query time
-   over chunks that are *already* embedded, using an embedder that is
-   already resident (a host-supplied `embed_fn` always is). See
-   [governor.md](governor.md#vector-recall-vs-embedding-two-decisions-not-one).
+For development: `git clone ... && cd elastimem && uv sync` (or `pip
+install -e .`), then `uv run pytest`.
 
-If you genuinely want FTS5-only behavior (no embeddings, ever, regardless
-of what's installed), set `disable_builtin_embedder=True` — see below.
-
-## Level 0 — no LLM at all
+## The loop
 
 ```python
 import elastimem
 
-mem = elastimem.open("~/.myapp/memory.db")
-mem.record_turn(user_text, reply_text)   # transcripts + regex fact capture
-ctx = mem.build_context(user_text)       # facts/lessons/episodic, FTS5 + (if
-                                          # tier and the 'embed' extra allow)
-                                          # the built-in embedder's vector leg
-hits = mem.recall("that thing about the car")
+mem = elastimem.open("~/.myapp/memory.db", llm=llm, context_tokens=8192,
+                     reserved_tokens=1500)
+
+def turn(user: str) -> str:
+    context = mem.context(user)
+    history[:] = history[-2 * context.keep_turns:]    # older turns are in context.summary
+    with mem.pause():                                  # only if you share one model with Elastimem
+        reply = model(system=f"{PERSONA}\n\n{context}", messages=history + [user])
+    mem.record(user, reply)
+    return reply
+
+mem.close()                                            # on exit
 ```
 
-You get: durable facts (rules + `remember`), full transcripts, hybrid
-FTS5+vector episodic recall (vector leg via the built-in embedder if the
-`embed` extra is installed and the tier allows it; FTS5-only otherwise —
-either way, `build_context`/`recall` never raise and never require any
-extra code from you). See `examples/minimal_bot.py`.
+That is the whole required surface. What to pass depends on the host:
 
-## Level 1 — llama.cpp host (single model instance)
+| Host | `llm` | `embedder` | `pause()` |
+|---|---|---|---|
+| No model at all | omit | default (`"auto"`) | no |
+| Local model, one instance (llama.cpp) | your completion function | your embedding model, or `"auto"` | **yes**, around every generation |
+| API model (OpenAI-compatible) | your completion function | `"auto"` or the API's embeddings | no |
+| Must never download anything | as above | `None`, or your own function | as above |
 
-The one hard rule: **your model instance is not thread-safe, so bracket your
-own generation with the foreground gate.** Elastimem's background jobs then
-interleave between turns.
+`llm` has the shape `(prompt, *, max_tokens, temperature) -> str`;
+`embedder` is `(list[str]) -> list[list[float]]`.
+
+## Settings that matter
+
+- **`context_tokens`**: your model's real context window. The default
+  (4096) starves memory on larger models.
+- **`reserved_tokens`**: what you need for yourself: your system prompt,
+  tool output, and the reply. Memory budgets the rest.
+- **`blocked`**: fact keys your app owns (`{"agent_name", "model"}`), so
+  extraction never overwrites them.
+
+After switching models, call `mem.configure(context_tokens=...,
+reserved_tokens=...)`. It also re-reads the hardware, so call it after a
+large model finishes loading.
+
+## Memory as tools
+
+Two tools give the host's own model direct access to memory. They are the
+recommended way to store facts when there is no background `llm`, and they
+reach the full history rather than only what fits in the prompt.
 
 ```python
-from llama_cpp import Llama
-import elastimem
+TOOLS = [
+    {"name": "remember", "description": "Store a fact about the user.",
+     "parameters": {"type": "object", "required": ["key", "value"], "properties": {
+         "key": {"type": "string", "description": "snake_case name, e.g. home_city"},
+         "value": {"type": "string"}}}},
+    {"name": "memory_search", "description": "Search past conversations and known facts.",
+     "parameters": {"type": "object", "required": ["query"], "properties": {
+         "query": {"type": "string"}}}},
+]
 
-chat = Llama(model_path="model.gguf", n_ctx=4096, ...)
-
-def llm(prompt, *, max_tokens, temperature):
-    out = chat.create_chat_completion(
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=max_tokens, temperature=temperature)
-    return out["choices"][0]["message"]["content"]
-
-mem = elastimem.open(
-    "~/.myagent/memory.db",
-    llm=llm,
-    context_tokens=4096,
-    static_prompt_tokens=measured_prompt_tokens,
-    reserved_keys={"model", "agent_name"},
-)
-
-# per turn:
-mem.tick()
-plan = mem.build_context(user_input)
-system_prompt = base_prompt + "\n\n" + plan.render()
-with mem.foreground():                       # hold background LLM jobs
-    reply = generate(system_prompt, history[-plan.keep_last_n_turns*2:], user_input)
-mem.record_turn(user_input, reply)
-
-# if you trim your history list, tell Elastimem:
-mem.report_evictions(evicted_pairs)          # -> rolling summary
-# feed plan.rolling_summary back as a system-side note next turn
-
-# on exit:
-mem.end_session()      # drains worker, writes session summary, consolidates
-mem.close()
+def call_tool(name, args):
+    if name == "remember":
+        return "stored" if mem.remember(args["key"], args["value"]) else "already known"
+    hits = mem.search(args["query"])
+    return "\n".join(f"- [{h.date}] {h.text}" for h in hits) or "nothing found"
 ```
 
-**If your host can switch models mid-session** (a different `n_ctx`, e.g.
-swapping a local model for a larger-context API model), budgets do **not**
-update on their own — they're only recomputed on a tier change, which may
-never happen. Call `reconfigure()` right after the switch:
+## Signals from the host
 
-```python
-mem.drain()                      # finish queued work on the old model
-mem.reconfigure(context_tokens=new_model_ctx,
-               static_prompt_tokens=measured_prompt_tokens)
-```
+- `report_pressure()`: call on a confirmed out-of-memory or failed decode,
+  not on every exception. It steps down one tier; repeats within 30 seconds
+  count once.
+- `on_tier=callback`: notified on every tier change, e.g. to unload an
+  embedding model.
+- `mem.status.reasons`: why vectors or LLM work are on or off right now.
+  Show it in a debug panel.
 
-Forgetting this is not dangerous (nothing crashes), but a host that jumps
-from a 4k-context local model to a 128k-context API model will silently keep
-using the old, much smaller memory budgets until something else happens to
-flip the tier.
+## Checklist
 
-Embeddings: **you usually don't need to do anything here.** If you don't
-pass `embedder=`, Elastimem's built-in embedder (`fastembed` +
-`BAAI/bge-small-en-v1.5`, ONNX Runtime — no torch, no extra GPU contention
-with your chat model) activates automatically and runs entirely on the
-background worker thread, so it never competes with your foreground
-generation for the model instance itself. Install the extra
-(`pip install elastimem[embed]`) and you're done.
+- [ ] `context_tokens` and `reserved_tokens` set from the real model and prompt.
+- [ ] `blocked` lists the app's own identity keys.
+- [ ] `pause()` around generation when the model instance is shared.
+- [ ] `record()` after every exchange.
+- [ ] The host keeps only `context.keep_turns` turns and shows `context.summary`
+      (`str(context)` includes it).
+- [ ] `remember` and `memory_search` exposed as tools.
+- [ ] `close()` on exit; `flush()` before unloading the model.
+- [ ] `configure(...)` after a model switch.
 
-Two reasons you might still want to supply your own `embedder=`:
-- **Non-English or multilingual content** — the built-in model is
-  English-tuned; a purpose-chosen multilingual embedding model will give
-  materially better semantic recall for non-English-dominant use cases.
-- **You already have an embedding model loaded for another reason** (e.g. a
-  separate tiny embedding GGUF via
-  `Llama(model_path=..., embedding=True, n_ctx=512, n_gpu_layers=0)`) and
-  want to reuse it rather than let Elastimem load and cache its own.
+## Mistakes to avoid
 
-If you supply your own `embedder=` and it fails (raises, or the model can't
-load), the vector leg disables itself for the rest of the session (logged
-once) and retrieval falls back to FTS5 — same floor as the built-in
-embedder failing. To force FTS5-only behavior unconditionally (e.g. an
-air-gapped environment that must never attempt the built-in embedder's
-first-run download), set `disable_builtin_embedder=True` explicitly —
-simply not passing `embedder=` is NOT enough to guarantee "no embeddings
-ever," since that's exactly the case the built-in default fills.
+- Calling `flush()`, `end_session()` or `close()` inside a `pause()`: they
+  return, but LLM work (extraction, summaries) is skipped and stays pending
+  until a later flush outside the pause.
+- Assuming `embedder=None` means "the default": it means keyword search
+  only. The default is `"auto"`.
+- Changing `mem.config` fields: it is a copy. Use `configure()`.
+- Expecting facts without an `llm` and without the `remember` tool: only
+  explicit `remember()` calls create facts.
 
-On decode/OOM errors from your model, call `mem.report_pressure()` — the
-governor sheds memory work first. Only call this for a **confirmed** memory
-pressure signal from your inference backend, not for every exception your
-generation call can raise — `report_pressure()` trusts every call at face
-value (it rate-limits repeated calls within a 30s window, but does not and
-cannot verify the call is actually about memory; see
-[governor.md's Known limitations](governor.md#known-limitations-exhaustive-as-of-this-writing),
-item 5). A host that catches a broad exception type and reports pressure
-for every instance of it risks degrading memory quality (dropping to LITE,
-disabling extraction/embeddings/consolidation) in response to failures that
-have nothing to do with RAM.
+## Examples
 
-See `examples/llama_cpp_bot.py` for a complete program.
-
-## Level 2 — OpenAI-compatible / API host
-
-API models don't contend for local RAM, so the foreground gate matters less
-(still harmless). Wire `llm` to your chat endpoint; set `context_tokens` to
-the model's window. You may pin `ELASTIMEM_TIER=full` since the machine
-isn't running the model. For `embedder`, the same auto-activation applies as
-everywhere else — leave it unset to get the built-in embedder (runs locally,
-regardless of your chat model being remote), or wire your own
-`embedder=` to an embeddings API endpoint if you'd rather keep embedding
-calls on the same provider as chat.
-
-## Exposing memory to your agent as tools
-
-Two natural tool bindings:
-
-- `remember(key, value)` → `mem.remember(key, value)[1]` (returns the reason
-  string — "stored", "reserved key…", etc.)
-- `memory_search(query)` → format `mem.recall(query)` hits as
-  `- [date] text` lines. Works in every tier, and reaches the full history
-  rather than just what fits in the prompt budget — so it matters most at
-  LITE, where injection is smallest. Always register it.
-
-## Host checklist
-
-- [ ] Pass `context_tokens` (your `n_ctx`) and measured `static_prompt_tokens`.
-      Check the actual resulting per-section budgets aren't hitting the
-      256-token dynamic floor (see [governor.md](governor.md#budget-derivation))
-      — a small model's context minus a large system prompt can leave almost
-      nothing for memory even with everything else working correctly.
-- [ ] Pass `reserved_keys` for identity fields your app owns.
-- [ ] Call `tick()` once per turn; `report_pressure()` ONLY on a confirmed
-      memory-pressure signal, never as a catch-all for any exception your
-      inference call can raise (see the Level 1 section above).
-- [ ] Bracket generation with `foreground()` when the model is local.
-- [ ] Call `record_turn` after every exchange; `report_evictions` when you trim.
-- [ ] Call `end_session()` on exit; `drain()` before unloading/switching models.
-- [ ] Render `plan.sections` into your prompt (or use `plan.render()`).
-- [ ] Decide your embedder story deliberately: leave `embedder=` unset (get
-      the built-in default — install `elastimem[embed]` for it to actually
-      activate), pass your own, or set `disable_builtin_embedder=True` if you
-      want a guarantee of FTS5-only behavior. Don't assume "I didn't pass
-      `embedder=`" means "no embeddings" — as of the built-in default, it
-      doesn't.
-- [ ] After any model switch, call `reconfigure_for_model`-equivalent logic
-      on your side (rebuild `context_tokens`/`static_prompt_tokens` and call
-      `mem.reconfigure(reprobe=True, ...)`) — including after any operation
-      that reopens/reconstructs your `Elastimem` object (e.g. a "clear all
-      memory" feature), not just an explicit model switch. A freshly
-      reopened store resets to whatever `context_tokens` you pass it at
-      that moment, not whatever was correct before.
-
-## Example programs
-
-- `examples/minimal_bot.py` — Level 0, no LLM at all.
-- `examples/llama_cpp_bot.py` — full-capability, local `llama-cpp-python`.
-- `examples/openai_agent.py` — any OpenAI-compatible HTTP endpoint (OpenAI,
-  Groq, Together, a local vLLM/llama.cpp server) via a plain `requests` call
-  — no vendor SDK required.
-- `examples/memory_search.py` — `remember()`/`recall()`/`facts()` used
-  directly, no chat loop, no LLM.
-
-All four use the same `llm=` shape — `(prompt, *, max_tokens, temperature) ->
-str` — so switching backends is a matter of swapping which example you start
-from, not restructuring how you call Elastimem.
+| File | Shows |
+|---|---|
+| `examples/minimal_bot.py` | No model: storing, searching, explicit facts |
+| `examples/memory_search.py` | The memory API without a chat loop, including `explain()` |
+| `examples/llama_cpp_bot.py` | A local model shared with Elastimem: `pause()`, `keep_turns`, `report_pressure()` |
+| `examples/openai_agent.py` | An API model through a plain HTTP call |

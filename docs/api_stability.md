@@ -1,148 +1,42 @@
-# API Stability Policy
+# API stability
 
-Elastimem's implementation (retrieval strategy, storage schema, extraction
-prompts, governor internals) is expected to change across releases. The
-surface listed below as **Stable** will not — code written against it keeps
-working without modification across minor and patch releases.
+Elastimem is pre-1.0. From 0.3.0 on:
 
-## Stable
+- **Stable**: the names below. A breaking change to them needs a new
+  minor version before 1.0 (a major one after), a `CHANGELOG.md` entry,
+  and an upgrade section in
+  [agent_integration_prompt.md](agent_integration_prompt.md). Adding a
+  method, a field or a setting is not breaking.
+- **Internal**: everything else, including every submodule
+  (`elastimem.search`, `elastimem.tiers`, ...), names starting with `_`,
+  and the database schema (which migrates automatically). These can change
+  in any release.
 
-Safe to depend on long-term. Changes to this surface follow semantic
-versioning: additive changes bump the minor version, breaking changes bump
-the major version and are called out in `CHANGELOG.md`.
+0.3.0 itself broke the 0.2 API (see the CHANGELOG). 0.2 was never
+published, so no deprecation period was kept.
 
-**Top-level (`import elastimem`)**
+## Stable names
 
 ```python
-elastimem.open(path, **kwargs)
-elastimem.Elastimem                # the facade class
-elastimem.ElastimemConfig
-elastimem.MemoryProfile
-elastimem.Budgets
-elastimem.Tier
-elastimem.Cadence
-elastimem.ConsolidationLevel
-elastimem.Fact
-elastimem.__version__
+elastimem.open, elastimem.Elastimem, elastimem.ElastimemConfig, elastimem.Tier,
+elastimem.Status, elastimem.Budgets, elastimem.Context, elastimem.Fact,
+elastimem.Hit, elastimem.Explanation, elastimem.__version__
 ```
 
-**`Elastimem` instance methods and properties**
+`Elastimem` members: `context`, `record`, `pause`, `search`, `explain`,
+`remember`, `forget`, `facts`, `history`, `learn`, `lessons`, `topics`,
+`rejected`, `sessions`, `new_session`, `end_session`, `resume`, `status`,
+`config`, `configure`, `report_pressure`, `flush`, `stats`, `close`, and the
+context-manager protocol. Constructor arguments: `path`, `llm`, `embedder`,
+`tokenizer`, `on_tier`, `config`, and every `ElastimemConfig` field.
 
-| Member | Purpose |
-|---|---|
-| `profile` (property) | current `MemoryProfile` snapshot |
-| `config` (property) | read-only snapshot of active `ElastimemConfig` |
-| `tick()` | per-turn cheap hardware re-check |
-| `report_pressure()` | signal OOM/decode failure |
-| `reconfigure(*, reprobe=False, **overrides)` | update config, rebuild budgets |
-| `build_context(user_input="")` | assemble budgeted prompt sections |
-| `begin_session(host_tag=None)` | start a session explicitly |
-| `record_turn(user_text, assistant_text)` | persist an exchange |
-| `foreground()` / `foreground_begin()` / `foreground_end()` | bracket host LLM generation |
-| `report_evictions(turns)` | fold evicted turns into rolling summary |
-| `drain(timeout=5.0)` | finish queued background work |
-| `recall(query, k=5)` | search past conversations/facts |
-| `sessions(n=20)` | recent sessions |
-| `resume_session(session_id=None)` | reload a past session |
-| `end_session()` | close session, summarize, consolidate |
-| `remember(key, value, source="explicit")` | store one fact |
-| `facts()` | current facts dict |
-| `fact_history(key)` | version chain of a fact |
-| `forget(key)` | tombstone a fact |
-| `add_lesson(text, tag=None)` | store a procedural lesson |
-| `lessons(n=None)` | load lessons |
-| `quarantine_entries(n=20)` | rejected auto-extractions |
-| `stats()` | row counts, file size, FTS flag |
-| `close()` | stop worker, close connections |
+Fields of `Context`, `Status`, `Budgets`, `Hit`, `Fact` and `Explanation`
+are Stable, as are the section names in `Context.sections`.
 
-`config` is read-only: assigning into the object it returns (e.g.
-`mem.config.context_tokens = 8192`) has no effect. Use `reconfigure()` for
-any change that should take effect.
+## Not promised
 
-`complete_fn`, `embed_fn`, `embed_query_fn`, `tokenizer_fn`, `path`, and
-`session_id` are readable attributes on `Elastimem` but are **construction-time
-only** — pass them via `open()`/`Elastimem(...)` and do not reassign them
-after construction. Reassignment is not guarded against today, but is
-unsupported: the background worker may hold a reference to the original
-callable.
-
-`ContextPlan.sections` and `MemoryProfile` gained new keys/fields
-(`sections["graph_context"]`, `MemoryProfile.graph_hops`) as part of the
-knowledge-graph work, and `MemoryProfile` gained
-`vector_recall_enabled`/`embedder_load_allowed`/`rolling_summary_mode` in
-0.2.0 — additive per the semantic-versioning promise above: existing code
-that reads specific keys/fields is unaffected, but code that asserts an
-*exact* set of `sections` keys or does positional `MemoryProfile(...)`
-construction should account for the new members. (A grep of this codebase
-at the time these fields were added found no positional
-`MemoryProfile(...)` construction outside `governor.py` itself, which
-always constructs by keyword.)
-
-One near-exception in 0.2.0: `MemoryProfile.rolling_summary_enabled`
-changed from a plain field to a **derived property**. Reading it is
-unaffected and its meaning is unchanged ("does the rolling summary cost a
-model call?"), which covers every documented use. Only code that passed it
-as a keyword to `MemoryProfile(...)` — construction Elastimem does not
-support outside the governor — would need to pass `rolling_summary_mode`
-instead.
-
-## Experimental
-
-| method | purpose |
-|---|---|
-| `explain(query, k=5)` | retrieval transparency — per-leg score breakdown and graph traversal path behind a `recall()`-equivalent search |
-| `timeline(query)` | resolve `query` to a fact key and return its full version history, oldest first |
-| `clusters()` | current knowledge-graph topic clusters (connected components over `graph_edges`, optionally LLM-labeled), largest first |
-
-`explain()`'s return type (`ExplainResult` and its nested
-`ChunkScoreBreakdown`/`FactScoreBreakdown`/`GraphTraversalStep`
-dataclasses, all in `elastimem.retrieval`) is new and may still change
-shape — field names, added/removed signals — as real usage surfaces what's
-actually useful to expose. The method itself (never raises, mirrors
-`recall()`'s ranking) is expected to stay stable; the breakdown's internal
-shape is what's still settling.
-
-`timeline()`'s return type (`TimelineResult`, `elastimem.retrieval`) is
-new for the same reason: the underlying storage (`Fact.valid_from`/
-`invalidated_at`/`invalidated_by`) is Stable and has been since Phase 1,
-but the query/resolution layer on top (`resolved_by`'s exact-vs-search
-distinction, specifically) is new enough to want real usage before
-committing to its exact shape.
-
-Future additions the team wants public feedback on before committing to
-stability will be exposed under `elastimem.experimental` and may change or
-disappear at any time, including in patch releases.
-
-## Internal
-
-Everything not listed above, specifically including:
-
-- Any name beginning with `_` on any object (e.g. `Elastimem._governor`,
-  `Elastimem._conn`, `Elastimem._execute_job`).
-- Submodules other than the top-level `elastimem` package — `elastimem.governor`,
-  `elastimem.retrieval`, `elastimem.extraction`, `elastimem.episodic`,
-  `elastimem.semantic`, `elastimem.procedural`, `elastimem.db`,
-  `elastimem.worker`, `elastimem.embeddings`, `elastimem.assembly`,
-  `elastimem.guards`, `elastimem.rules`, `elastimem.default_embedder` — are
-  implementation, not API, even though Python does not prevent importing
-  from them. This includes module-level constants such as
-  `elastimem.governor.GIB`.
-- The `Governor` class and its methods (`tick`, `report_pressure`,
-  `reconfigure`, `profile`) — these are wrapped by identically-named methods
-  on `Elastimem` itself, which is the supported entry point.
-
-Internal surface may change or be removed without notice, in any release,
-including patch releases. If you find yourself reaching into it, that's a
-signal a corresponding stable method is missing — please open an issue
-rather than depending on the internal path.
-
-## Why this split exists
-
-The framework's implementation (how retrieval works, how facts are scored,
-how the governor classifies hardware) is expected to improve over time.
-Locking those details into the public API would force a breaking release
-every time the implementation gets better. The stable surface above is
-intentionally described in terms of user intent (`recall`, `remember`,
-`forget`) rather than mechanism (no `retrieve_fts`, no `run_governor_cycle`),
-so the framework is free to change how it fulfills that intent without
-changing how you call it.
+- **Rankings and scores.** The equation's weights are tuned against
+  measurements and may change in any release. Rely on order, not values.
+- **The text of `Status.reasons`** and rendered headings of `str(Context)`.
+- **`Explanation.items[].parts` keys** beyond the five current terms.
+- **Tier thresholds** (RAM sizes, pressure rules, time budget defaults).

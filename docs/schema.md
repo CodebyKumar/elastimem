@@ -1,123 +1,55 @@
 # Storage schema
 
-One store = one SQLite file. WAL journal mode, `synchronous=NORMAL`,
-foreign keys ON. All timestamps are ISO-8601 UTC strings. Schema is
-versioned via `meta.schema_version`; migrations run in `db.open_store()`.
+One store is one SQLite file in WAL mode (schema version 4). The schema is
+defined in `src/elastimem/db.py`; this page explains it.
 
 ## Tables
 
-### `meta`
-`key TEXT PK, value TEXT` — schema version, install markers, checkpoints.
+| Table | Holds | Notes |
+|---|---|---|
+| `meta` | `schema_version` | |
+| `sessions` | One row per conversation | `rolling_summary` and `summary_turn` (how far folding has got) survive restarts |
+| `messages` | Every message, verbatim | The source of truth; never rewritten |
+| `chunks` | Search units, one or more per exchange | `embedding` (float32 BLOB) and `extracted_at` are filled in by the worker; `NULL` means pending |
+| `facts` | Versioned key-value facts | One open version per key (`until IS NULL`); `replaced_by` links the chain; `embedding` as for chunks |
+| `lessons` | Lessons for the agent | Unique text; beyond `max_lessons` the oldest are archived |
+| `rejected` | Automatic facts that failed validation | Capped at 200 rows |
+| `entities` | Things mentioned in conversation | Unique on `(type, name)`; `seen` and `confidence` grow with repeats; `topic_id`/`topic` set by consolidation |
+| `relations` | Directed links between entities | Unique on `(source, target, relation)` |
+| `mentions` | Which chunks mention which entity | Feeds the graph signal |
+| `chunks_fts`, `facts_fts` | FTS5 indexes (`porter unicode61`) | Kept in sync by triggers; absent when SQLite lacks FTS5 |
 
-### `sessions`
-| column | notes |
+## Pending work is a query
+
+| Work | Query |
 |---|---|
-| `id` | PK |
-| `started_at`, `ended_at` | `ended_at` NULL while live; orphans (crash) are closed on next open |
-| `title` | first user message, ≤ 80 chars — the no-LLM summary floor |
-| `summary` | LLM 1–2 sentence episodic summary (nullable) |
-| `rolling_summary` | last working-memory digest, used by `resume_session` |
-| `message_count` | maintained by `record_turn` |
-| `host_tag` | free-form host label (model id, app version…) |
+| Vectors to compute | `chunks.embedding IS NULL`, `facts.embedding IS NULL` (current facts) |
+| Turns to extract | `chunks.extracted_at IS NULL`, grouped by `first_msg_id` |
+| Turns to fold | `max(messages.turn) - keep_turns > sessions.summary_turn` |
 
-### `messages` — the permanent verbatim record
-| column | notes |
-|---|---|
-| `session_id → sessions` | `ON DELETE CASCADE` |
-| `turn` | user-turn index within the session |
-| `role` | `user \| assistant \| system` |
-| `content` | text; media as `[image: <ref>]` placeholders |
-| `token_estimate` | chars/4 at write time; used by resume budgeting |
+Vectors carry `embedding_model`. On open, vectors written by a different
+embedder are cleared so they are redone.
 
-Index: `(session_id, turn)`.
+## Size
 
-### `chunks` — episodic retrieval units
-One per exchange (`User: …\nAssistant: …`), sentence-split beyond
-`chunk_target_tokens` (default 400).
+At 384 dimensions a vector is 1.5 KB, so 10,000 chunks add about 15 MB to
+the file and the same to the in-RAM index while vector search is on.
+Entities and relations are capped at 2,000 and 5,000 rows.
 
-| column | notes |
-|---|---|
-| `first_msg_id`, `last_msg_id` | span of source messages |
-| `text` | the condensed exchange |
-| `embedding` | little-endian float32 BLOB (`array('f')`), NULL until embedded |
-| `embedding_model` | label; lets a re-index detect stale vectors. `"elastimem:bge-small-en-v1.5"` for vectors from the built-in default embedder, `"host"` for any host-supplied `embedder=` (the label doesn't distinguish between different host embedders — a host that swaps its own embedding model should re-embed or track that distinction itself) |
-| `importance` | default 0.5; consolidation may raise/lower later |
+## Migrations
 
-Indexes: `(session_id)`; partial `WHERE embedding IS NULL` (the embed queue).
-FTS5: `chunks_fts` (content-linked, `porter unicode61`, trigger-maintained).
+Opening an older store migrates it in one transaction; a failed migration
+leaves it untouched.
 
-### `facts` — temporally versioned semantic memory
-| column | notes |
-|---|---|
-| `key` | normalized snake_case |
-| `value` | short string |
-| `category` | `profile` (always injected) \| `note` (competes by score) |
-| `source` | `explicit(1.0) \| rule(0.7) \| auto(0.5) \| import(0.8)` → `importance` |
-| `valid_from`, `invalidated_at` | NULL `invalidated_at` = current version |
-| `invalidated_by → facts` | the superseding row (audit chain) |
-| `archived` | decay-forgotten; excluded from prompts, never deleted |
-| `last_accessed_at`, `access_count` | bumped when injected; feeds decay |
+- **v3 (Elastimem 0.2) -> v4**: renames (`quarantine` -> `rejected`,
+  `graph_nodes`/`graph_edges` -> `entities`/`relations`,
+  `valid_from`/`invalidated_at` -> `since`/`until`), adds
+  `chunks.extracted_at`, `facts.embedding`, `sessions.summary_turn` and
+  `mentions` (backfilled from chunk text). `rule` facts become `auto`.
+  Turns recorded before v4 count as extracted, so the history is not
+  queued for the LLM.
+- **v1/v2**: open once with Elastimem 0.2 to reach v3 first.
+- A store newer than the installed package is refused.
 
-Indexes: unique partial `(key) WHERE invalidated_at IS NULL` (one live
-version per key — updates must invalidate before insert); `(key, valid_from)`
-for history. FTS5: `facts_fts` over `(key, value)`.
-
-### `lessons`
-`text UNIQUE, tag, use_count, archived` — procedural memory; capped by
-archiving the oldest beyond `max_lessons`.
-
-### `quarantine`
-Rejected automatic extractions: `ts, key, value, reason, source`. Capped at
-`quarantine_cap` (200). Never injected into prompts; exists so extractor
-misbehavior is inspectable.
-
-### `graph_nodes` — embedded semantic knowledge graph (entities)
-Extracted alongside facts by the same LLM completion (`extraction.py`),
-gated by `MemoryProfile.graph_hops` (LITE=1, STANDARD=1, FULL=2 — see
-`governor.py`). One more retrieval signal inside the existing hybrid
-pipeline, not a separate store.
-
-| column | notes |
-|---|---|
-| `type` | `person \| place \| org \| thing \| entity` |
-| `canonical_name` | normalized (lowercased, whitespace-collapsed, leading article stripped) identity — see `graph._canonicalize` |
-| `aliases` | JSON array of raw surface forms seen, capped at 8 |
-| `importance`, `confidence` | `confidence` is a running average across re-extractions, used to weight the graph retrieval nudge |
-| `mention_count` | bumped on every re-extraction of the same entity |
-| `cluster_id` | nullable; the root node id of this entity's connected component (see `graph.compute_clusters`), NULL for a singleton with no edges |
-| `cluster_label` | nullable; a short LLM-generated topic name for the cluster (e.g. "Local AI"), set separately from clustering itself — see `graph.label_clusters` |
-
-Unique index `(type, canonical_name)` — write-time dedup; repeated
-mentions update the existing row (`ON CONFLICT DO UPDATE`) instead of
-inserting a new one. Rows beyond `graph_node_cap` (default 2000) are
-trimmed by lowest `(importance, mention_count, updated_at)`. Beyond the
-cap, a background consolidation sweep (`graph.apply_decay`,
-`graph.merge_duplicates`) hard-deletes confidence-decayed rows and merges
-LLM-confirmed duplicate entities — see
-[governor.md](governor.md#graph-maintenance-decay-dedup-llm-assisted-merging).
-
-### `graph_edges` — embedded semantic knowledge graph (relationships)
-| column | notes |
-|---|---|
-| `source_node`, `target_node → graph_nodes` | `ON DELETE CASCADE`; directed, but traversed bidirectionally at retrieval time (`graph.expand`) |
-| `relationship` | short snake_case label, e.g. `works_at`, `builds`, `runs_on` |
-| `confidence`, `importance`, `weight` | `confidence` is a running average, same pattern as nodes |
-| `seen_count`, `last_seen` | bumped on repeated extraction of the same relationship |
-| `source_chunk_id → chunks` | nullable; the chunk that produced this edge (not currently surfaced by `explain()`, which computes its traversal fresh rather than reading provenance off individual edges — kept for a future direct-provenance lookup) |
-
-Unique index `(source_node, target_node, relationship)` — write-time
-dedup, same pattern as nodes. Rows beyond `graph_edge_cap` (default 5000)
-are trimmed by lowest `(importance, seen_count, last_seen)`.
-
-Traversal is a `WITH RECURSIVE` CTE bounded by the governor's hop count —
-no graph library, no separate index. Query-time entity detection
-(`graph.detect_seed_nodes`) is a plain substring scan over
-`canonical_name`/`aliases`, no NER call.
-
-## Size expectations
-
-384-dim float32 vector = 1.5 KB/chunk → 10k chunks ≈ 15 MB of vectors.
-Benchmarked recall at 10k chunks (pure Python): FTS5 ~2 ms, hybrid ~43 ms.
-The `elastimem[vec]` extra is reserved for a future `sqlite-vec`-backed
-index over the same BLOBs, for much larger stores — it is declared but not
-yet wired into the codebase; brute-force cosine runs unconditionally today.
+A corrupt file is moved to `<path>.corrupt-<timestamp>` and a fresh store
+is created.

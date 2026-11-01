@@ -1,161 +1,118 @@
-# Public API reference
+# API reference
 
-The surface documented here is stable — see [api_stability.md](api_stability.md)
-for the precise Stable/Experimental/Internal boundaries. Anything not listed
-there (submodules like `elastimem.governor`, underscore-prefixed members) is
-internal even though Python does not prevent importing it.
+Everything below is importable from `elastimem`. Submodules are internal
+(see [api_stability.md](api_stability.md)).
 
-`elastimem.open(path, **kwargs) -> Elastimem`
+## Opening a store
 
-The friendly front door — identical to constructing `Elastimem(path, **kwargs)`.
+```python
+mem = elastimem.open(path, *, llm=None, embedder="auto", tokenizer=None,
+                     on_tier=None, config=None, **settings)
+```
 
-`Elastimem(path, *, llm=None, embedder=None, config=None, tokenizer_fn=None, probe_fn=None, on_tier_change=None, **config_overrides)`
+Same as `elastimem.Elastimem(path, ...)`. Usable as a context manager:
+`with elastimem.open(...) as mem:` closes it on exit.
 
-One persistent store backed by one SQLite file (`":memory:"` supported).
+| Argument | Meaning |
+|---|---|
+| `path` | SQLite file, created if missing. `":memory:"` for a throwaway store |
+| `llm` | `(prompt, *, max_tokens, temperature) -> str` for background work. Optional |
+| `embedder` | `(list[str]) -> list[list[float]]`; `"auto"` = the built-in model when `elastimem[embed]` is installed; `None` = keyword search only |
+| `tokenizer` | `(str) -> int` token counter; default is about four characters per token |
+| `on_tier` | `(old: Tier, new: Tier) -> None`, called when the tier changes |
+| `config` | an `ElastimemConfig`; inline `**settings` override it |
 
-- `llm(prompt, *, max_tokens, temperature) -> str` — optional LLM.
-  (`complete_fn=` still accepted as a legacy alias.)
-- `embedder(texts: list[str]) -> list[list[float]]` — optional embedder.
-  (`embed_fn=` still accepted as a legacy alias.) **Leaving this `None`
-  (i.e. not passing it) auto-activates Elastimem's own built-in embedder**
-  (`BAAI/bge-small-en-v1.5` via the optional `fastembed` extra) rather than
-  leaving semantic search disabled — see
-  [governor.md](governor.md#built-in-embedder-auto-activates-read-this-before-assuming-embeddings-are-off).
-  Set `disable_builtin_embedder=True` in config to guarantee FTS5-only
-  behavior instead; passing `embedder=None` explicitly does NOT opt out on
-  its own, since `None` is exactly what triggers the auto-activation.
-- `**config_overrides` — any `ElastimemConfig` field passed inline, e.g.
-  `context_tokens=4096, reserved_keys={"model"}`. May be combined with
-  `config=`; inline values override the config object. Unknown names raise
-  `TypeError` listing the valid options.
-- `tokenizer_fn(text) -> int` — optional exact token counter (default chars/4).
-- `probe_fn() -> (total_bytes, available_bytes)` — override hardware probe.
-- `on_tier_change(old: Tier, new: Tier)` — governor callback.
+Raises `TypeError` for an unknown setting and `ValueError` for an invalid
+value.
 
-**Construction can raise** (e.g. an unwritable `path`, disk full during
-initial schema creation, or an unknown `config_overrides` key →
-`TypeError`) — this is the one exception to the "never raises" invariant
-documented below. Wrap `Elastimem(path, ...)` / `elastimem.open(...)` in
-your own error handling if the store might be opened somewhere failure
-needs to be user-visible (e.g. an unwritable data directory). Once
-construction succeeds, `build_context`, `record_turn`, and `recall` are
-guaranteed not to raise into the host — see the per-method notes below.
+## Each turn
 
-### Attributes (post-construction, read-only in normal use)
+| Method | Returns | Notes |
+|---|---|---|
+| `context(query="")` | `Context` | Memory for this turn's prompt. Re-checks the governor. Never raises |
+| `record(user, reply)` | `None` | Stores one exchange; derived work runs in the background. Never raises |
+| `pause()` | `Pause` | `with mem.pause():` around the host's own generation, when the host and Elastimem share one model. Or `p = mem.pause()` ... `p.end()`, from any thread |
 
-- `embed_fn` — the resolved passage-side embedder (host-supplied, the
-  built-in default, or `None` if neither is active).
-- `embed_query_fn` — the resolved query-side embedder for an asymmetrically-
-  trained embedder (set automatically alongside `embed_fn` when the
-  built-in default activates; `None` for a host-supplied `embedder=`, which
-  is assumed symmetric — retrieval then reuses `embed_fn` for queries too).
-- `config` — read-only snapshot (`ElastimemConfig`) of the active
-  configuration. Mutating the returned object has no effect; use
-  `reconfigure()` to change settings, which keeps derived budgets in sync.
-  There is no public `governor` attribute — the equivalent operations are
-  `profile`, `tick()`, `report_pressure()`, and `reconfigure()` on `Elastimem`
-  itself.
+## Searching
 
-`embed_fn`, `embed_query_fn`, `tokenizer_fn`, and `path` are construction-time
-only — set them via `open()`/`Elastimem(...)`; reassigning any of them after
-construction raises `AttributeError` (the background worker reads them
-without synchronization, so silently swapping the callable out from under
-it would race rather than fail loudly). `session_id` is different: it is
-genuine, actively-mutated internal state (a new session begins on the first
-`record_turn()` and again after `end_session()`) — read it if you need it,
-but treat it as informational, not something you set.
+| Method | Returns | Notes |
+|---|---|---|
+| `search(query, k=5)` | `list[Hit]` | Past moments and facts, best first. Never raises |
+| `explain(query, k=5)` | `Explanation` | The same results with each score split into its terms |
 
-### Per-turn
+## Facts and lessons
 
-| method                                                                             | purpose                                                                                                          |
-| ---------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| `tick() -> MemoryProfile`                                                        | cheap hardware re-check; call once per turn                                                                      |
-| `build_context(user_input="") -> ContextPlan`                                    | budgeted prompt sections + window plan; never raises                                                             |
-| `foreground()` (context manager) / `foreground_begin()` / `foreground_end()` | hold background LLM jobs while the host generates — prefer the context manager; use explicit begin/end only when generation can't be bracketed in one `with` block (e.g. streaming across separate callbacks) |
-| `record_turn(user_text, assistant_text)`                                         | persist exchange, rule capture, enqueue extraction/embedding; never raises                                       |
-| `report_evictions(turns: list[tuple[str, str]])`                                 | fold host-evicted (user, assistant) pairs into the rolling summary                                               |
-| `report_pressure() -> MemoryProfile`                                             | OOM/decode-failure signal; downgrades one tier on first call, coalesces repeat calls within a 30s cooldown (see [governor.md](governor.md)) |
-| `reconfigure(**config_overrides) -> MemoryProfile`                               | update config (e.g.`context_tokens` after a model switch) and rebuild budgets immediately — the only supported way to change config after construction |
+| Method | Returns | Notes |
+|---|---|---|
+| `remember(key, value)` | `bool` | True if new or changed. Keys are normalized to snake_case |
+| `forget(key)` | `bool` | Closes the current version; history is kept |
+| `facts()` | `dict[str, str]` | Current facts |
+| `history(key_or_question)` | `list[Fact]` | Every version, oldest first. A question is matched against current facts |
+| `learn(lesson)` | `bool` | Stores a lesson for the agent itself |
+| `lessons(n=5)` | `list[str]` | Newest lessons, oldest first |
+| `topics()` | `list[dict]` | `{"id", "name", "members"}` groups of related entities |
+| `rejected(n=20)` | `list[dict]` | Automatic facts that failed validation, for debugging |
 
-### Memory operations
+## Sessions
 
-| method                                                           | purpose                                    |
-| ---------------------------------------------------------------- | ------------------------------------------ |
-| `remember(key, value, source="explicit") -> (changed, reason)` | validated, synchronous, durable fact write |
-| `facts() -> dict[str, str]`                                    | current facts                              |
-| `fact_history(key) -> list[Fact]`                              | full version chain, oldest first           |
-| `timeline(query) -> TimelineResult` *(Experimental)*           | resolve `query` to a fact key (exact key, or a fact search over free text — "what did I do before AI?") and return its full version history; see [governor.md](governor.md#timeline-query) |
-| `forget(key) -> bool`                                          | tombstone the current version              |
-| `recall(query, k=5) -> list[Hit]`                              | search chunks + facts; never raises        |
-| `explain(query, k=5) -> ExplainResult` *(Experimental)*        | same ranking as `recall`, plus every per-leg score (FTS/vector/graph/importance/recency) and the graph traversal path — see [governor.md](governor.md#knowledge-graph); never raises |
-| `clusters() -> list[dict]` *(Experimental)*                    | current knowledge-graph topic clusters (connected components over `graph_edges`, optionally LLM-labeled), largest first; see [governor.md](governor.md#graph-maintenance-decay-dedup-llm-assisted-merging); never raises |
-| `add_lesson(text, tag=None)` / `lessons(n=None)`             | procedural memory                          |
+| Method | Returns | Notes |
+|---|---|---|
+| `sessions(n=20)` | `list[dict]` | Newest first: `id, started_at, ended_at, title, summary, message_count` |
+| `new_session(tag=None)` | `int` | Ends the current session and starts another. Optional: `record()` starts one |
+| `end_session()` | `None` | Finishes background work, summarizes (with `llm`), tidies memory |
+| `resume(session_id=None)` | `(str \| None, list[dict])` | Rolling summary and trailing messages of a past session (default: the latest) |
 
-### Sessions
+## Status and lifecycle
 
-| method                                                                  | purpose                                               |
-| ----------------------------------------------------------------------- | ----------------------------------------------------- |
-| `begin_session(host_tag=None) -> int`                                 | explicit start (`record_turn` starts one lazily)    |
-| `end_session()`                                                       | drain worker, LLM session summary, exit consolidation |
-| `sessions(n=20) -> list[dict]`                                        | recent sessions, newest first                         |
-| `resume_session(session_id=None) -> (rolling_summary, tail_messages)` | reload a past session into the host's window          |
+| Member | Returns | Notes |
+|---|---|---|
+| `status` | `Status` | What memory will do this turn, and why |
+| `config` | `ElastimemConfig` | A copy; changing it has no effect |
+| `configure(**settings)` | `Status` | Change settings, e.g. `context_tokens` after a model switch |
+| `report_pressure()` | `Status` | The host hit an OOM or failed decode: one tier down |
+| `flush(timeout=5.0)` | `bool` | Finish all pending background work; False on timeout |
+| `stats()` | `dict` | Row counts, file size, FTS5 availability |
+| `close()` | `None` | Ends the session, stops the worker, closes connections. Safe to call twice |
 
-### Lifecycle / inspection
+## Settings (`ElastimemConfig`)
 
-| method                                     | purpose                                 |
-| ------------------------------------------ | --------------------------------------- |
-| `drain(timeout=5.0) -> bool`             | finish queued background work           |
-| `close()`                                | drain, stop worker, close connections   |
-| `stats() -> dict`                        | row counts, file size, FTS availability |
-| `quarantine_entries(n=20) -> list[dict]` | rejected auto-extractions               |
-| `profile -> MemoryProfile`               | current governor snapshot               |
+| Field | Default | Meaning |
+|---|---|---|
+| `context_tokens` | 4096 | The chat model's context window. Set it |
+| `reserved_tokens` | 1112 | Tokens the host needs for its own prompt, tool output and the reply |
+| `tier` | `None` | Fix the tier; `None` lets the governor decide. Env: `ELASTIMEM_TIER=lite\|standard\|full` |
+| `pinned` | empty | Fact keys always listed first |
+| `blocked` | empty | Fact keys the host owns; never stored (also matches `*_<key>`) |
+| `turn_budget_ms` | 50 | Memory work per turn before the tier steps down |
+| `half_life_days` | 30 | How fast unused memories fade |
+| `max_lessons` | 15 | Older lessons are archived |
 
-## Value types
+Everything else that could be tuned is a constant in `elastimem/tiers.py`.
 
-- **`ContextPlan`** — `sections: dict[str, str]` (keys: `user_facts`,
-  `graph_context`, `relevant_past_moments`, `previous_sessions`, `lessons`
-  — `graph_context` is Experimental, budgeted from a share of the episodic
-  budget rather than its own `Budgets` field, see
-  [governor.md](governor.md#graph-context-in-build_context)),
-  `rolling_summary: str | None`, `keep_last_n_turns: int`,
-  `profile: MemoryProfile`, `render() -> str`.
-- **`MemoryProfile`** — `tier`, `budgets` (`working/facts/episodic/sessions/ lessons`, tokens), `embeddings_enabled`, `vector_recall_enabled`,
-  `embedder_load_allowed`, `llm_extraction_enabled`, `extraction_cadence`,
-  `rolling_summary_mode`, `rolling_summary_enabled` (derived),
-  `consolidation_level`, `episodic_top_k`, `graph_hops`.
+## Types
 
-  The three embedding flags are separate on purpose, because indexing and
-  querying have very different costs (see
-  [governor.md](governor.md#vector-recall-vs-embedding-two-decisions-not-one)):
-  `embeddings_enabled` permits embedding **newly recorded chunks** (`False`
-  at LITE); `vector_recall_enabled` permits the **vector leg during
-  retrieval** (`True` at every tier); `embedder_load_allowed` permits
-  **triggering a first load** of the built-in model (`False` at LITE). All
-  three reflect the GOVERNOR's tier-based permission only — none of them
-  means an embedder is actually configured and working. Check
-  `store.embed_fn is not None` separately if you need to know whether
-  vector search is actually possible right now.
+**`Context`**: `sections: dict[str, str]` with keys `facts`, `topics`,
+`moments`, `sessions`, `lessons` (`""` when empty); `summary: str | None`
+(this session's turns that left the window); `keep_turns: int` (turns the
+host should keep verbatim); `status: Status`. `str(context)` renders the
+summary and non-empty sections under Markdown headings.
 
-  `rolling_summary_mode` is a `RollingSummaryMode` (`LLM`, `EXTRACTIVE`,
-  `MARKER`). `rolling_summary_enabled` remains available as a derived
-  property with its original meaning — `True` only for `LLM`, i.e. "will
-  this cost a model call?" — so existing host code needs no change.
-- **`Hit`** (from `elastimem.retrieval`) — `kind` (`chunk|fact`), `text`,
-  `date`, `score`, `session_id`.
-- **`Fact`** — `key`, `value`, `category`, `source`, `importance`,
-  `valid_from`, `invalidated_at`, `archived`.
-- **`ElastimemConfig`** — see docstrings in `elastimem/config.py`; notable fields:
-  `context_tokens`, `static_prompt_tokens`, `reserved_keys`, `profile_keys`,
-  `chunk_target_tokens`, `worker_max_tokens`, `lite_llm_extraction`,
-  `tier_override`,
-  `min_query_words` (gates LLM extraction, default 4),
-  `min_retrieval_query_words` (gates local FTS5/vector retrieval, default 1
-  — deliberately much lower than `min_query_words` since retrieval is free
-  and a short query still carries real intent), `disable_builtin_embedder`
-  (default `False` — set `True` to force FTS5-only retrieval and prevent
-  the built-in embedder from ever activating, e.g. for an air-gapped host),
-  `tier_thresholds_gib` (RAM thresholds the governor uses to classify
-  FULL/STANDARD/LITE), `memory_split` (how the non-working token pool
-  divides across facts/episodic/sessions/lessons), `working_share`
-  (fraction of the dynamic token pool reserved for the working window).
-- **`Tier`** — `LITE < STANDARD < FULL`; env override `ELASTIMEM_TIER`.
+**`Status`**: `tier: Tier`; `budgets: Budgets`; `keep_turns: int`;
+`vectors: bool`; `llm: str` (`per_turn`, `batched`, `session_end` or
+`off`); `graph_hops: int`; `reasons: dict[str, str]` with keys `tier`,
+`vectors`, `llm`.
+
+**`Budgets`**: token budgets `working, facts, moments, topics, sessions,
+lessons`.
+
+**`Hit`**: `kind` (`"moment"` or `"fact"`), `text`, `date`
+(`YYYY-MM-DD`), `score`, `session` (moments only).
+
+**`Fact`**: `key`, `value`, `source` (`explicit`, `auto` or `import`),
+`since`, `until` (`None` for the current version).
+
+**`Explanation`**: `query`, `tier`, `weights` (the tier's equation),
+`missing` (term -> why it did not contribute), `items` (each with `hit`
+and `parts`: the weighted contribution of each term, summing to the score).
+
+**`Tier`**: `LITE < STANDARD < FULL`.
