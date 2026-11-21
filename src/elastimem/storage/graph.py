@@ -14,7 +14,7 @@ import logging
 import re
 import sqlite3
 
-from . import tiers
+from .. import tiers
 from .db import utcnow
 
 log = logging.getLogger("elastimem")

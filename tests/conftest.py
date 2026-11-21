@@ -5,7 +5,8 @@ import math
 import pytest
 
 import elastimem
-from elastimem import Tier, governor
+from elastimem import Tier
+from elastimem.runtime import governor
 
 
 @pytest.fixture(autouse=True)

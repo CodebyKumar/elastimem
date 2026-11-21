@@ -15,7 +15,7 @@ import re
 import sqlite3
 from typing import Callable
 
-from . import tiers
+from .. import tiers
 from .db import utcnow
 
 TokenizerFn = Callable[[str], int]

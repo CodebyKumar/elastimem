@@ -13,11 +13,11 @@
 from importlib.metadata import PackageNotFoundError, version
 
 from .config import ElastimemConfig, Tier
-from .context import Context
-from .facts import Fact
-from .governor import Budgets, Status
-from .inspection import Explanation
-from .search import Hit
+from .retrieval.context import Context
+from .retrieval.inspection import Explanation
+from .retrieval.search import Hit
+from .runtime.governor import Budgets, Status
+from .storage.facts import Fact
 from .store import Elastimem
 
 try:

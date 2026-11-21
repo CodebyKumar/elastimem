@@ -1,10 +1,11 @@
 import pytest
+from conftest import toy_embed
 
 import elastimem
-from elastimem import Tier, db, scoring
+from elastimem import Tier
+from elastimem.retrieval import scoring
+from elastimem.storage import db
 from elastimem.tiers import Weights
-
-from conftest import toy_embed
 
 
 def _fill(mem, n=30):
@@ -101,7 +102,7 @@ def test_relevance_beats_importance():
 
 
 def test_pure_python_vectors_match_numpy(path, monkeypatch):
-    from elastimem import vectors
+    from elastimem.retrieval import vectors
 
     with elastimem.open(path, embedder=toy_embed, tier=Tier.FULL) as mem:
         _fill(mem, 5)

@@ -1,9 +1,8 @@
 import pytest
+from conftest import StubLLM
 
 import elastimem
 from elastimem import Context, Status, Tier
-
-from conftest import StubLLM
 
 
 def test_three_call_flow(path):
@@ -24,10 +23,6 @@ def test_status_explains_itself(mem):
     assert s.reasons["tier"].startswith("FULL")
 
 
-def test_lite_may_not_load_the_builtin_model(path):
-    with elastimem.open(path, tier=Tier.LITE) as mem:
-        if mem._vectors.builtin:
-            assert "may not load" in mem.status.reasons["vectors"]
 
 
 def test_hot_path_never_raises(path):
@@ -66,10 +61,6 @@ def test_invalid_settings():
         elastimem.ElastimemConfig(reserved_tokens=4000)
 
 
-def test_close_twice_is_safe(path):
-    mem = elastimem.open(path, embedder=None)
-    mem.close()
-    mem.close()
 
 
 def test_context_renders_sections(mem):

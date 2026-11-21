@@ -8,7 +8,7 @@ Elastimem is pre-1.0. From 0.3.0 on:
   [agent_integration_prompt.md](agent_integration_prompt.md). Adding a
   method, a field or a setting is not breaking.
 - **Internal**: everything else, including every submodule
-  (`elastimem.search`, `elastimem.tiers`, ...), names starting with `_`,
+  (`elastimem.retrieval.search`, `elastimem.tiers`, ...), names starting with `_`,
   and the database schema (which migrates automatically). These can change
   in any release.
 

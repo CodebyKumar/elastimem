@@ -15,7 +15,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from .tiers import Weights
+from ..tiers import Weights
 
 RELEVANCE = ("vector", "keyword", "graph")
 

@@ -20,10 +20,12 @@ import logging
 import threading
 from typing import TYPE_CHECKING
 
-from . import episodes, facts, graph, llm, tiers
+from .. import tiers
+from ..storage import episodes, facts, graph
+from . import llm
 
 if TYPE_CHECKING:
-    from .store import Elastimem
+    from ..store import Elastimem
 
 log = logging.getLogger("elastimem")
 

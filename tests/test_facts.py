@@ -1,8 +1,9 @@
 import pytest
 
 import elastimem
-from elastimem import Tier, facts
+from elastimem import Tier
 from elastimem.config import normalize_key
+from elastimem.storage import facts
 
 
 def test_changing_a_fact_keeps_its_history(mem):

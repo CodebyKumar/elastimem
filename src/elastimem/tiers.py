@@ -1,7 +1,7 @@
 """What each tier allows and how it ranks memories: the one place to tune.
 
 A tier is chosen by the governor from what the machine can afford. Each tier
-has a fixed ranking equation (see :mod:`elastimem.scoring`)::
+has a fixed ranking equation (see :mod:`elastimem.retrieval.scoring`)::
 
     relevance = vector*w_vector + keyword*w_keyword + graph*w_graph
     score     = relevance + importance*w_importance + recency*w_recency

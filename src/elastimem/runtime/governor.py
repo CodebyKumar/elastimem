@@ -25,8 +25,8 @@ import time
 from dataclasses import dataclass
 from typing import Callable
 
-from . import tiers
-from .config import ElastimemConfig, Tier
+from .. import tiers
+from ..config import ElastimemConfig, Tier
 
 log = logging.getLogger("elastimem")
 

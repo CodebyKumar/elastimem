@@ -13,7 +13,7 @@ import logging
 import re
 from typing import Callable
 
-from . import tiers
+from .. import tiers
 
 log = logging.getLogger("elastimem")
 

@@ -282,8 +282,10 @@ before and after the embedder loads.
 
 ## 12. Code structure
 
-The package stays flat. Two large files are split, and modules are named
-after the layer they own.
+The package started flat. Two large files are split, and modules are named
+after the layer they own. After the rewrite the modules were grouped into
+`storage/`, `retrieval/` and `runtime/` (see `architecture.md`); the table
+below lists them by name only.
 
 | 0.3 module | Contains | From 0.2 |
 |---|---|---|
@@ -498,7 +500,9 @@ Baseline results (0.2.0, 8 GB M-series Mac):
 Also found: `close()` closes only the calling thread's connection, so the
 worker's SQLite connection leaks (F12).
 
-**Resume point (updated 2026-11-01, end of day).** The 0.3 code, tests,
+**Resume point (updated 2026-11-21).** All docs, CHANGELOG and version 0.3.0 are written and uncommitted in the working tree. Remaining: test, tag, then integrate into Tuffy. Earlier note, from 2026-11-01:
+
+**Resume point (2026-11-01, end of day).** The 0.3 code, tests,
 benchmarks and examples are done and committed on the `redesign-0.3`
 branch (85 tests pass, plus 1 slow test for the built-in model). Rewritten
 docs so far: `architecture.md`, `api.md`, `schema.md`, `integrations.md`,
@@ -508,7 +512,7 @@ release steps. Until then, README, `agent_integration_prompt.md`,
 describe 0.2.
 
 **Phase 1: storage**
-- [x] `db.py`: schema v4 (`entities`, `relations`, `mentions`, `rejected`, `facts.since/until/embedding`, `chunks.extracted_at`, `sessions.summary_turn`), v3 -> v4 migration in one transaction. Verified by hand on a copy of the fixture (row counts, FTS rebuild, integrity and foreign-key checks); still needs a pytest
+- [x] `db.py`: schema v4 (`entities`, `relations`, `mentions`, `rejected`, `facts.since/until/embedding`, `chunks.extracted_at`, `sessions.summary_turn`), v3 -> v4 migration in one transaction. Verified by hand and by `tests/test_storage.py`
 - Also in `db.py`: `utcnow()`, `days_since()`, `decay()` (registered as a SQL function) so no module keeps its own copy
 
 **Phase 2: layers**
@@ -611,12 +615,12 @@ What moved the numbers, found by measuring rather than planned:
   ("what") can still match as a keyword. With keyword at 0.1 weight it no
   longer decides rankings in the eval.
 - [x] Delete the 0.2 modules and tests
-- [ ] Delete or rewrite stale docs (with phase 6): delete `governor.md`, `tiers.md`, `quickstart.md`, `installation.md` (absorbed into `architecture.md` and `integrations.md`)
+- [x] Delete or rewrite stale docs (with phase 6): delete `governor.md`, `tiers.md`, `quickstart.md`, `installation.md` (absorbed into `architecture.md` and `integrations.md`)
 
 **Phase 6: docs and release**
 - [x] Update examples (all four rewritten; the two offline ones run)
 - [x] Rewrite `architecture.md`, `api.md`, `schema.md`, `integrations.md`, `api_stability.md`
-- [ ] Rewrite README
-- [ ] Rewrite `agent_integration_prompt.md` for 0.3, adding a `0.2.0 -> 0.3.0` subsection to its section 9 (append-only; the old subsections stay)
-- [ ] Update `CONTRIBUTING.md` links to the deleted docs
-- [ ] CHANGELOG and version 0.3.0; drop the unused `vec` extra from `pyproject.toml`
+- [x] Rewrite README
+- [x] Rewrite `agent_integration_prompt.md` for 0.3, adding a `0.2.0 -> 0.3.0` subsection to its section 9 (append-only; the old subsections stay)
+- [x] Update `CONTRIBUTING.md` links to the deleted docs
+- [x] CHANGELOG and version 0.3.0; drop the unused `vec` extra from `pyproject.toml`

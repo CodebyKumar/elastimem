@@ -22,13 +22,16 @@ import threading
 import time
 from typing import Callable
 
-from . import context as context_mod
-from . import db, episodes, facts, graph, inspection, lessons, llm, search, tiers
+from . import tiers
 from .config import ElastimemConfig, Tier
-from .context import Context
-from .governor import Governor, Status, budgets, keep_turns
-from .jobs import Pause, Worker, consolidate
-from .vectors import Vectors
+from .retrieval import context as context_mod
+from .retrieval import inspection, search
+from .retrieval.context import Context
+from .retrieval.vectors import Vectors
+from .runtime import llm
+from .runtime.governor import Governor, Status, budgets, keep_turns
+from .runtime.jobs import Pause, Worker, consolidate
+from .storage import db, episodes, facts, graph, lessons
 
 log = logging.getLogger("elastimem")
 

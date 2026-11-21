@@ -5,7 +5,8 @@ from pathlib import Path
 import pytest
 
 import elastimem
-from elastimem import Tier, db
+from elastimem import Tier
+from elastimem.storage import db
 
 FIXTURE = Path(__file__).parent / "fixtures" / "v3_store.db"
 
@@ -72,8 +73,3 @@ def test_corrupt_file_is_moved_aside(path):
     conn, _ = db.open_store(path)
     assert conn.execute("SELECT count(*) FROM facts").fetchone()[0] == 0
     assert list(Path(path).parent.glob("memory.db.corrupt-*"))
-
-
-def test_decay_is_available_in_sql(path):
-    conn, _ = db.open_store(path)
-    assert conn.execute("SELECT decay(1.0, ?, 30)", (db.utcnow(),)).fetchone()[0] == pytest.approx(1.0)

@@ -1,4 +1,4 @@
-from elastimem import graph
+from elastimem.storage import graph
 
 
 def _extract(conn, chunk_ids, entities, relations=()):

@@ -165,21 +165,28 @@ keyword search only and 1.00 with the built-in embedder.
 
 ## Modules
 
-| Module | Owns |
-|---|---|
-| `store.py` | `Elastimem`, the public class |
-| `config.py` | `ElastimemConfig`, `Tier` |
-| `tiers.py` | Every tunable constant: tier capabilities, the equation, budgets, caps |
-| `governor.py` | Tier choice, `Status`, `Budgets` |
-| `db.py` | Schema, migrations, connections, time helpers |
-| `episodes.py` | Messages, chunks, sessions, rolling summary |
-| `facts.py` | Versioned facts, grounding, rejected facts |
-| `graph.py` | Entities, relations, mentions, topics |
-| `lessons.py` | Lessons |
-| `vectors.py` | Embedders and the in-RAM vector index |
-| `search.py` | Query analysis and signals |
-| `scoring.py` | The equation |
-| `context.py` | `Context` and its sections |
-| `inspection.py` | `explain()`, `history()` |
-| `llm.py` | Prompts and parsing for background calls |
-| `jobs.py` | The worker, `pause()`, consolidation |
+```
+src/elastimem/
+  store.py        Elastimem, the public class (delegates to the layers below)
+  config.py       ElastimemConfig, Tier
+  tiers.py        Every tunable constant: tier capabilities, the equation, budgets, caps
+  storage/        What is kept, in one SQLite file
+    db.py           Schema, migrations, connections, time helpers
+    episodes.py     Messages, chunks, sessions, rolling summary
+    facts.py        Versioned facts, grounding, rejected facts
+    graph.py        Entities, relations, mentions, topics
+    lessons.py      Lessons
+  retrieval/      Finding and ranking it for a prompt
+    vectors.py      Embedders and the in-RAM vector index
+    search.py       Query analysis and signals
+    scoring.py      The equation
+    context.py      Context and its sections
+    inspection.py   explain(), history()
+  runtime/        Deciding and doing the background work
+    governor.py     Tier choice, Status, Budgets
+    jobs.py         The worker, pause(), consolidation
+    llm.py          Prompts and parsing for background calls
+```
+
+Dependencies point down: `store` uses all three folders; `retrieval` and
+`runtime` use `storage`; `storage` uses only `config` and `tiers`.

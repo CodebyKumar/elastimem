@@ -11,13 +11,15 @@ import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from . import episodes, facts, graph, lessons, search, tiers
-from .db import days_since
-from .episodes import fit_lines
-from .governor import Status
+from .. import tiers
+from ..runtime.governor import Status
+from ..storage import episodes, facts, graph, lessons
+from ..storage.db import days_since
+from ..storage.episodes import fit_lines
+from . import search
 
 if TYPE_CHECKING:
-    from .store import Elastimem
+    from ..store import Elastimem
 
 TITLES = {
     "facts": "What you know about the user",

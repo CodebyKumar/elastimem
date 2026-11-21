@@ -6,13 +6,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from . import facts, search
-from .config import Tier, normalize_key
+from ..config import Tier, normalize_key
+from ..storage import facts
+from ..tiers import Weights
+from . import search
 from .search import Hit
-from .tiers import Weights
 
 if TYPE_CHECKING:
-    from .store import Elastimem
+    from ..store import Elastimem
 
 
 @dataclass(frozen=True)

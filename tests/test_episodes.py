@@ -1,5 +1,6 @@
 import elastimem
-from elastimem import Tier, episodes
+from elastimem import Tier
+from elastimem.storage import episodes
 
 
 def test_record_stores_messages_and_chunks(mem):

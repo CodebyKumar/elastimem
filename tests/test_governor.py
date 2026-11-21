@@ -1,7 +1,8 @@
 import pytest
 
-from elastimem import ElastimemConfig, Tier, governor, tiers
-from elastimem.governor import GIB, Governor
+from elastimem import ElastimemConfig, Tier, tiers
+from elastimem.runtime import governor
+from elastimem.runtime.governor import GIB, Governor
 
 
 @pytest.mark.parametrize("total_gib, pressure, tier", [

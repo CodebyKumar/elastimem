@@ -1,22 +1,72 @@
 # Changelog
 
 All notable changes to Elastimem are documented here. Format loosely follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/). As of `0.2.0`
-Elastimem is out of pre-release and versioning follows the policy in
-[docs/api_stability.md](docs/api_stability.md): additive changes to the
-Stable surface bump the minor version, breaking changes bump the major
-version.
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning follows
+[docs/api_stability.md](docs/api_stability.md).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-21
+
+A rewrite. The 0.2 API is **broken with no aliases** (0.2 was never on
+PyPI). Stores migrate automatically (schema v3 -> v4). Upgrade steps:
+[docs/agent_integration_prompt.md](docs/agent_integration_prompt.md)
+section 8. Reasoning and measurements: [docs/redesign.md](docs/redesign.md).
+
+### Changed (API)
+- `build_context` -> `context` (returns `Context`), `record_turn` ->
+  `record`, `recall` -> `search`, `foreground()` -> `pause()` (a handle that
+  can end on another thread), `reconfigure` -> `configure`, `profile` ->
+  `status`, `drain` -> `flush`, `begin_session` -> `new_session`,
+  `resume_session` -> `resume`, `fact_history`/`timeline` -> `history`,
+  `clusters` -> `topics`, `add_lesson` -> `learn`, `quarantine_entries` ->
+  `rejected`. `remember` returns `bool`.
+- `tick()` and `report_evictions()` are gone: `context()` re-checks the
+  governor, and the host trims to `context.keep_turns`.
+- Settings cut from about 30 to 8 (`context_tokens`, `reserved_tokens`,
+  `tier`, `pinned`, `blocked`, `turn_budget_ms`, `half_life_days`,
+  `max_lessons`). The rest are constants in `elastimem/tiers.py`.
+  `static_prompt_tokens`, `output_reserve` and `tool_reserve` became one
+  `reserved_tokens`; `reserved_keys` -> `blocked`; `embed_fn` and
+  `disable_builtin_embedder` -> `embedder=` (`None` = keyword only).
+
+### Changed (behavior)
+- One ranking equation for every tier and every kind of memory
+  (`0.80*vector + 0.10*keyword + 0.10*graph + 0.05*importance +
+  0.05*recency`); a term that cannot contribute hands its weight to the
+  others. `explain()` shows each term.
+- Facts are embedded and found by meaning, not just by keyword.
+- LLM extraction depends on `llm=` being given; the tier only sets the
+  cadence (every turn, every 2 turns, session end).
+- The governor reads memory pressure (macOS and Linux) instead of free
+  pages, and steps a tier down when `context()` measurably runs over
+  `turn_budget_ms`.
+- Automatic facts are validated by a structural grounding check; no word
+  lists remain. Keyword search ignores terms that are common in the store.
+- Pending work (vectors, extraction, summaries) is read from SQL, so a
+  crash loses nothing and a tier upgrade backfills on its own.
+- Vector search runs on an in-RAM index (numpy when available), cutting
+  `context()` at 10k chunks from 206 ms to 12 ms.
+- `close()` closes every thread's connection (a worker connection leaked
+  before).
+
+### Removed
+- Regex rule capture (`rules.py`). Facts come from `remember()`, usually
+  exposed to the host's model as a tool, or from an `llm`.
+- The unused `vec` extra.
+- Docs `governor.md`, `tiers.md`, `quickstart.md`, `installation.md`,
+  folded into `architecture.md` and `integrations.md`.
+
 ### Added
-- `docs/agent_integration_prompt.md` — a single self-contained document
-  aimed at coding agents (Claude Code, Cursor, SDK agents) asked to
-  integrate Elastimem or upgrade an existing integration. Complete
-  capability list, full `ElastimemConfig` reference with defaults, the five
-  host obligations, per-version upgrade steps, common anti-patterns, and a
-  runnable verification script. `CONTRIBUTING.md` now requires updating it
-  in the same PR as any user-visible change.
+- `docs/redesign.md`, `benchmarks/eval_recall.py` (19 questions) and a v3
+  store fixture for the migration test.
+- `docs/agent_integration_prompt.md`: one self-contained document for
+  coding agents integrating or upgrading Elastimem.
+
+### Measured (8 GB Mac)
+Recall@5 with keyword only 0.58 -> 0.68, with the built-in embedder 0.95 ->
+1.00; `context()` at 1k chunks 20.7 ms -> 1.7 ms; test suite 204 tests in
+4.6 s -> 110 tests in 3 s.
 
 ## [0.2.0] - 2026-08-18
 

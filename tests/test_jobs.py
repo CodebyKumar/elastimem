@@ -1,10 +1,10 @@
 import threading
 import time
 
+from conftest import StubLLM, toy_embed
+
 import elastimem
 from elastimem import Tier
-
-from conftest import StubLLM, toy_embed
 
 PUPPY = ("I adopted a puppy named Bruno", "Lovely!")
 

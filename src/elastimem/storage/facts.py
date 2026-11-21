@@ -16,8 +16,8 @@ import re
 import sqlite3
 from dataclasses import dataclass
 
-from . import tiers
-from .config import normalize_key
+from .. import tiers
+from ..config import normalize_key
 from .db import utcnow
 
 IMPORTANCE = {"explicit": 1.0, "import": 0.8, "auto": 0.5}

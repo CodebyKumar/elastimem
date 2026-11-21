@@ -1,7 +1,7 @@
 # Storage schema
 
 One store is one SQLite file in WAL mode (schema version 4). The schema is
-defined in `src/elastimem/db.py`; this page explains it.
+defined in `src/elastimem/storage/db.py`; this page explains it.
 
 ## Tables
 
