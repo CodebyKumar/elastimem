@@ -147,7 +147,9 @@ class Governor:
         self._on_change = on_change
         self._lock = threading.Lock()
         self._slow = self._healthy = 0
-        self._last_probe = self._last_pressure_report = 0.0
+        self._last_probe = 0.0
+        # -inf, not 0: monotonic() counts from boot on Linux, so 0 can be "recent".
+        self._last_pressure_report = float("-inf")
         self.on_battery = False
         self.reason = ""
         self._tier = self._read()

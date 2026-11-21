@@ -66,3 +66,11 @@ def test_budgets_are_the_same_on_every_tier():
     b = governor.budgets(ElastimemConfig(context_tokens=8192, reserved_tokens=1024))
     assert b.working + b.facts + b.moments + b.topics + b.sessions + b.lessons <= 8192 - 1024
     assert governor.keep_turns(b) >= tiers.MIN_KEEP_TURNS
+
+
+def test_first_pressure_report_counts_even_just_after_boot(monkeypatch):
+    # time.monotonic() starts near zero on a freshly booted Linux machine.
+    monkeypatch.setattr("elastimem.runtime.governor.time.monotonic", lambda: 5.0)
+    g = Governor(ElastimemConfig(), probe_fn=lambda: (32 * GIB, "normal"))
+    g.report_pressure()
+    assert g.tier is Tier.STANDARD
